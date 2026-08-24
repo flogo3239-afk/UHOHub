@@ -22,7 +22,7 @@ try:
 except Exception:
     winreg = None
 
-CURRENT_APP_VERSION = "2.3.0"
+CURRENT_APP_VERSION = "2.4.0"
 GITHUB_REPO = "flogo3239-afk/UHOHub"
 
 def get_resource_path(relative_path):
