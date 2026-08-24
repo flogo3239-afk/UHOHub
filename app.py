@@ -2220,10 +2220,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                         try: shutil.copy2(item, os.path.join(backup_dir, item))
                         except: pass
 
-                # 2. Download executable or zip stream
+                # 2. Resolve running executable paths
+                current_exe = os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else os.path.join(os.getcwd(), "UHOHub.exe"))
+                current_dir = os.path.dirname(current_exe)
+                current_filename = os.path.basename(current_exe)
+                uho_target_path = os.path.join(current_dir, "UHOHub.exe")
+
+                # 3. Download executable or zip stream
                 is_zip = download_url.lower().endswith(".zip")
-                temp_download = "UHOHub_temp.zip" if is_zip else "UHOHub_update.exe"
-                target_file = "UHOHub_update.exe"
+                temp_download = os.path.join(current_dir, "UHOHub_temp.zip" if is_zip else "UHOHub_update.exe")
+                target_file = os.path.join(current_dir, "UHOHub_update.exe")
 
                 for f_tmp in [temp_download, target_file]:
                     if os.path.exists(f_tmp):
@@ -2266,38 +2272,49 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     try: os.remove(temp_download)
                     except: pass
 
-                # 3. Verify target executable size
+                # 4. Verify target executable size
                 if not os.path.exists(target_file) or os.path.getsize(target_file) < 100000:
                     raise Exception("Heruntergeladene Datei ist unvollständig.")
 
                 modal_win.after(0, lambda: status_lbl.configure(text="✅ Download fertig! Starte nahtlosen Neustart...", text_color="#00E676"))
                 time.sleep(1.0)
 
-                # 4. Generate batch updater script that waits, replaces binary, and restarts
-                bat_script = """@echo off
+                # 5. Generate batch updater script that terminates old processes, updates binaries, and launches detached
+                bat_script = f"""@echo off
 setlocal enabledelayedexpansion
 title UHO Hub Auto-Updater
 echo Aktualisiere UHO Hub auf die neueste Version...
 timeout /t 2 /nobreak >nul
+
 :wait_close
-taskkill /f /im UHOHub.exe >nul 2>&1
+taskkill /f /im "{current_filename}" >nul 2>&1
+taskkill /f /im "UHOHub.exe" >nul 2>&1
+taskkill /f /im "OsuTrainingTracker.exe" >nul 2>&1
 timeout /t 1 /nobreak >nul
-move /y "UHOHub_update.exe" "UHOHub.exe" >nul 2>&1
-if exist "UHOHub_update.exe" (
+
+move /y "{target_file}" "{current_exe}" >nul 2>&1
+if exist "{target_file}" (
     timeout /t 1 /nobreak >nul
     goto wait_close
 )
+
+REM If old file was named OsuTrainingTracker.exe, also mirror it to UHOHub.exe
+if /i not "{current_filename}"=="UHOHub.exe" (
+    copy /y "{current_exe}" "{uho_target_path}" >nul 2>&1
+)
+
 echo Starte neue Version...
-start "" "%~dp0UHOHub.exe"
+powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '{current_exe}'"
 del "%~f0" & exit
 """
-                bat_path = "uho_update_runner.bat"
+                bat_path = os.path.join(current_dir, "uho_update_runner.bat")
                 with open(bat_path, "w", encoding="utf-8") as f:
                     f.write(bat_script)
 
-                # 5. Launch batch script detached and terminate current process
-                subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=subprocess.CREATE_NO_WINDOW)
-                self.after(200, lambda: (self.destroy(), sys.exit(0)))
+                # 6. Launch batch script completely detached (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                DETACHED_FLAGS = 0x00000008 | 0x00000200
+                subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=DETACHED_FLAGS, close_fds=True)
+                self.after(300, lambda: (self.destroy(), os._exit(0)))
 
             except Exception as e:
                 err_msg = str(e)
@@ -8101,5 +8118,7 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()
     app = App()
     app.mainloop()
