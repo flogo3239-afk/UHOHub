@@ -166,13 +166,18 @@ def classify_map(m):
     cats = [k for k, v in fp.items() if v >= 0.40]
     return cats if cats else ['Consistency', 'Aim']
 
-def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None):
+def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, user_feedback=None, banned_mods=None):
     if exclude_ids is None:
         exclude_ids = set()
+    if banned_mods is None:
+        banned_mods = set()
     
     # Resolve required mod and scale query SR
     req_mod = str(mod or "NM").upper().strip()
     if req_mod in ["NONE", "NO MOD", "NOMOD", "AUTO"]:
+        req_mod = "NM"
+
+    if req_mod in banned_mods:
         req_mod = "NM"
 
     query_sr = target_sr
@@ -193,12 +198,28 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None):
         # Maps with a low affinity score (< 0.40) are skipped in <1ms
         scored_candidates = []
         for m in db:
-            if m.get('id') in exclude_ids:
+            m_id = str(m.get('id', ''))
+            if m_id in exclude_ids or m.get('id') in exclude_ids:
                 continue
+
+            # Check User Thumbs-Down Feedback
+            if user_feedback and isinstance(user_feedback, dict):
+                fb = user_feedback.get(m_id)
+                if fb and fb.get("liked") is False:
+                    continue  # AUTO-SKIP: Map explicitly downvoted by user!
+
             fp = compute_map_pattern_fingerprint(m)
             aff_score = fp.get(category, 0.0)
+
+            # User Thumbs-Up Boost
+            if user_feedback and isinstance(user_feedback, dict):
+                fb = user_feedback.get(m_id)
+                if fb and fb.get("liked") is True:
+                    aff_score += 0.35
+
             if aff_score < 0.40:
                 continue  # AUTO-SKIP: Map rejected because its pattern does not fit this skillset!
+            
             sr_diff = abs(m.get('sr', 5.0) - query_sr)
             # Composite rank: high affinity score + close SR match
             rank_metric = aff_score * 2.0 - sr_diff
@@ -420,6 +441,17 @@ def calculate_skill_test_score(acc, misses, h50=0, maxcombo=0, map_sr=5.5, playe
     - 4-6 Misses & 92%+ Acc -> 50 - 64 Punkte
     - 8+ Misses / Low Acc -> 25 - 45 Punkte
     """
+    try: acc = float(acc)
+    except: acc = 0.0
+    try: misses = int(misses)
+    except: misses = 0
+    try: h50 = int(h50)
+    except: h50 = 0
+    try: map_sr = float(map_sr)
+    except: map_sr = 5.5
+    try: player_sr = float(player_sr)
+    except: player_sr = 5.5
+
     if acc <= 0:
         return 0.0
 
@@ -586,19 +618,25 @@ class BanchoRefereeBot:
 
     def _run_loop(self):
         try:
-            self.log(f"🔌 Verbinde mit Bancho IRC (irc.ppy.sh:6667) als '{self.username}'...", "#00E5FF")
+            clean_pass = self.irc_password.strip()
+            clean_user = self.username.strip().replace(" ", "_")
+            if not clean_pass or not clean_user:
+                self.log("❌ Kein IRC-Passwort oder Username vorhanden. Bitte in den Einstellungen hinterlegen!", "#FF5252")
+                return
+
+            self.log(f"🔌 Verbinde mit Bancho IRC (irc.ppy.sh:6667) als '{clean_user}'...", "#00E5FF")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(20)
             self.sock.connect(("irc.ppy.sh", 6667))
             self.connected = True
             
-            clean_pass = self.irc_password.strip()
-            clean_user = self.username.strip().replace(" ", "_")
+            # Send standard Bancho IRC handshake
             self._send_raw(f"PASS {clean_pass}")
             self._send_raw(f"NICK {clean_user}")
             self._send_raw(f"USER {clean_user} 0 * :{clean_user}")
             
             readbuffer = ""
+            logged_in = False
             while self.running:
                 try:
                     data = self.sock.recv(4096)
@@ -610,16 +648,29 @@ class BanchoRefereeBot:
 
                     for line in lines:
                         if not line: continue
+                        
                         # Respond to PING
                         if line.startswith("PING"):
                             self._send_raw(line.replace("PING", "PONG"))
                             continue
 
+                        # Check for Bancho Authentication Failures
+                        if " 464 " in line or "Password incorrect" in line or "Bad authentication" in line or "Bad token" in line:
+                            self.log("❌ Authentifizierungs-Fehler (464): Das IRC-Passwort ist ungültig!", "#FF5252")
+                            self.log("ℹ️ WICHTIG: Verwende dein offizielles Server-Passwort von https://osu.ppy.sh/p/irc (NICHT dein osu!-Login-Passwort!).", "#FFA726")
+                            self.running = False
+                            return
+
+                        if " 433 " in line or "Nickname is already in use" in line:
+                            self.log(f"❌ Nickname '{clean_user}' ist bereits eingeloggt. Bitte schließe andere IRC-Clients.", "#FF5252")
+
                         # Check for Bancho Login Successful
-                        if " 001 " in line or "Welcome to osu!bancho" in line or "ChoToken" in line:
-                            self.log("✅ Erfolgreich mit Bancho IRC eingeloggt!", "#00E676")
+                        if (" 001 " in line or "Welcome to osu!bancho" in line or "ChoToken" in line) and not logged_in:
+                            logged_in = True
+                            self.log(f"✅ Erfolgreich bei Bancho IRC eingeloggt als '{clean_user}'!", "#00E676")
                             time.sleep(0.8)
-                            self.send_mp(f"mp make {self.pending_lobby_name}")
+                            self.log(f"⚡ Sende Lobby-Erstellungsbefehl: !mp make {self.pending_lobby_name}", "#00E5FF")
+                            self._send_raw(f"PRIVMSG BanchoBot :!mp make {self.pending_lobby_name}")
 
                         # Check for Match Created
                         if "Created the tournament match" in line or "Joined channel #mp_" in line or "#mp_" in line:
@@ -627,7 +678,8 @@ class BanchoRefereeBot:
                             if match_m:
                                 self.match_id = match_m.group(1)
                                 self.channel = f"#mp_{self.match_id}"
-                                self.log(f"🏆 Lobby erfolgreich erstellt: {self.channel} (ID: {self.match_id})", "#00E676")
+                                self.log(f"🏆 Ingame-Lobby erfolgreich erstellt: {self.channel} (ID: {self.match_id})", "#00E676")
+                                self._send_raw(f"JOIN {self.channel}")
                                 if self.pending_password:
                                     time.sleep(0.5)
                                     self.send_mp(f"mp password {self.pending_password}")
@@ -1591,6 +1643,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.last_deep_replay_telemetry = None
         self.deep_replay_history = []
         self.ai_debug_logs = []
+        self.ai_user_feedback = {}
         self._dir_mtimes = {}
 
         # Scan existing replays to initialize baseline
@@ -1616,6 +1669,40 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.show_tutorial_welcome()
         else:
             self.show_main_menu()
+
+    def record_ai_feedback(self, liked: bool, map_obj=None, text_snippet=""):
+        """Records thumbs up/down user feedback for a map or coaching response, tuning the recommendation engine."""
+        if not hasattr(self, "ai_user_feedback") or not isinstance(self.ai_user_feedback, dict):
+            self.ai_user_feedback = {}
+        
+        cur_map = map_obj or getattr(self, "current_ai_training_map", None) or {}
+        map_id = str(cur_map.get("id", ""))
+        map_name = cur_map.get("name", "Unbekannte Map")
+        skill = getattr(self, "ai_training_target_skill", "Allgemein")
+        
+        if map_id:
+            self.ai_user_feedback[map_id] = {
+                "liked": liked,
+                "map_name": map_name,
+                "skillset": skill,
+                "sr": cur_map.get("sr", 5.0),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+        
+        self.log_ai_event(
+            category=f"User-Feedback: {'👍 Positiv (Gefällt)' if liked else '👎 Negativ (Nicht passend)'}",
+            input_summary={
+                "liked": liked,
+                "map_id": map_id,
+                "map_name": map_name,
+                "skillset": skill,
+                "snippet": text_snippet[:100] if text_snippet else ""
+            },
+            calculations={
+                "algorithm_impact": f"{'+0.80 Prioritäts-Boost' if liked else '-1.50 Malus / Auto-Skip'}"
+            }
+        )
+        self.save_global_settings()
 
     def log_ai_event(self, category, input_summary, prompt_text=None, raw_ai_response=None, calculations=None):
         """Records an AI prompt, reasoning, response, and scoring calculation into the diagnostic log."""
@@ -1720,6 +1807,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     if data.get('last_deep_replay_telemetry'): self.last_deep_replay_telemetry = data.get('last_deep_replay_telemetry')
                     if data.get('deep_replay_history'): self.deep_replay_history = data.get('deep_replay_history')
                     if data.get('ai_debug_logs'): self.ai_debug_logs = data.get('ai_debug_logs')
+                    if data.get('ai_user_feedback'): self.ai_user_feedback = data.get('ai_user_feedback')
             except: pass
 
     def save_global_settings(self):
@@ -1745,7 +1833,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             'user_setup_profile': getattr(self, 'user_setup_profile', {}),
             'last_deep_replay_telemetry': getattr(self, 'last_deep_replay_telemetry', None),
             'deep_replay_history': getattr(self, 'deep_replay_history', []),
-            'ai_debug_logs': getattr(self, 'ai_debug_logs', [])
+            'ai_debug_logs': getattr(self, 'ai_debug_logs', []),
+            'ai_user_feedback': getattr(self, 'ai_user_feedback', {})
         }
         try:
             with open(self.settings_file, 'w', encoding='utf-8') as f:
@@ -2181,23 +2270,65 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 desktop = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
                 out_file = os.path.join(desktop, "uho_ai_diagnostics.txt")
                 logs = getattr(self, "ai_debug_logs", [])
+                feedback_dict = getattr(self, "ai_user_feedback", {})
+                setup_prof = getattr(self, "user_setup_profile", {})
+                pa = getattr(self, "last_profile_analysis", {}) or {}
+                dt_hist = getattr(self, "deep_replay_history", [])
                 
                 report_lines = [
-                    "=" * 70,
-                    f"UHO HUB - KI-DIAGNOSE & GEDANKENPROTOKOLL (v{CURRENT_APP_VERSION})",
+                    "=" * 75,
+                    f"UHO HUB - MASTER KI-DIAGNOSE & TRAININGSDATENSATZ (v{CURRENT_APP_VERSION})",
                     f"Erstellt am: {time.strftime('%Y-%m-%d %H:%M:%S')}",
                     f"Spieler: {getattr(self, 'osu_username', 'Unbekannt')}",
                     f"KI-Modell: {getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}",
                     f"Gesamtanzahl protokollierter KI-Events: {len(logs)}",
-                    "=" * 70,
-                    ""
+                    "=" * 75,
+                    "",
+                    "🎮 1. BENUTZER-FEEDBACK & MAP-BEWERTUNGEN (👍 / 👎)",
+                    "-" * 75
                 ]
+                
+                if feedback_dict:
+                    for m_id, fb in feedback_dict.items():
+                        icon = "👍 Gefällt" if fb.get("liked") else "👎 Nicht passend / Skipped"
+                        report_lines.append(f"  • [{icon}] Map-ID {m_id}: {fb.get('map_name', 'Unbekannt')} (★ {fb.get('sr', 0):.1f}) | Skillset: {fb.get('skillset', '-')} | Datum: {fb.get('timestamp', '-')}")
+                else:
+                    report_lines.append("  (Noch keine Daumen-Feedbacks abgegeben)")
+
+                report_lines.extend([
+                    "",
+                    "🛠️ 2. HARDWARE-, ERGONOMIE- & TECHNIQUE-PROFIL",
+                    "-" * 75,
+                    json.dumps(setup_prof, indent=2, ensure_ascii=False) if setup_prof else "  (Keine Setup-Daten hinterlegt)",
+                    "",
+                    "📊 3. SKILL-RADAR & PROFIL-SCORES",
+                    "-" * 75,
+                    f"  • Hauptschwäche: {pa.get('weakness', 'Keine')}",
+                    f"  • Stärkstes Skillset: {pa.get('main_skill', 'Keine')}",
+                    f"  • Radar-Scores: {json.dumps(pa.get('scores', {}), indent=2, ensure_ascii=False)}",
+                    "",
+                    f"🔬 4. MULTI-PLAY REPLAY-TELEMETRIE ({len(dt_hist)} gespeicherte Replays)",
+                    "-" * 75
+                ])
+
+                if dt_hist:
+                    for idx, r in enumerate(dt_hist[:10]):
+                        m = r.get("metrics", {})
+                        report_lines.append(f"  [{idx+1}] {r.get('player', 'Spieler')} | Score: {r.get('score', 0):,} | Acc: {r.get('accuracy', 0):.2f}% | UR: ~{m.get('ur', 0):.1f} | Overaim: {m.get('overaim_pct', 0):.1f}% | Chokes: {', '.join(m.get('choke_reasons', []))}")
+                else:
+                    report_lines.append("  (Keine Replays in der Telemetrie-Historie)")
+
+                report_lines.extend([
+                    "",
+                    "🤖 5. DETAIL-PROTOKOLL DER KI-EVENTS (PROMPTS & ROH-ANTWORTEN)",
+                    "-" * 75
+                ])
                 
                 if not logs:
                     report_lines.append("Keine KI-Events protokolliert. Führe erst eine Profil-Analyse, ein KI-Training oder einen Skill Test durch.")
                 else:
                     for idx, item in enumerate(logs):
-                        report_lines.append(f"--- [EVENT #{idx+1}] {item.get('timestamp', '')} | Kategorie: {item.get('category', 'Allgemein')} ---")
+                        report_lines.append(f"\n--- [EVENT #{idx+1}] {item.get('timestamp', '')} | Kategorie: {item.get('category', 'Allgemein')} ---")
                         report_lines.append(f"📌 INPUTS / SCORES:\n{json.dumps(item.get('inputs', {}), indent=2, ensure_ascii=False)}")
                         if item.get('calculations'):
                             report_lines.append(f"\n🔢 BERECHNUNGEN & SCORING:\n{json.dumps(item.get('calculations', {}), indent=2, ensure_ascii=False)}")
@@ -2205,7 +2336,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                             report_lines.append(f"\n🤖 GESENDETER PROMPT AN GEMINI:\n{item.get('prompt')}")
                         if item.get('raw_ai_response'):
                             report_lines.append(f"\n💡 GEMINI ROH-ANTWORT & GEDANKENGANG:\n{item.get('raw_ai_response')}")
-                        report_lines.append("\n" + ("-" * 60) + "\n")
+                        report_lines.append("-" * 60)
                         
                 content = "\n".join(report_lines)
                 try:
@@ -2216,12 +2347,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                         self.clipboard_append(content)
                     except:
                         pass
-                    self.show_message("✅ KI-Diagnose exportiert", f"Das vollständige KI-Gedankenprotokoll wurde auf deinem Desktop gespeichert:\n\n📄 {out_file}\n\n(Zusätzlich in die Zwischenablage kopiert!)")
+                    self.show_message("✅ KI-Diagnose exportiert", f"Der vollständige KI-Trainings- und Fehler-Datensatz wurde auf deinem Desktop gespeichert:\n\n📄 {out_file}\n\n(Zusätzlich in die Zwischenablage kopiert!)")
                 except Exception as e:
                     self.show_message("Fehler beim Export", f"Konnte Datei nicht schreiben: {e}")
 
             def clear_ai_diagnostics():
                 self.ai_debug_logs = []
+                self.ai_user_feedback = {}
                 self.save_global_settings()
                 self.show_settings(active_tab="ai")
 
@@ -2676,24 +2808,41 @@ del "%~f0" & exit
             act_row = ctk.CTkFrame(bubble, fg_color="transparent")
             act_row.pack(anchor="w", padx=2)
 
-            def copy_txt(t=text):
-                try:
-                    self.clipboard_clear()
-                    self.clipboard_append(t)
-                except: pass
-
-            ctk.CTkButton(act_row, text="📋", width=28, height=24, font=("Arial", 11), fg_color="transparent",
-                          hover_color="#282836", text_color="#888899", command=copy_txt).pack(side="left", padx=2)
-            ctk.CTkButton(act_row, text="👍", width=28, height=24, font=("Arial", 11), fg_color="transparent",
-                          hover_color="#282836", text_color="#888899").pack(side="left", padx=2)
-            ctk.CTkButton(act_row, text="👎", width=28, height=24, font=("Arial", 11), fg_color="transparent",
-                          hover_color="#282836", text_color="#888899").pack(side="left", padx=2)
+            self._attach_feedback_buttons(act_row, text)
 
             self._bind_mousewheel_to_chat(container)
             try:
                 self.chat_scrollable_frame.after(50, lambda: self.chat_scrollable_frame._parent_canvas.yview_moveto(1.0))
             except: pass
             return container
+
+    def _attach_feedback_buttons(self, act_row, bubble_text):
+        def copy_txt():
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(bubble_text)
+            except: pass
+
+        ctk.CTkButton(act_row, text="📋", width=28, height=24, font=("Arial", 11), fg_color="transparent",
+                      hover_color="#282836", text_color="#888899", command=copy_txt).pack(side="left", padx=2)
+
+        def on_thumb_up():
+            self.record_ai_feedback(liked=True, text_snippet=bubble_text)
+            btn_up.configure(fg_color="#1b382b", text_color="#00E676", text="👍 Gemerkt")
+            btn_down.configure(fg_color="transparent", text_color="#888899", text="👎")
+
+        def on_thumb_down():
+            self.record_ai_feedback(liked=False, text_snippet=bubble_text)
+            btn_down.configure(fg_color="#3d1c1c", text_color="#FF5252", text="👎 Nicht passend")
+            btn_up.configure(fg_color="transparent", text_color="#888899", text="👍")
+
+        btn_up = ctk.CTkButton(act_row, text="👍", width=28, height=24, font=("Arial", 11), fg_color="transparent",
+                               hover_color="#282836", text_color="#888899", command=on_thumb_up)
+        btn_up.pack(side="left", padx=2)
+
+        btn_down = ctk.CTkButton(act_row, text="👎", width=28, height=24, font=("Arial", 11), fg_color="transparent",
+                                 hover_color="#282836", text_color="#888899", command=on_thumb_down)
+        btn_down.pack(side="left", padx=2)
 
     def replace_modern_thinking(self, thinking_container, new_text):
         import time as _time
@@ -2725,18 +2874,7 @@ del "%~f0" & exit
         act_row = ctk.CTkFrame(bubble, fg_color="transparent")
         act_row.pack(anchor="w", padx=2)
 
-        def copy_txt(t=new_text):
-            try:
-                self.clipboard_clear()
-                self.clipboard_append(t)
-            except: pass
-
-        ctk.CTkButton(act_row, text="📋", width=28, height=24, font=("Arial", 11), fg_color="transparent",
-                      hover_color="#282836", text_color="#888899", command=copy_txt).pack(side="left", padx=2)
-        ctk.CTkButton(act_row, text="👍", width=28, height=24, font=("Arial", 11), fg_color="transparent",
-                      hover_color="#282836", text_color="#888899").pack(side="left", padx=2)
-        ctk.CTkButton(act_row, text="👎", width=28, height=24, font=("Arial", 11), fg_color="transparent",
-                      hover_color="#282836", text_color="#888899").pack(side="left", padx=2)
+        self._attach_feedback_buttons(act_row, new_text)
 
         self._bind_mousewheel_to_chat(thinking_container)
         try:
@@ -3217,11 +3355,26 @@ DEINE ANTWORT-RICHTLINIEN:
                       font=("Arial", 11, "bold"), progress_color="#00BFA5").pack(anchor="w", padx=12, pady=(0, 6))
 
         irc_info_lbl = ctk.CTkLabel(bot_box, text="", font=("Arial", 10), justify="left")
-        irc_info_lbl.pack(anchor="w", padx=12, pady=(0, 8))
+        irc_info_lbl.pack(anchor="w", padx=12, pady=(0, 4))
         if getattr(self, "osu_irc_password", ""):
             irc_info_lbl.configure(text="✅ osu! IRC-Passwort hinterlegt. Bot ist einsatzbereit!", text_color="#00E676")
         else:
-            irc_info_lbl.configure(text="ℹ️ Kein IRC-Passwort hinterlegt. Bot fragt beim Start danach oder nutzt manuelle Lobbies.", text_color="#FFA726")
+            irc_info_lbl.configure(text="⚠️ Kein IRC-Passwort hinterlegt (wird für automatische Lobbies & Einladungen benötigt).", text_color="#FFA726")
+
+        def prompt_irc_pwd():
+            dialog = ctk.CTkInputDialog(text="Gib dein IRC-Server-Passwort von https://osu.ppy.sh/p/irc ein:\n(NICHT dein normales osu!-Login-Passwort!)", title="osu! IRC-Server-Passwort")
+            val = dialog.get_input()
+            if val is not None and val.strip():
+                self.osu_irc_password = val.strip()
+                self.save_global_settings()
+                irc_info_lbl.configure(text="✅ osu! IRC-Passwort hinterlegt. Bot ist einsatzbereit!", text_color="#00E676")
+
+        irc_btn_row = ctk.CTkFrame(bot_box, fg_color="transparent")
+        irc_btn_row.pack(fill="x", padx=12, pady=(0, 8))
+        ctk.CTkButton(irc_btn_row, text="🔑 IRC-Passwort eintragen", font=("Arial", 10, "bold"), height=26,
+                      fg_color="#2b2b3a", hover_color="#3b3b4f", command=prompt_irc_pwd).pack(side="left")
+        ctk.CTkButton(irc_btn_row, text="🌐 Passwort auf osu.ppy.sh abrufen", font=("Arial", 10), height=26,
+                      fg_color="transparent", hover_color="#222230", text_color="#00E5FF", command=lambda: webbrowser.open("https://osu.ppy.sh/p/irc")).pack(side="left", padx=(6, 0))
 
         # ----------------- RIGHT: MAPPOOL & RULES -----------------
         f_right = ctk.CTkFrame(grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2a2a38")
@@ -6041,6 +6194,20 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
                 # --- Powerful Intent Recognition for Live Coaching ---
                 msg_lower = msg.lower()
+                is_negative = any(neg in msg_lower for neg in ["keine", "kein", "nicht mehr", "stop", "bloß kein", "keinen", "will nicht", "lass mal sein"])
+                is_skip_intent = any(sk in msg_lower for sk in ["überspring", "überspringen", "skip", "nächste schwäche", "nächstes problem", "nächste map", "andere map", "was anderes", "wechsel"])
+                is_fun_mode = any(w in msg_lower for w in ["spaß", "fun", "aus spaß", "nur zum spaß", "just for fun", "was für spaß", "geile map", "chillen", "abgehen"])
+                
+                # Check persistent mod preference / mod dependency ("nur Hidden", "nur HardRock", "nur HR")
+                is_only_mod = any(w in msg_lower for w in ["nur hd", "nur hidden", "nur hr", "nur hardrock", "immer hd", "immer hr", "kann nur hr", "kann nur hd", "ohne hr kann ich", "ohne hd kann ich", "mit jeder mod"])
+                mod_crutch_detected = None
+                if is_only_mod:
+                    if "hr" in msg_lower or "hardrock" in msg_lower or "hard rock" in msg_lower:
+                        mod_crutch_detected = "HR"
+                        self._persistent_mod_pref = "HR"
+                    elif "hd" in msg_lower or "hidden" in msg_lower:
+                        mod_crutch_detected = "HD"
+                        self._persistent_mod_pref = "HD"
 
                 # 1. Star Rating Intent (e.g. "7 star", "7 sterne", "7*", "6.5 star", "8*", "7.2 sr")
                 requested_sr = None
@@ -6086,19 +6253,42 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 elif any(w in msg_lower for w in ["nomod", "no mod", "nm", "ohne mods"]):
                     requested_mod = "NM"
 
-                # Apply immediate live training map switch if user requested a skill, star rating or mod
+                # Handle Negation & Exclusions
                 did_update_map = False
-                if requested_skill or requested_sr is not None or requested_mod is not None:
+                coach_directive_note = ""
+
+                if is_negative and any(ez_kw in msg_lower for ez_kw in ["easy", "ez"]):
+                    if not hasattr(self, "_banned_mods"): self._banned_mods = set()
+                    self._banned_mods.add("EZ")
+                    self._user_requested_mod = None
+                    did_update_map = True
+                    coach_directive_note = "Spieler möchte vorerst keine Easy (EZ) Maps mehr. Bestätige den Ausschluss freundlich und erkläre den Fokuswechsel."
+                    self.pick_next_ai_training_map(banned_mod="EZ", rotate_weakness=True)
+                elif is_negative and any(tech_kw in msg_lower for tech_kw in ["tech", "technical"]):
+                    if not hasattr(self, "_skipped_skills"): self._skipped_skills = set()
+                    self._skipped_skills.add("Tech")
+                    did_update_map = True
+                    coach_directive_note = "Spieler möchte aktuell keine Tech-Maps. Bestätige und rotiere zur nächsten Schwäche."
+                    self.pick_next_ai_training_map(skip_skill="Tech", rotate_weakness=True)
+                elif is_fun_mode:
+                    did_update_map = True
+                    coach_directive_note = "Spieler möchte aus Spaß spielen / sich auspowern. Schalte auf Fun-Mode mit seiner stärksten Disziplin (Speed/Aim)."
+                    self.pick_next_ai_training_map(is_fun_mode=True)
+                elif is_skip_intent:
+                    did_update_map = True
+                    coach_directive_note = "Spieler möchte die aktuelle Map / Schwäche überspringen. Rotiere zur nächsten Herausforderung."
+                    self.pick_next_ai_training_map(rotate_weakness=True)
+                elif requested_skill or requested_sr is not None or requested_mod is not None or mod_crutch_detected:
                     did_update_map = True
                     new_skill = requested_skill or getattr(self, "ai_training_target_skill", "Streams")
                     self.ai_training_target_skill = new_skill
-                    self._user_requested_mod = requested_mod
+                    self._user_requested_mod = requested_mod or mod_crutch_detected
 
                     if requested_sr is not None:
                         self._user_requested_sr = requested_sr
                         self._ai_training_target_sr = requested_sr
 
-                    self.pick_next_ai_training_map(forced_skill=new_skill, forced_mod=requested_mod)
+                    self.pick_next_ai_training_map(forced_skill=new_skill, forced_mod=self._user_requested_mod)
 
                 # Auto-detect hardware / technique details from user chat
                 did_save_setup = self.update_user_setup_from_text(msg)
@@ -6112,31 +6302,45 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                     import traceback
                     try:
                         cur_map = getattr(self, "current_ai_training_map", {}) or {}
-                        cur_info = f"{cur_map.get('name', 'Unbekannt')} (★ {cur_map.get('sr', 5.5):.1f}, Skillset: {getattr(self, 'ai_training_target_skill', 'Streams')})"
+                        cur_info = f"{cur_map.get('name', 'Unbekannt')} (★ {cur_map.get('sr', 5.5):.1f}, Mod: {cur_map.get('mod', 'NM')}, Skillset: {getattr(self, 'ai_training_target_skill', 'Streams')})"
                         setup_info = json.dumps(getattr(self, "user_setup_profile", {}))
                         
                         response = None
                         if getattr(self, "gemini_key", ""):
                             try:
+                                crutch_instruction = ""
+                                if mod_crutch_detected:
+                                    crutch_instruction = f"""
+- MOD-CRUTCH DIAGNOSE ({mod_crutch_detected}-Abhängigkeit):
+  Der Spieler hat angegeben, dass er fast nur {mod_crutch_detected} spielt.
+  1. Erkläre ihm freundlich und didaktisch die Ursache ('AR10 / Low-Density Lock-in'). Wer nur HR/HD spielt, verlernt das Lesen normaler Notendichten (AR 9.0-9.5) und verlässt sich rein auf Reflexe statt echtes Rhythmus-Lesen.
+  2. Empfiehl eine 70/30-Strategie (70% mit {mod_crutch_detected}, 30% gezielte NoMod-Grundlagen), um ein kompletter Turnierspieler zu werden.
+  3. Bestätige, dass die links vorbereitete Map seinen Wunsch berücksichtigt!"""
+
                                 full_prompt = f"""[KI-Live-Coaching Feed]
 Aktuell geladene Trainingsmap: {cur_info}
 Bekanntes Spieler-Setup: {setup_info}
+Spezielle Anweisung: {coach_directive_note}
 Spieler-Nachricht: {msg}
 
 Antworte als Pro-Coach auf Deutsch (ca. 3-5 prägnante Sätze):
 - Wenn der Spieler Hardware-/Setup-Details (Maus/Tablet, DPI/Area, Tastatur/Rapid Trigger, Grip oder Tapping-Stil) genannt hat, gehe sofort darauf ein und gib konkrete Tuning- und Ergonomie-Tipps (z. B. Area-Größe, Actuation Point, Handgelenk-Winkel).
-- Falls er nach einer bestimmten Map/Kategorie/★ gefragt hat, bestätige, dass die Map links aktualisiert wurde.
-- Gib ihm konkrete mechanische Ausführungstipps und motiviere ihn, seine Schwächen zu besiegen!"""
+- Falls er nach einer bestimmten Map/Kategorie/★ gefragt oder etwas ausgeschlossen hat (z.B. keine Easy Maps, nächstes Problem), bestätige den Wechsel auf die neue Map links.{crutch_instruction}
+- Gib ihm konkrete mechanische Ausführungstipps und motiviere ihn!"""
                                 response = self.query_gemini(full_prompt)
                             except Exception as api_err:
                                 response = f"⚠️ [API-Fehlercode: {type(api_err).__name__}]: {api_err}\n\n" + self.offline_analyze(msg)
 
                         if not response:
                             # Smart rich offline response in 100% German
-                            if did_save_setup:
+                            if mod_crutch_detected:
+                                response = f"Alles klar! Ich habe dein Training auf **+{mod_crutch_detected}** eingestellt.\n\n⚠️ **Coach-Diagnose ({mod_crutch_detected}-Lock-in):** Wenn du ausschließlich {mod_crutch_detected} spielst, gewöhnt sich dein Gehirn an das High-AR-Reaktionsfenster und verlernt das Lesen dichterer NoMod-Pattern (AR 9.0-9.5). Um ein kompletter Spieler zu werden, empfehle ich 70% mit {mod_crutch_detected} und 30% NoMod-Reading als Fundament!\n\n🎮 Map links bereit: **{self.current_ai_training_map['name']}**"
+                            elif did_save_setup:
                                 response = f"Perfekt! Ich habe deine Setup-Daten gespeichert ({setup_info}).\n\n💡 **Coach-Tipp:** Mit diesem Setup können wir gezielt an deiner Konstanz arbeiten. Achte auf eine entspannte Handhaltung und spiele die links vorbereitete Map!"
+                            elif is_fun_mode:
+                                response = f"🎉 **Fun-Mode aktiviert!** Wir schieben die Schwächen kurz beiseite und lassen dich auf deinem Paradestück **{self.ai_training_target_skill} (★ {self.current_ai_training_map['sr']:.1f})** abgehen!\n\n🎮 Map links bereit: **{self.current_ai_training_map['name']}** – viel Spaß beim Reinknallen!"
                             elif did_update_map:
-                                response = f"Alles klar! Ich habe dein Training sofort auf **{self.ai_training_target_skill} (★ {self.current_ai_training_map['sr']:.1f})** angepasst.\n\n🎮 Neue Map links bereit: **{self.current_ai_training_map['name']}**\n📋 Fokus-Ziel: {self.current_ai_training_map['goal']}\n\n💡 **Coach-Tipp:** Starte die Map direkt per `osu!direct`. Achte besonders auf gleichmäßige Fingerbewegung und halte deinen Unterarm locker!"
+                                response = f"Alles klar! Ich habe dein Training sofort angepasst auf **{self.ai_training_target_skill} (★ {self.current_ai_training_map['sr']:.1f})**.\n\n🎮 Neue Map links bereit: **{self.current_ai_training_map['name']}**\n📋 Fokus-Ziel: {self.current_ai_training_map['goal']}\n\n💡 **Coach-Tipp:** Starte die Map direkt per `osu!direct`. Achte besonders auf gleichmäßige Fingerbewegung und halte deinen Unterarm locker!"
                             else:
                                 response = self.offline_analyze(msg)
 
@@ -6242,13 +6446,22 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
         self.ai_training_target_skill = skill_name
         self.pick_next_ai_training_map(forced_skill=skill_name)
 
-    def pick_next_ai_training_map(self, adaptive_delta=0.0, forced_skill=None, forced_mod=None):
+    def pick_next_ai_training_map(self, adaptive_delta=0.0, forced_skill=None, forced_mod=None, banned_mod=None, skip_skill=None, rotate_weakness=False, is_fun_mode=False):
         if not hasattr(self, "_ai_train_session_count"):
             self._ai_train_session_count = 0
         if not hasattr(self, "_ai_train_tested_skills"):
             self._ai_train_tested_skills = set()
         if not hasattr(self, "_ai_train_skill_streak"):
             self._ai_train_skill_streak = 0
+        if not hasattr(self, "_banned_mods"):
+            self._banned_mods = set()
+        if not hasattr(self, "_skipped_skills"):
+            self._skipped_skills = set()
+
+        if banned_mod:
+            self._banned_mods.add(str(banned_mod).upper().strip())
+        if skip_skill:
+            self._skipped_skills.add(str(skip_skill))
 
         self._ai_train_session_count += 1
 
@@ -6269,48 +6482,74 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
         ]
 
         is_stress_test_mode = False
-        target_mod = forced_mod or getattr(self, "_user_requested_mod", None)
+        target_mod = forced_mod or getattr(self, "_user_requested_mod", None) or getattr(self, "_persistent_mod_pref", None)
+        if target_mod and target_mod in self._banned_mods:
+            target_mod = "NM"
 
-        if forced_skill:
+        if is_fun_mode:
+            # Fun Mode: Focus on player's strongest or most rewarding skills (Speed / Aim)
+            if scores:
+                sorted_by_best = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                skill = sorted_by_best[0][0]
+            else:
+                skill = "Speed"
+            self.ai_training_target_skill = skill
+            self._ai_train_skill_streak = 1
+        elif forced_skill:
             skill = forced_skill
+            self.ai_training_target_skill = skill
+            self._ai_train_skill_streak = 1
+        elif rotate_weakness or skip_skill:
+            # Rotate to next weakness that is not currently skipped
+            all_s = ["Aim", "Streams", "Speed", "Tech", "Precision", "Reading", "Stamina", "Consistency"]
+            if scores:
+                sorted_skills = sorted(scores.items(), key=lambda x: x[1])
+                candidates = [s[0] for s in sorted_skills if s[0] not in self._skipped_skills]
+                skill = candidates[0] if candidates else sorted_skills[0][0]
+            else:
+                cands = [s for s in all_s if s not in self._skipped_skills]
+                skill = random.choice(cands) if cands else "Aim"
             self.ai_training_target_skill = skill
             self._ai_train_skill_streak = 1
         elif len(self._ai_train_tested_skills) < len(ALL_SKILLS_STRESS_ORDER):
             # Phase 1: LIMIT-TESTING / STRESS-TEST PHASE
-            # Test each skillset and dedicated mod to uncover mechanical breaking points!
             is_stress_test_mode = True
             for sk, s_mod in ALL_SKILLS_STRESS_ORDER:
-                if sk not in self._ai_train_tested_skills:
+                if sk not in self._ai_train_tested_skills and sk not in self._skipped_skills:
                     skill = sk
-                    if not target_mod:
+                    if not target_mod and s_mod not in self._banned_mods:
                         target_mod = s_mod
                     self._ai_train_tested_skills.add(sk)
                     break
+            else:
+                skill = "Aim"
             self.ai_training_target_skill = skill
             self._ai_train_skill_streak = 1
         else:
             # Phase 2: DYNAMIC ROTATION & TARGETED WEAKNESS COACHING
-            # Switch skillset every 2 rounds to maintain broad versatility!
             self._ai_train_skill_streak += 1
             if self._ai_train_skill_streak > 2:
                 self._ai_train_skill_streak = 1
                 if scores:
                     sorted_skills = sorted(scores.items(), key=lambda x: x[1])
-                    weak_candidates = [s[0] for s in sorted_skills[:3]]
+                    weak_candidates = [s[0] for s in sorted_skills[:4] if s[0] not in self._skipped_skills]
                     if getattr(self, "ai_training_target_skill", "") in weak_candidates:
                         weak_candidates.remove(self.ai_training_target_skill)
                     skill = random.choice(weak_candidates) if weak_candidates else sorted_skills[0][0]
                 else:
                     all_s = ["Aim", "Streams", "Speed", "Tech", "Precision", "Reading", "Stamina", "Consistency"]
-                    skill = random.choice([s for s in all_s if s != getattr(self, "ai_training_target_skill", "")])
+                    cands = [s for s in all_s if s != getattr(self, "ai_training_target_skill", "") and s not in self._skipped_skills]
+                    skill = random.choice(cands) if cands else "Aim"
                 self.ai_training_target_skill = skill
                 
                 # Assign challenging mod according to skill
                 if not target_mod:
-                    if skill == "Speed": target_mod = "DT"
-                    elif skill == "Precision" and random.random() < 0.5: target_mod = "HR"
-                    elif skill == "Reading" and random.random() < 0.5: target_mod = "HD"
-                    elif random.random() < 0.2: target_mod = random.choice(["DT", "HR", "HD"])
+                    if skill == "Speed" and "DT" not in self._banned_mods: target_mod = "DT"
+                    elif skill == "Precision" and "HR" not in self._banned_mods and random.random() < 0.5: target_mod = "HR"
+                    elif skill == "Reading" and "HD" not in self._banned_mods and random.random() < 0.5: target_mod = "HD"
+                    elif random.random() < 0.2:
+                        avail_m = [m for m in ["DT", "HR", "HD"] if m not in self._banned_mods]
+                        if avail_m: target_mod = random.choice(avail_m)
             else:
                 skill = getattr(self, "ai_training_target_skill", "Streams")
 
@@ -6331,7 +6570,7 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
             base_sr = 5.2
 
         # In Stress-Test mode, push difficulty (+0.30★) to test where the limits lie!
-        stress_push = +0.30 if is_stress_test_mode else 0.0
+        stress_push = +0.30 if is_stress_test_mode and not is_fun_mode else 0.0
 
         if not hasattr(self, "_ai_session_performance_delta"):
             self._ai_session_performance_delta = 0.0
@@ -6346,14 +6585,26 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
         if not hasattr(self, "recent_ai_training_map_ids"):
             self.recent_ai_training_map_ids = set()
 
-        chosen = pick_dynamic_map_for_skill(skill, target_sr, exclude_ids=self.recent_ai_training_map_ids, mod=target_mod)
+        chosen = pick_dynamic_map_for_skill(
+            category=skill,
+            target_sr=target_sr,
+            exclude_ids=self.recent_ai_training_map_ids,
+            mod=target_mod,
+            user_feedback=getattr(self, "ai_user_feedback", {}),
+            banned_mods=self._banned_mods
+        )
         self.recent_ai_training_map_ids.add(chosen["id"])
         if len(self.recent_ai_training_map_ids) > 30:
             self.recent_ai_training_map_ids.clear()
 
         # Update Top Badge
         mod_badge = f" [{chosen['mod']}]" if chosen.get('mod') and chosen['mod'] != "NM" else ""
-        phase_badge = f"🔥 Stress-Test ({len(self._ai_train_tested_skills)}/8): " if is_stress_test_mode else "✨ KI-Fokus: "
+        if is_fun_mode:
+            phase_badge = "🎉 Fun-Mode: "
+        elif is_stress_test_mode:
+            phase_badge = f"🔥 Stress-Test ({len(self._ai_train_tested_skills)}/8): "
+        else:
+            phase_badge = "✨ KI-Fokus: "
         if hasattr(self, "ai_train_focus_lbl") and self.ai_train_focus_lbl.winfo_exists():
             self.ai_train_focus_lbl.configure(text=f"{phase_badge}{skill}{mod_badge} (★ {chosen['sr']:.1f})")
 
@@ -6591,7 +6842,16 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                     calculations={"adaptive_sr_delta": delta, "adapt_msg": adapt_msg}
                 )
 
-                feedback = f"✅ Runde automatisch erfasst ({played_mods_str})!\nAcc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | Misses: {miss}\n\n🤖 Coach-Analyse:\n{ai_coaching_text}\n\n{mod_warning + chr(10) + chr(10) if mod_warning else ''}{adapt_msg}"
+                if not hasattr(self, "_rounds_since_feedback_prompt"):
+                    self._rounds_since_feedback_prompt = 0
+                self._rounds_since_feedback_prompt += 1
+
+                feedback_inquiry = ""
+                if self._rounds_since_feedback_prompt >= 3:
+                    self._rounds_since_feedback_prompt = 0
+                    feedback_inquiry = "\n\n💡 *Kurze Frage:* Wie hat dir das Pattern dieser Map gefallen und passte es zum Skillset? Klicke gerne auf 👍 oder 👎 unter dieser Nachricht, damit ich dein Training noch passender gestalte!"
+
+                feedback = f"✅ Runde automatisch erfasst ({played_mods_str})!\nAcc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | Misses: {miss}\n\n🤖 Coach-Analyse:\n{ai_coaching_text}\n\n{mod_warning + chr(10) + chr(10) if mod_warning else ''}{adapt_msg}{feedback_inquiry}"
 
                 def update_feed():
                     if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
