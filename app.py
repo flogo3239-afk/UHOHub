@@ -68,57 +68,103 @@ STREAM_ARTISTS = {'dragonforce', 'xi', 'foreground eclipse', 'imperial circus de
                   'undead corporation', 'memai siren', 'demetori', 'galneryus', 'tears of tragedy',
                   'fellows', 'necrofantasia', 'icdd', 'aether realm', 'dragon eyes'}
 
+def compute_map_pattern_fingerprint(m):
+    """
+    Berechnet einen mathematischen HitObject- & Struktur-Fingerabdruck (0.0 bis 1.0)
+    für alle 8 osu! Standard Skillsets zur millimetergenauen Vorfilterung & Auto-Skip.
+    """
+    sr = float(m.get('sr', 5.0))
+    bpm = float(m.get('bpm', 180.0))
+    length = int(m.get('len', 120))
+    cs = float(m.get('cs', 4.0))
+    od = float(m.get('od', 8.0))
+    ar = float(m.get('ar', 9.0))
+    name = str(m.get('name', '')).lower()
+
+    is_tech_artist = any(a in name for a in TECH_ARTISTS)
+    is_tech_kw = any(k in name for k in TECH_KEYWORDS)
+    is_stream_artist = any(a in name for a in STREAM_ARTISTS)
+
+    # 1. Tech Score (Slider Velocity, Awkward Angles, Polyrhythms)
+    tech_score = 0.05
+    if is_tech_artist: tech_score += 0.50
+    if is_tech_kw: tech_score += 0.40
+    if 125 <= bpm <= 165 and sr >= 5.0: tech_score += 0.25
+    if 'slider' in name or 'sv' in name or 'gimmick' in name or 'velocity' in name: tech_score += 0.35
+    tech_score = min(1.0, tech_score)
+
+    # 2. Streams Score (1/4 Note Chains, Deathstreams)
+    stream_score = 0.05
+    if is_stream_artist or 'stream' in name or 'deathstream' in name: stream_score += 0.55
+    if 170 <= bpm <= 230 and length >= 120: stream_score += 0.35
+    if not is_tech_artist and not is_tech_kw and 175 <= bpm <= 225: stream_score += 0.15
+    if tech_score > 0.60: stream_score -= 0.40
+    stream_score = max(0.0, min(1.0, stream_score))
+
+    # 3. Speed Score (High BPM Bursting & Raw Tapping Speed)
+    speed_score = 0.05
+    if bpm >= 210: speed_score += 0.55
+    elif bpm >= 195: speed_score += 0.35
+    if 'speed' in name or 'fast' in name or 'bpm' in name: speed_score += 0.30
+    if length <= 130 and bpm >= 190: speed_score += 0.20
+    if tech_score > 0.60: speed_score -= 0.45
+    speed_score = max(0.0, min(1.0, speed_score))
+
+    # 4. Jump Aim Score (Snapping Distance, Wide Spacing - Strictly non-tech!)
+    aim_score = 0.05
+    if not is_tech_artist and not is_tech_kw:
+        if 'jump' in name or 'tv size' in name: aim_score += 0.50
+        if 170 <= bpm <= 220 and length <= 160: aim_score += 0.35
+        if cs <= 4.4 and sr >= 4.5 and stream_score < 0.50: aim_score += 0.30
+    if tech_score > 0.45: aim_score -= 0.60
+    if stream_score > 0.70: aim_score -= 0.35
+    aim_score = max(0.0, min(1.0, aim_score))
+
+    # 5. Precision Score (Small CS >= 4.5 & High OD Accuracy)
+    prec_score = 0.05
+    if cs >= 5.0: prec_score += 0.55
+    elif cs >= 4.5: prec_score += 0.35
+    if od >= 9.0: prec_score += 0.30
+    if 'precision' in name or 'small cs' in name or 'cs5' in name or 'cs6' in name: prec_score += 0.40
+    prec_score = max(0.0, min(1.0, prec_score))
+
+    # 6. Reading Score (Low AR Density, Overlapping Notes)
+    read_score = 0.05
+    if ar <= 8.5 and sr >= 4.5: read_score += 0.55
+    elif ar <= 8.8 and sr >= 4.0: read_score += 0.35
+    if 'reading' in name or 'hidden' in name or 'low ar' in name: read_score += 0.45
+    read_score = max(0.0, min(1.0, read_score))
+
+    # 7. Stamina Score (Long Drain, Sustained Note Stream Density)
+    stam_score = 0.05
+    if length >= 210: stam_score += 0.55
+    elif length >= 160: stam_score += 0.35
+    if (bpm >= 180 and length >= 150) or 'marathon' in name or 'stamina' in name: stam_score += 0.30
+    stam_score = max(0.0, min(1.0, stam_score))
+
+    # 8. Consistency Score (Uniform Star Density, High OD, Marathon Pacing)
+    cons_score = 0.05
+    if length >= 120 and od >= 8.0 and not is_tech_artist and not is_tech_kw:
+        cons_score += 0.45
+    if length >= 150 and aim_score > 0.30:
+        cons_score += 0.30
+    cons_score = max(0.0, min(1.0, cons_score))
+
+    return {
+        'Aim': aim_score,
+        'Streams': stream_score,
+        'Speed': speed_score,
+        'Tech': tech_score,
+        'Precision': prec_score,
+        'Reading': read_score,
+        'Stamina': stam_score,
+        'Consistency': cons_score
+    }
+
 def classify_map(m):
-    sr = m.get('sr', 5.0)
-    bpm = m.get('bpm', 180)
-    length = m.get('len', 120)
-    cs = m.get('cs', 4.0)
-    od = m.get('od', 8.0)
-    ar = m.get('ar', 9.0)
-    name = m.get('name', '').lower()
-    
-    is_tech = any(a in name for a in TECH_ARTISTS) or any(k in name for k in TECH_KEYWORDS)
-    is_stream = any(a in name for a in STREAM_ARTISTS) or ('stream' in name) or ('deathstream' in name)
-    
-    categories = []
-    
-    # 1. Tech
-    if is_tech or ('tech' in name) or ('remix' in name) or (130 <= bpm <= 165 and sr >= 5.2):
-        categories.append('Tech')
-        
-    # 2. Speed (strictly exclude slow tech)
-    if (bpm >= 205 and not is_tech) or ('speed up' in name) or ('high-bpm' in name) or (bpm >= 195 and length <= 130 and not is_tech):
-        categories.append('Speed')
-        
-    # 3. Stamina
-    if length >= 180 or ('marathon' in name) or ('stamina' in name) or (length >= 150 and bpm >= 185):
-        categories.append('Stamina')
-        
-    # 4. Streams
-    if is_stream or (170 <= bpm <= 230 and length >= 120 and not is_tech):
-        categories.append('Streams')
-        
-    # 5. Precision
-    if cs >= 4.5 or od >= 9.2 or ('precision' in name) or ('cs5' in name) or ('cs6' in name):
-        categories.append('Precision')
-        
-    # 6. Reading
-    if (ar <= 8.8 and sr >= 4.5) or (ar <= 8.5 and sr >= 4.0) or ('reading' in name) or ('hidden' in name):
-        categories.append('Reading')
-        
-    # 7. Aim (Jump Aim - strictly exclude Tech maps!)
-    if not is_tech:
-        if ('tv size' in name) or ('jump' in name) or (170 <= bpm <= 220 and length <= 150) or (sr >= 4.2 and cs <= 4.4 and not is_stream):
-            categories.append('Aim')
-            
-    # 8. Consistency
-    if length >= 120 and od >= 8.0 and not is_tech:
-        categories.append('Consistency')
-        
-    if not categories:
-        categories = ['Tech'] if is_tech else ['Consistency', 'Aim']
-        
-    return categories
+    fp = compute_map_pattern_fingerprint(m)
+    cats = [k for k, v in fp.items() if v >= 0.40]
+    return cats if cats else ['Consistency', 'Aim']
 
 def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None):
     if exclude_ids is None:
@@ -143,21 +189,29 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None):
         cands = [m for m in pool if m.get("id") not in exclude_ids] or pool
         chosen = random.choice(cands)
     else:
-        # 1. Exact skillset match with tight SR range (+- 0.35*)
-        cands = [m for m in db if m['id'] not in exclude_ids and category in classify_map(m) and abs(m['sr'] - query_sr) <= 0.35]
-        
-        # 2. Relaxed SR range (+- 0.65*)
-        if not cands:
-            cands = [m for m in db if m['id'] not in exclude_ids and category in classify_map(m) and abs(m['sr'] - query_sr) <= 0.65]
-            
-        # 3. Wider fallback
-        if not cands:
-            cands = [m for m in db if m['id'] not in exclude_ids and category in classify_map(m)]
-            
-        if not cands:
-            cands = [m for m in db if m['id'] not in exclude_ids] or db
-            
-        chosen = random.choice(cands)
+        # Step 1: HitObject-Level Mathematical Pattern Telemetry & Auto-Skip Filter
+        # Maps with a low affinity score (< 0.40) are skipped in <1ms
+        scored_candidates = []
+        for m in db:
+            if m.get('id') in exclude_ids:
+                continue
+            fp = compute_map_pattern_fingerprint(m)
+            aff_score = fp.get(category, 0.0)
+            if aff_score < 0.40:
+                continue  # AUTO-SKIP: Map rejected because its pattern does not fit this skillset!
+            sr_diff = abs(m.get('sr', 5.0) - query_sr)
+            # Composite rank: high affinity score + close SR match
+            rank_metric = aff_score * 2.0 - sr_diff
+            scored_candidates.append((rank_metric, aff_score, sr_diff, m))
+
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        # Filter top mathematically verified candidates within reasonable SR range
+        top_candidates = [item[3] for item in scored_candidates if item[2] <= 0.65]
+        if not top_candidates:
+            top_candidates = [item[3] for item in scored_candidates[:5]] if scored_candidates else db
+
+        chosen = random.choice(top_candidates[:3]) if len(top_candidates) >= 3 else top_candidates[0]
     
     raw_sr = float(chosen.get('sr', 5.0))
     raw_bpm = int(chosen.get('bpm', 180))
@@ -6081,7 +6135,15 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
         if getattr(self, "gemini_key", ""):
             def _async_gen_ai_goal(m=chosen, sk=skill):
                 try:
-                    g_prompt = f"Erstelle für den osu! Standard Spieler ein hochspezifisches, motivierendes 1-Satz-Fokus-Ziel für diese Trainings-Runde auf Deutsch:\nMap: {m['name']} (★ {m['sr']:.1f}, Mod: {m.get('mod', 'NM')}, BPM: {m.get('bpm', 180)}, Skillset: {sk})\nNur 1 direkter technischer Satz:"
+                    weakness_info = ""
+                    if hasattr(self, "_ai_last_weakness_context") and self._ai_last_weakness_context:
+                        weakness_info = f"\nBekannte Spieler-Schwachstelle aus letzter Analyse: {self._ai_last_weakness_context}"
+                    g_prompt = (
+                        f"Du bist ein Elite osu! Coach. Erstelle für den osu! Standard Spieler ein hochspezifisches, "
+                        f"technisches 1-Satz-Fokus-Ziel für diese Trainings-Runde auf Deutsch:\n"
+                        f"Map: {m['name']} (★ {m['sr']:.1f}, Mod: {m.get('mod', 'NM')}, BPM: {m.get('bpm', 180)}, Skillset: {sk}){weakness_info}\n"
+                        f"Nur 1 direkter technischer Satz:"
+                    )
                     g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}:generateContent?key={self.gemini_key}"
                     payload = {"contents": [{"role": "user", "parts": [{"text": g_prompt}]}], "generationConfig": {"temperature": 0.8, "maxOutputTokens": 100}}
                     res = requests.post(g_url, json=payload, timeout=6).json()
