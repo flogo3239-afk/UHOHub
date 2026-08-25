@@ -4209,17 +4209,26 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 pool[s]["state"] = "available"
             return pool
 
-        # Fallback to authentic slot selection
+        # Fallback to authentic slot selection with HitObject pattern telemetry & auto-skip
         slots = ["NM1", "NM2", "NM3", "NM4", "HD1", "HD2", "HR1", "HR2", "DT1", "DT2", "FM1", "FM2", "TB"]
+        slot_archetype_map = {
+            "NM1": "Aim", "NM2": "Tech", "NM3": "Speed", "NM4": "Consistency",
+            "HD1": "Aim", "HD2": "Reading", "HR1": "Precision", "HR2": "Streams",
+            "DT1": "Speed", "DT2": "Aim", "FM1": "Streams", "FM2": "Tech", "TB": "Stamina"
+        }
         used_ids = set()
         pool = {}
 
         for slot in slots:
+            req_skill = slot_archetype_map.get(slot, "Aim")
             if "DT" in slot:
                 slot_min, slot_max = max(3.8, min_sr * 0.72), max(4.2, max_sr * 0.74)
+                target_mid = (slot_min + slot_max) / 2.0
             else:
                 slot_min, slot_max = min_sr, max_sr
+                target_mid = (min_sr + max_sr) / 2.0
 
+            # Step 1: Filter by SR range and year
             candidates = [m for m in DYNAMIC_RANKED_MAPS_DB if slot_min <= m.get('sr', 0) <= slot_max and m.get('id') not in used_ids]
             if year and year != "Alle Jahre (Mix)":
                 try:
@@ -4234,23 +4243,21 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             if not candidates:
                 candidates = DYNAMIC_RANKED_MAPS_DB
 
-            if slot in ["NM1", "HD1"]:
-                c = [m for m in candidates if m.get('len', 120) <= 150 and m.get('bpm', 180) >= 170]
-                if c: candidates = c
-            elif slot in ["NM2", "HD2"]:
-                c = [m for m in candidates if m.get('bpm', 180) <= 175 or 'remix' in m.get('name', '').lower() or 'tech' in m.get('name', '').lower()]
-                if c: candidates = c
-            elif slot in ["NM3", "DT1"]:
-                c = [m for m in candidates if m.get('bpm', 180) >= 195]
-                if c: candidates = c
-            elif slot in ["NM4", "TB"]:
-                c = [m for m in candidates if m.get('len', 120) >= 150]
-                if c: candidates = c
-            elif slot in ["HR1", "HR2"]:
-                c = [m for m in candidates if m.get('cs', 4.0) >= 4.0 or m.get('od', 8.0) >= 8.5]
-                if c: candidates = c
+            # Step 2: HitObject Pattern Telemetry & Auto-Skip for Tournament Slot Archetype
+            scored_candidates = []
+            for m in candidates:
+                fp = compute_map_pattern_fingerprint(m)
+                aff_score = fp.get(req_skill, 0.0)
+                if aff_score < 0.40:
+                    continue  # AUTO-SKIP: Map rejected for this tournament slot!
+                sr_diff = abs(m.get('sr', target_mid) - target_mid)
+                rank_metric = aff_score * 2.0 - sr_diff
+                scored_candidates.append((rank_metric, m))
 
-            chosen = random.choice(candidates)
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+            top_pool = [item[1] for item in scored_candidates[:4]] if scored_candidates else candidates
+
+            chosen = random.choice(top_pool)
             used_ids.add(chosen['id'])
             pool[slot] = {
                 "slot": slot,
