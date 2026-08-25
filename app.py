@@ -17,6 +17,8 @@ import shutil
 import zipfile
 import socket
 import lzma
+import uuid
+from datetime import datetime
 try:
     import winreg
 except Exception:
@@ -33,6 +35,7 @@ def get_resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 DYNAMIC_RANKED_MAPS_DB = []
+DYNAMIC_MAPS_BY_SKILL = {}
 OFFICIAL_TOURNAMENTS_DB = {}
 try:
     for candidate_dir in [getattr(sys, "_MEIPASS", ""), os.path.dirname(os.path.abspath(__file__)), os.getcwd(), r"C:\Users\louis\.gemini\antigravity\scratch"]:
@@ -41,6 +44,12 @@ try:
         if not DYNAMIC_RANKED_MAPS_DB and os.path.exists(db_path):
             with open(db_path, "r", encoding="utf-8") as f:
                 DYNAMIC_RANKED_MAPS_DB = json.load(f)
+                DYNAMIC_MAPS_BY_SKILL = {}
+                for m in DYNAMIC_RANKED_MAPS_DB:
+                    sk = m.get('primary_skill', 'Aim')
+                    if sk not in DYNAMIC_MAPS_BY_SKILL:
+                        DYNAMIC_MAPS_BY_SKILL[sk] = []
+                    DYNAMIC_MAPS_BY_SKILL[sk].append(m)
                 
         t_path = os.path.join(candidate_dir, "official_tournament_pools.json")
         if not OFFICIAL_TOURNAMENTS_DB and os.path.exists(t_path):
@@ -48,6 +57,47 @@ try:
                 OFFICIAL_TOURNAMENTS_DB = json.load(f)
 except Exception as e:
     pass
+
+import ctypes
+from ctypes import wintypes
+
+TH32CS_SNAPPROCESS = 0x00000002
+
+class PROCESSENTRY32(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD),
+        ('cntUsage', wintypes.DWORD),
+        ('th32ProcessID', wintypes.DWORD),
+        ('th32DefaultHeapID', ctypes.POINTER(wintypes.ULONG)),
+        ('th32ModuleID', wintypes.DWORD),
+        ('cntThreads', wintypes.DWORD),
+        ('th32ParentProcessID', wintypes.DWORD),
+        ('pcPriClassBase', wintypes.LONG),
+        ('dwFlags', wintypes.DWORD),
+        ('szExeFile', ctypes.c_char * 260)
+    ]
+
+def is_osu_process_active():
+    """Detects if osu!.exe is running on Windows in <1ms without subprocess overhead."""
+    try:
+        hSnapshot = ctypes.windll.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if hSnapshot == -1:
+            return False
+        pe32 = PROCESSENTRY32()
+        pe32.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        has_next = ctypes.windll.kernel32.Process32First(hSnapshot, ctypes.byref(pe32))
+        found = False
+        while has_next:
+            exe_name = pe32.szExeFile.decode('cp1252', errors='ignore').lower()
+            if 'osu!.exe' in exe_name or exe_name == 'osu.exe':
+                found = True
+                break
+            has_next = ctypes.windll.kernel32.Process32Next(hSnapshot, ctypes.byref(pe32))
+        ctypes.windll.kernel32.CloseHandle(hSnapshot)
+        return found
+    except Exception:
+        return False
+
 
 TECH_ARTISTS = {'camellia', 'kobaryo', 'lapix', 'frums', 'silentroom', 'v0id', 'laur', 'team grimoire', 'usao',
                 't+pazolite', 'redalice', 'psycho filth', 'sota fujimori', 'nanahira', 'polysha', 'kikoyu',
@@ -195,51 +245,54 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
     elif req_mod == "EZ":
         query_sr = min(9.5, target_sr / 0.72)
 
-    db = DYNAMIC_RANKED_MAPS_DB
-    if not db:
-        pool = AI_BENCHMARK_POOL.get(category, AI_BENCHMARK_POOL.get("Aim", []))
-        cands = [m for m in pool if m.get("id") not in exclude_ids] or pool
-        chosen = random.choice(cands)
-    else:
-        # Step 1: HitObject-Level Mathematical Pattern Telemetry & Auto-Skip Filter
-        # Maps with a low affinity score (< 0.40) are skipped in <1ms
-        scored_candidates = []
-        for m in db:
-            m_id = str(m.get('id', ''))
-            if m_id in exclude_ids or m.get('id') in exclude_ids:
-                continue
+    pool = DYNAMIC_MAPS_BY_SKILL.get(category)
+    if not pool:
+        pool = DYNAMIC_RANKED_MAPS_DB if DYNAMIC_RANKED_MAPS_DB else AI_BENCHMARK_POOL.get(category, AI_BENCHMARK_POOL.get("Aim", []))
 
-            # Check User Thumbs-Down Feedback
-            if user_feedback and isinstance(user_feedback, dict):
-                fb = user_feedback.get(m_id)
-                if fb and fb.get("liked") is False:
-                    continue  # AUTO-SKIP: Map explicitly downvoted by user!
+    scored_candidates = []
+    # Filter candidates by SR proximity and user feedback
+    sr_close_pool = [m for m in pool if abs(float(m.get('sr', 5.0)) - query_sr) <= 0.90]
+    eval_pool = sr_close_pool if sr_close_pool else pool
 
-            fp = compute_map_pattern_fingerprint(m)
-            aff_score = fp.get(category, 0.0)
+    # Sample randomly if pool is large to ensure maximum variety and sub-millisecond response
+    sample_pool = random.sample(eval_pool, min(len(eval_pool), 150)) if len(eval_pool) > 150 else eval_pool
 
-            # User Thumbs-Up Boost
-            if user_feedback and isinstance(user_feedback, dict):
-                fb = user_feedback.get(m_id)
-                if fb and fb.get("liked") is True:
-                    aff_score += 0.35
+    for m in sample_pool:
+        m_id = str(m.get('id', ''))
+        if m_id in exclude_ids or m.get('id') in exclude_ids:
+            continue
 
-            if aff_score < 0.40:
-                continue  # AUTO-SKIP: Map rejected because its pattern does not fit this skillset!
-            
-            sr_diff = abs(m.get('sr', 5.0) - query_sr)
-            # Composite rank: high affinity score + close SR match
-            rank_metric = aff_score * 2.0 - sr_diff
-            scored_candidates.append((rank_metric, aff_score, sr_diff, m))
+        # Check User Thumbs-Down Feedback
+        if user_feedback and isinstance(user_feedback, dict):
+            fb = user_feedback.get(m_id)
+            if fb and fb.get("liked") is False:
+                continue  # AUTO-SKIP: Map explicitly downvoted by user!
 
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        fp = compute_map_pattern_fingerprint(m)
+        aff_score = fp.get(category, 0.50)
 
-        # Filter top mathematically verified candidates within reasonable SR range
-        top_candidates = [item[3] for item in scored_candidates if item[2] <= 0.65]
-        if not top_candidates:
-            top_candidates = [item[3] for item in scored_candidates[:5]] if scored_candidates else db
+        # If map is already pre-classified in DYNAMIC_MAPS_BY_SKILL as this category, guarantee high baseline affinity
+        if m.get('primary_skill') == category:
+            aff_score = max(aff_score, 0.75)
 
-        chosen = random.choice(top_candidates[:3]) if len(top_candidates) >= 3 else top_candidates[0]
+        # User Thumbs-Up Boost
+        if user_feedback and isinstance(user_feedback, dict):
+            fb = user_feedback.get(m_id)
+            if fb and fb.get("liked") is True:
+                aff_score += 0.35
+
+        sr_diff = abs(float(m.get('sr', 5.0)) - query_sr)
+        rank_metric = aff_score * 2.0 - sr_diff
+        scored_candidates.append((rank_metric, aff_score, sr_diff, m))
+
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # Filter top candidates
+    top_candidates = [item[3] for item in scored_candidates if item[2] <= 0.65]
+    if not top_candidates:
+        top_candidates = [item[3] for item in scored_candidates[:5]] if scored_candidates else pool
+
+    chosen = random.choice(top_candidates[:5]) if len(top_candidates) >= 5 else top_candidates[0]
     
     raw_sr = float(chosen.get('sr', 5.0))
     raw_bpm = int(chosen.get('bpm', 180))
@@ -1722,6 +1775,17 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         
         self.load_global_settings()
         self.scan_all_local_osu_replays(max_replays=25)
+        
+        # Daily & Session Recap System initialization
+        self.active_session = None
+        appdata_dir = os.path.dirname(getattr(self, 'settings_file', '')) if getattr(self, 'settings_file', '') else '.'
+        self.session_recaps_file = os.path.join(appdata_dir, "session_recaps_history.json")
+        self.session_recaps_history = self.load_session_recaps_history()
+        self._osu_closed_timer_start = None
+        self._session_recap_modal_shown = False
+        self._processed_session_play_ids = set()
+        self._start_osu_session_monitor_daemon()
+
         self.after(3500, self.start_auto_update_checker)
         if not getattr(self, "uho_api_key", ""):
             self.show_uho_auth_screen()
@@ -1868,7 +1932,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     if data.get('deep_replay_history'): self.deep_replay_history = data.get('deep_replay_history')
                     if data.get('ai_debug_logs'): self.ai_debug_logs = data.get('ai_debug_logs')
                     if data.get('ai_user_feedback'): self.ai_user_feedback = data.get('ai_user_feedback')
-                    if data.get('uho_friends_list'): self.uho_friends_list = data.get('uho_friends_list')
+                    if data.get('uho_friends_list'):
+                        raw_fl = data.get('uho_friends_list', [])
+                        self.uho_friends_list = [f for f in raw_fl if str(f).strip().lower() not in ['banchobot', 'gemini ai', 'gemini']]
             except: pass
 
     def save_global_settings(self):
@@ -3524,9 +3590,878 @@ DEINE ANTWORT-RICHTLINIEN:
         return "🎯 **Dein KI-Coach:** Ich passe dein Training laufend an deine Leistung an! Sag mir einfach jederzeit, welches Skillset (Streams, Aim, Speed, Tech, Stamina) oder welches Sterne-Level (z. B. ★ 7.0) du trainieren willst!"
 
     # ---------------------------------------------------------------------------
+    # TAGES- & SESSION-RECAP SYSTEM (5-MIN PROCESS INACTIVITY & LIVE TRACKING)
+    # ---------------------------------------------------------------------------
+    def load_session_recaps_history(self):
+        try:
+            path = getattr(self, "session_recaps_file", "session_recaps_history.json")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return []
+
+    def save_session_recaps_history(self):
+        try:
+            path = getattr(self, "session_recaps_file", "session_recaps_history.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(getattr(self, "session_recaps_history", []), f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _fetch_user_snapshot_stats(self):
+        """Fetches current live player rank, PP, and top plays snapshot from osu! API."""
+        user = getattr(self, "osu_username", "")
+        key = getattr(self, "api_key", "")
+        if not user or not key:
+            return {"rank": 0, "pp": 0.0, "acc": 0.0, "playcount": 0, "top_plays": []}
+
+        rank = 0
+        pp = 0.0
+        acc = 0.0
+        playcount = 0
+        top_plays = []
+        try:
+            u_res = requests.get(f"https://osu.ppy.sh/api/get_user?k={key}&u={user}&m=0", timeout=6).json()
+            if isinstance(u_res, list) and u_res:
+                rank = int(u_res[0].get("pp_rank", 0) or 0)
+                pp = float(u_res[0].get("pp_raw", 0.0) or 0.0)
+                acc = float(u_res[0].get("accuracy", 0.0) or 0.0)
+                playcount = int(u_res[0].get("playcount", 0) or 0)
+
+            b_res = requests.get(f"https://osu.ppy.sh/api/get_user_best?k={key}&u={user}&m=0&limit=50", timeout=6).json()
+            if isinstance(b_res, list):
+                top_plays = b_res
+        except Exception:
+            pass
+
+        return {"rank": rank, "pp": pp, "acc": acc, "playcount": playcount, "top_plays": top_plays}
+
+    def _start_osu_session_monitor_daemon(self):
+        if getattr(self, "_osu_session_daemon_running", False):
+            return
+        self._osu_session_daemon_running = True
+
+        def _loop():
+            while True:
+                try:
+                    time.sleep(5)
+                    is_running = is_osu_process_active()
+                    now = time.time()
+
+                    if is_running:
+                        # Case 1: osu! is actively running
+                        if self.active_session is None:
+                            st = datetime.now()
+                            s_stats = self._fetch_user_snapshot_stats()
+                            self.active_session = {
+                                "id": str(uuid.uuid4())[:8],
+                                "date": st.strftime("%Y-%m-%d"),
+                                "start_time_iso": st.isoformat(),
+                                "start_time_str": st.strftime("%H:%M"),
+                                "end_time_str": None,
+                                "duration_mins": 0,
+                                "start_rank": s_stats.get("rank", 0),
+                                "start_pp": s_stats.get("pp", 0.0),
+                                "start_acc": s_stats.get("acc", 0.0),
+                                "start_top_play_ids": [str(p.get("beatmap_id", "")) for p in s_stats.get("top_plays", [])],
+                                "end_rank": s_stats.get("rank", 0),
+                                "end_pp": s_stats.get("pp", 0.0),
+                                "end_acc": s_stats.get("acc", 0.0),
+                                "plays": [],
+                                "new_top_plays": [],
+                                "skillset_distribution": {},
+                                "avg_accuracy": 0.0,
+                                "total_hits": 0,
+                                "passes_count": 0,
+                                "fails_count": 0,
+                                "retries_count": 0,
+                                "status": "active"
+                            }
+                            self._osu_closed_timer_start = None
+                            self._session_recap_modal_shown = False
+                        else:
+                            # Player reopened osu! within 5 minutes -> cancel cooldown countdown
+                            if self._osu_closed_timer_start is not None:
+                                self._osu_closed_timer_start = None
+
+                        # Sync recent plays in background
+                        self._sync_session_recent_plays()
+
+                    else:
+                        # Case 2: osu! is NOT running
+                        if self.active_session is not None and self.active_session.get("status") == "active":
+                            if self._osu_closed_timer_start is None:
+                                # osu! was just closed -> start 5-minute (300 sec) countdown
+                                self._osu_closed_timer_start = now
+                            else:
+                                elapsed = now - self._osu_closed_timer_start
+                                # Trigger recap exactly after 5 minutes (300 seconds) of inactivity
+                                if elapsed >= 300 and not getattr(self, "_session_recap_modal_shown", False):
+                                    self._session_recap_modal_shown = True
+                                    recap = self.finalize_active_session()
+                                    if recap:
+                                        self.after(0, lambda r=recap: self.show_session_recap_modal(r))
+                                    self.active_session = None
+                                    self._osu_closed_timer_start = None
+                except Exception:
+                    pass
+
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def _sync_session_recent_plays(self):
+        user = getattr(self, "osu_username", "")
+        key = getattr(self, "api_key", "")
+        if not user or not key or not self.active_session:
+            return
+
+        if not hasattr(self, "_processed_session_play_ids"):
+            self._processed_session_play_ids = set()
+
+        try:
+            url = f"https://osu.ppy.sh/api/get_user_recent?k={key}&u={user}&m=0&limit=10"
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                plays = r.json()
+                if isinstance(plays, list):
+                    for p in plays:
+                        p_id = str(p.get("date", "")) + "_" + str(p.get("score", ""))
+                        if p_id not in self._processed_session_play_ids:
+                            self._processed_session_play_ids.add(p_id)
+                            self.record_play_in_active_session(p)
+        except Exception:
+            pass
+
+    def record_play_in_active_session(self, play_obj):
+        if not self.active_session:
+            st = datetime.now()
+            s_stats = self._fetch_user_snapshot_stats()
+            self.active_session = {
+                "id": str(uuid.uuid4())[:8],
+                "date": st.strftime("%Y-%m-%d"),
+                "start_time_iso": st.isoformat(),
+                "start_time_str": st.strftime("%H:%M"),
+                "end_time_str": None,
+                "duration_mins": 0,
+                "start_rank": s_stats.get("rank", 0),
+                "start_pp": s_stats.get("pp", 0.0),
+                "start_acc": s_stats.get("acc", 0.0),
+                "start_top_play_ids": [str(p.get("beatmap_id", "")) for p in s_stats.get("top_plays", [])],
+                "end_rank": s_stats.get("rank", 0),
+                "end_pp": s_stats.get("pp", 0.0),
+                "end_acc": s_stats.get("acc", 0.0),
+                "plays": [],
+                "new_top_plays": [],
+                "skillset_distribution": {},
+                "avg_accuracy": 0.0,
+                "total_hits": 0,
+                "passes_count": 0,
+                "fails_count": 0,
+                "retries_count": 0,
+                "status": "active"
+            }
+
+        h300 = int(play_obj.get("count300", 0) or 0)
+        h100 = int(play_obj.get("count100", 0) or 0)
+        h50 = int(play_obj.get("count50", 0) or 0)
+        miss = int(play_obj.get("countmiss", 0) or 0)
+        tot = h300 + h100 + h50 + miss
+        acc = ((h300 * 300 + h100 * 100 + h50 * 50) / (tot * 300) * 100.0) if tot > 0 else 0.0
+        rank = str(play_obj.get("rank", "")).upper()
+        combo = int(play_obj.get("maxcombo", 0) or 0)
+        bid = str(play_obj.get("beatmap_id", ""))
+
+        is_fail_or_retry = (rank == "F")
+        is_quick_retry = is_fail_or_retry and (tot < 45 or combo < 20)
+        is_real_fail = is_fail_or_retry and not is_quick_retry
+        is_pass = not is_fail_or_retry
+
+        # Resolve Map metadata from database
+        map_meta = None
+        for m in (DYNAMIC_RANKED_MAPS_DB or []):
+            if str(m.get("id")) == bid:
+                map_meta = m
+                break
+
+        map_name = map_meta.get("name", f"Beatmap #{bid}") if map_meta else f"Beatmap #{bid}"
+        skill = map_meta.get("primary_skill", "Aim") if map_meta else "Aim"
+        sr = float(map_meta.get("sr", 5.0)) if map_meta else 5.0
+
+        # Compute Live PP & Peak metrics
+        mods_num = int(play_obj.get("enabled_mods", 0) or 0)
+        calc_pp, if_fc_pp = self.calculate_live_pp_metrics(sr=sr, acc=acc, combo=combo, max_combo=max(combo, tot), misses=miss, mods_num=mods_num)
+        
+        # Estimate Peak PP reached
+        peak_pp = if_fc_pp if (combo >= tot * 0.65 and miss <= 2) else calc_pp
+        if is_pass and miss == 0:
+            peak_pp = max(calc_pp, if_fc_pp)
+
+        # Update Map Peak Record in database
+        map_key = f"{bid}_{map_name}"
+        is_new_rec, prev_rec = self.update_map_peak_record(map_key, map_name, peak_pp, combo, mods_str="NM")
+        self.update_live_pp_hud(cur_pp=calc_pp, peak_pp=peak_pp, if_fc_pp=if_fc_pp, map_peak_pp=max(peak_pp, prev_rec))
+
+        # Check session highest peak
+        cur_ses_peak = self.active_session.get("highest_peak_pp", 0.0)
+        if peak_pp > cur_ses_peak:
+            self.active_session["highest_peak_pp"] = round(peak_pp, 1)
+            self.active_session["highest_peak_map"] = map_name
+            self.active_session["highest_peak_combo"] = combo
+            self.active_session["highest_peak_acc"] = round(acc, 2)
+            self.active_session["highest_peak_sr"] = sr
+
+        p_entry = {
+            "bid": bid,
+            "name": map_name,
+            "skill": skill,
+            "sr": sr,
+            "acc": round(acc, 2),
+            "miss": miss,
+            "combo": combo,
+            "rank": rank,
+            "hits": tot,
+            "calc_pp": calc_pp,
+            "peak_pp": peak_pp,
+            "if_fc_pp": if_fc_pp,
+            "is_pass": is_pass,
+            "is_fail": is_real_fail,
+            "is_retry": is_quick_retry
+        }
+
+        self.active_session["plays"].append(p_entry)
+        self.active_session["total_hits"] += tot
+        if is_pass:
+            self.active_session["passes_count"] += 1
+        elif is_real_fail:
+            self.active_session["fails_count"] += 1
+        elif is_quick_retry:
+            self.active_session["retries_count"] += 1
+
+        self.active_session["skillset_distribution"][skill] = self.active_session["skillset_distribution"].get(skill, 0) + 1
+
+    def finalize_active_session(self, is_manual=False):
+        if not self.active_session:
+            return None
+
+        s = self.active_session
+        end_time = datetime.now()
+        s["end_time_str"] = end_time.strftime("%H:%M")
+        
+        try:
+            st_iso = datetime.fromisoformat(s["start_time_iso"])
+            s["duration_mins"] = max(1, int((end_time - st_iso).total_seconds() / 60))
+        except Exception:
+            s["duration_mins"] = 15
+
+        # Fetch End Stats from osu! API
+        end_stats = self._fetch_user_snapshot_stats()
+        if end_stats.get("rank", 0) > 0:
+            s["end_rank"] = end_stats["rank"]
+            s["end_pp"] = end_stats["pp"]
+            s["end_acc"] = end_stats["acc"]
+        else:
+            s["end_rank"] = s.get("end_rank") or s.get("start_rank", 0)
+            s["end_pp"] = s.get("end_pp") or s.get("start_pp", 0.0)
+            s["end_acc"] = s.get("end_acc") or s.get("start_acc", 0.0)
+
+        # Rank & PP Delta (Lower rank number = better rank!)
+        if s["start_rank"] > 0 and s["end_rank"] > 0:
+            s["rank_delta"] = s["start_rank"] - s["end_rank"]
+        else:
+            s["rank_delta"] = 0
+
+        s["pp_delta"] = round(s["end_pp"] - s["start_pp"], 1)
+
+        # Check for new Top Plays achieved during session
+        start_top_ids = set(s.get("start_top_play_ids", []))
+        s["start_top_play_ids"] = list(start_top_ids)
+        new_tops = []
+        for i, tp in enumerate(end_stats.get("top_plays", [])[:50]):
+            tp_bid = str(tp.get("beatmap_id", ""))
+            if tp_bid not in start_top_ids:
+                t_name = f"Beatmap #{tp_bid}"
+                for m in (DYNAMIC_RANKED_MAPS_DB or []):
+                    if str(m.get("id")) == tp_bid:
+                        t_name = m.get("name", t_name)
+                        break
+                new_tops.append({
+                    "name": t_name,
+                    "pp": round(float(tp.get("pp", 0.0) or 0.0), 1),
+                    "mod": format_mods_string(int(tp.get("enabled_mods", 0) or 0)),
+                    "rank_in_top": i + 1
+                })
+        s["new_top_plays"] = new_tops
+
+        # Calculate average session accuracy
+        pass_accs = [p["acc"] for p in s["plays"] if p.get("is_pass")]
+        if pass_accs:
+            s["avg_accuracy"] = round(sum(pass_accs) / len(pass_accs), 2)
+        elif s["plays"]:
+            s["avg_accuracy"] = round(sum(p["acc"] for p in s["plays"]) / len(s["plays"]), 2)
+        else:
+            s["avg_accuracy"] = s["end_acc"]
+
+        # Primary Skillset
+        if s["skillset_distribution"]:
+            s["primary_skill"] = max(s["skillset_distribution"], key=s["skillset_distribution"].get)
+        else:
+            s["primary_skill"] = "Allround"
+
+        # Best play of session
+        sorted_plays = sorted(s["plays"], key=lambda x: x.get("acc", 0) * x.get("sr", 1), reverse=True)
+        s["best_play"] = sorted_plays[0] if sorted_plays else None
+
+        # Physical Cooldown & Ergonomie Routine
+        prim = s["primary_skill"]
+        s_dist = s["skillset_distribution"]
+        stream_speed_share = (s_dist.get("Streams", 0) + s_dist.get("Speed", 0)) / max(1, len(s["plays"]))
+        
+        if stream_speed_share >= 0.35 or s["total_hits"] >= 4000:
+            s["health_cooldown"] = {
+                "title": "⚠️ Hohe Unterarm- & Beugesehnen-Belastung (Streams / Speed)",
+                "steps": [
+                    "1. Handgelenk-Beugerdehnung: Arm nach vorne strecken, Handfläche sanft nach unten/zu dir ziehen (25s pro Hand).",
+                    "2. Gebets-Stretch (Karpaltunnel): Handflächen vor der Brust flach gegeneinander drücken, Ellbogen langsam anheben (20s).",
+                    "3. Fingerschütteln: Hände 30s locker ausschütteln, anschließend warmes Wasser über die Unterarme laufen lassen."
+                ],
+                "rest_advice": "Mindestens 45 Minuten Pause vor der nächsten Tapping-Session machen, um Verkrampfungen vorzubeugen!"
+            }
+        elif prim in ["Aim", "Precision"] or s_dist.get("Aim", 0) >= 6:
+            s["health_cooldown"] = {
+                "title": "🎯 Hohe Schulter- & Handgelenks-Spannung (Aiming / Jumps)",
+                "steps": [
+                    "1. Schulterkreisen & Nacken: 10x langsam nach hinten kreisen, um Verspannungen im Trapezmuskel zu lösen.",
+                    "2. Daumenballen-Massage: Sanft den Muskelansatz der Maushand / Stifthand für 30s kreisend massieren.",
+                    "3. 20-20-20 Augenpause: 20 Sekunden lang auf einen Punkt in 6m Entfernung blicken."
+                ],
+                "rest_advice": "Achte auf eine ergonomische Sitzhaltung und lockere die Schulterpartie!"
+            }
+        else:
+            s["health_cooldown"] = {
+                "title": "✨ Ausgewogene Allround-Session",
+                "steps": [
+                    "1. Handgelenke sanft in beide Richtungen kreisen (je 15 Sekunden).",
+                    "2. Finger spreizen und für 5 Sekunden zu einer leichten Faust ballen (3x wiederholen).",
+                    "3. Kurzer Spaziergang oder Dehnung des oberen Rückens."
+                ],
+                "rest_advice": "Perfekte Session-Balance! Trink ein Glas Wasser zur Regeneration."
+            }
+
+        # Generate Gemini AI Tomorrow Prescription & Summary
+        tomorrow_plan = ""
+        summary_text = ""
+        if getattr(self, "gemini_key", ""):
+            try:
+                g_prompt = (
+                    f"Du bist der offizielle Pro osu! Cheftrainer. Erstelle ein prägnantes, motivierendes Tages-Fazit und einen konkreten Trainingsplan für MORGEN auf Deutsch:\n"
+                    f"Spieler: {getattr(self, 'osu_username', 'Spieler')}\n"
+                    f"Dauer: {s['duration_mins']} Min | Gespielte Maps: {len(s['plays'])} ({s['passes_count']} Passes, {s['fails_count']} Fails)\n"
+                    f"Rang-Delta: {'+' if s['rank_delta']>0 else ''}{s['rank_delta']} Ränge | PP-Delta: {'+' if s['pp_delta']>0 else ''}{s['pp_delta']:.1f} pp\n"
+                    f"Durchschnitts-Acc: {s['avg_accuracy']:.2f}% | Hauptfokus heute: {s['primary_skill']}\n"
+                    f"Antworte in genau 2 Abschnitten:\n"
+                    f"FAZIT: (2 motivierende Sätze zur heutigen Form)\n"
+                    f"PLAN FÜR MORGEN: (2 hochkonkrete Sätze, welches Skillset/BPM/Mod er morgen wie trainieren soll)"
+                )
+                g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}:generateContent?key={self.gemini_key}"
+                payload = {"contents": [{"role": "user", "parts": [{"text": g_prompt}]}], "generationConfig": {"temperature": 0.7, "maxOutputTokens": 350}}
+                res = requests.post(g_url, json=payload, timeout=8).json()
+                raw_t = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+                
+                if "PLAN FÜR MORGEN:" in raw_t:
+                    parts = raw_t.split("PLAN FÜR MORGEN:")
+                    summary_text = parts[0].replace("FAZIT:", "").strip()
+                    tomorrow_plan = parts[1].strip()
+                else:
+                    tomorrow_plan = raw_t
+            except Exception:
+                pass
+
+        if not tomorrow_plan:
+            if s["primary_skill"] == "Streams":
+                tomorrow_plan = "Du hast heute ein starkes Stream-Volumen absolviert. Morgen solltest du 20-30 Minuten gezielt Finger Control und Tech auf AR 9.2 spielen, um dein Aiming und Slider-Timing zu stabilisieren."
+                summary_text = f"Solide Ausdauer-Session mit {s['passes_count']} erfolgreichen Passes! Deine Finger haben gut durchgehalten."
+            elif s["primary_skill"] == "Speed":
+                tomorrow_plan = "Morgen empfiehlt sich ein Fokus auf Stamina und kontrollierte Deathstreams (-20 BPM), um den heutigen High-BPM Burst-Speed mit konstanter Ausdauer zu untermauern."
+                summary_text = "Explosiver Speed-Fokus! Du hast deine Reaktionsgrenze heute spürbar nach oben verschoben."
+            elif s["primary_skill"] == "Aim":
+                tomorrow_plan = "Nach der heutigen Aim- und Jump-Einheit solltest du morgen 30 Minuten Low-AR Reading und Precision (CS 5+) trainieren, um deine Snapping-Genauigkeit zu verfeinern."
+                summary_text = f"Guter Aim-Fokus mit {s['total_hits']:,} Hits! Achte morgen auf gleichmäßige Handgelenk-Führung."
+            else:
+                tomorrow_plan = "Morgen solltest du deine größte Schwachstelle (z. B. Tech oder Streams) mit 4-5 gezielten Warmup-Maps anspielen und anschließend auf deiner Wohlfühl-Disziplin aufbauen."
+                summary_text = "Ausgeglichene Trainingsrunde mit stabiler Accuracy über alle gespielten Maps."
+
+        s["ai_tomorrow_plan"] = tomorrow_plan
+        s["ai_summary"] = summary_text
+        s["status"] = "finished"
+
+        # Save into history
+        if not hasattr(self, "session_recaps_history") or not isinstance(self.session_recaps_history, list):
+            self.session_recaps_history = []
+        self.session_recaps_history.insert(0, s)
+        if len(self.session_recaps_history) > 60:
+            self.session_recaps_history = self.session_recaps_history[:60]
+        self.save_session_recaps_history()
+
+        return s
+
+    def format_discord_recap_text(self, s):
+        """Creates a clean, emoji-rich Markdown block for easy 1-click Discord sharing."""
+        rank_sign = "+" if s.get("rank_delta", 0) > 0 else ""
+        pp_sign = "+" if s.get("pp_delta", 0) > 0 else ""
+        
+        top_play_txt = ""
+        if s.get("new_top_plays"):
+            tp = s["new_top_plays"][0]
+            top_play_txt = f"\n🔥 **Neues #{tp.get('rank_in_top', 1)} Top-Play:** {tp.get('name', 'Map')} (+{tp.get('mod', 'NM')} • {tp.get('pp', 0):.0f}pp)"
+        
+        peak_highlight_txt = ""
+        if s.get("highest_peak_pp", 0) > 0:
+            peak_highlight_txt = f"\n⚡ **Höchster PP-Peak:** {s.get('highest_peak_pp', 0.0):.1f}pp auf {s.get('highest_peak_map', 'Map')} ({s.get('highest_peak_combo', 0)}x Combo)"
+
+        health_t = s.get("health_cooldown", {}).get("title", "Regenerations-Check")
+        h_steps = s.get("health_cooldown", {}).get("steps", ["Handgelenke dehnen"])
+        h_step_txt = h_steps[0] if h_steps else "Handgelenke dehnen & Fingerschütteln"
+
+        discord_card = (
+            f"╔══════════════════════════════════════════════════════╗\n"
+            f"║          📊 UHO Hub • TAGES- & SESSION-RECAP          ║\n"
+            f"╠══════════════════════════════════════════════════════╣\n"
+            f"👤 **Spieler:** {getattr(self, 'osu_username', 'Spieler')}  •  ⏱️ **Spielzeit:** {s.get('duration_mins', 0)} Min ({s.get('start_time_str', '00:00')} - {s.get('end_time_str', '00:00')})\n\n"
+            f"📈 **Rang-Delta:** #{s.get('start_rank', 0):,} ➔ #{s.get('end_rank', 0):,} ({rank_sign}{s.get('rank_delta', 0)} Ränge 🟢)\n"
+            f"⚡ **Performance:** {s.get('start_pp', 0.0):.1f}pp ➔ {s.get('end_pp', 0.0):.1f}pp ({pp_sign}{s.get('pp_delta', 0.0):.1f} Net-PP)\n"
+            f"🎮 **Maps gespielt:** {len(s.get('plays', []))} ({s.get('passes_count', 0)} Passes, {s.get('fails_count', 0)} Fails)  •  🎯 **Ø Acc:** {s.get('avg_accuracy', 0.0):.2f}%\n"
+            f"💥 **Total Hits:** {s.get('total_hits', 0):,}{top_play_txt}{peak_highlight_txt}\n\n"
+            f"⚡ **Haupt-Fokus heute:** {s.get('primary_skill', 'Allgemein')}\n"
+            f"🧘 **Cooldown-Tipp:** {h_step_txt}\n\n"
+            f"🎯 **KI-Plan für morgen:**\n\"{s.get('ai_tomorrow_plan', 'Konzentriertes Training fortsetzen.')}\"\n"
+            f"╚══════════════════════════════════════════════════════╝"
+        )
+        return discord_card
+
+    def show_session_recap_modal(self, recap):
+        """Displays a modal dialog with the session summary."""
+        modal = ctk.CTkToplevel(self)
+        modal.title("📊 UHO Hub • Tages- & Session-Recap")
+        modal.geometry("780x560")
+        modal.minsize(680, 480)
+        modal.configure(fg_color="#101015")
+        modal.attributes("-topmost", True)
+
+        try:
+            modal.update_idletasks()
+            w, h = 780, 560
+            x = self.winfo_x() + (self.winfo_width() // 2) - (w // 2)
+            y = self.winfo_y() + (self.winfo_height() // 2) - (h // 2)
+            modal.geometry(f"{w}x{h}+{max(20, x)}+{max(20, y)}")
+        except Exception:
+            pass
+
+        card = ctk.CTkFrame(modal, fg_color="#161622", corner_radius=16, border_width=1, border_color="#2c2c3e")
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        # Header
+        hdr = ctk.CTkFrame(card, fg_color="transparent")
+        hdr.pack(fill="x", padx=20, pady=(16, 10))
+
+        title_box = ctk.CTkFrame(hdr, fg_color="transparent")
+        title_box.pack(side="left")
+        ctk.CTkLabel(title_box, text="📊 TAGES- & SESSION-RECAP", font=("Arial", 18, "bold"), text_color="#00E5FF").pack(anchor="w")
+        ctk.CTkLabel(title_box, text=f"Spieler: {getattr(self, 'osu_username', 'Spieler')} • Datum: {recap.get('date', 'Heute')} • ⏱️ {recap.get('duration_mins', 0)} Min Spielzeit",
+                     font=("Arial", 11), text_color="#888899").pack(anchor="w")
+
+        # Scrollable container for cards
+        body = ctk.CTkScrollableFrame(card, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+        # Top 2-Column Grid
+        top_grid = ctk.CTkFrame(body, fg_color="transparent")
+        top_grid.pack(fill="x", pady=(0, 8))
+        top_grid.grid_columnconfigure(0, weight=1)
+        top_grid.grid_columnconfigure(1, weight=1)
+
+        # Card 1: Rang & Performance
+        c1 = ctk.CTkFrame(top_grid, fg_color="#1c1c28", corner_radius=12, border_width=1, border_color="#2a2a3e")
+        c1.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
+
+        ctk.CTkLabel(c1, text="📈 Rang & Performance", font=("Arial", 13, "bold"), text_color="#ffffff").pack(anchor="w", padx=14, pady=(12, 6))
+        
+        r_delta = recap.get("rank_delta", 0)
+        r_col = "#00E676" if r_delta > 0 else ("#FF5252" if r_delta < 0 else "#aaaaaa")
+        r_sign = "+" if r_delta > 0 else ""
+        r_txt = f"{r_sign}{r_delta} Ränge" if r_delta != 0 else "Rang gehalten"
+        ctk.CTkLabel(c1, text=f"• Rang: #{recap.get('start_rank', 0):,} ➔ #{recap.get('end_rank', 0):,} ({r_txt})",
+                     font=("Arial", 12, "bold"), text_color=r_col).pack(anchor="w", padx=14, pady=2)
+
+        pp_d = recap.get("pp_delta", 0.0)
+        pp_col = "#00E676" if pp_d > 0 else ("#FF5252" if pp_d < 0 else "#aaaaaa")
+        pp_sign = "+" if pp_d > 0 else ""
+        ctk.CTkLabel(c1, text=f"• Performance: {recap.get('start_pp', 0.0):.1f}pp ➔ {recap.get('end_pp', 0.0):.1f}pp ({pp_sign}{pp_d:.1f} Net-PP)",
+                     font=("Arial", 12), text_color=pp_col).pack(anchor="w", padx=14, pady=2)
+
+        ctk.CTkLabel(c1, text=f"• Maps: {len(recap.get('plays', []))} ({recap.get('passes_count', 0)} Passes, {recap.get('fails_count', 0)} Fails)",
+                     font=("Arial", 11), text_color="#cccccc").pack(anchor="w", padx=14, pady=2)
+        ctk.CTkLabel(c1, text=f"• Durchschnitts-Acc: {recap.get('avg_accuracy', 0.0):.2f}% • Hits: {recap.get('total_hits', 0):,}",
+                     font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=14, pady=(2, 12))
+
+        # Card 2: Highlights & Top-Plays
+        c2 = ctk.CTkFrame(top_grid, fg_color="#1c1c28", corner_radius=12, border_width=1, border_color="#2a2a3e")
+        c2.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
+
+        ctk.CTkLabel(c2, text="🏆 Session-Highlights", font=("Arial", 13, "bold"), text_color="#ffffff").pack(anchor="w", padx=14, pady=(12, 6))
+
+        if recap.get("highest_peak_pp", 0) > 0:
+            peak_val = recap["highest_peak_pp"]
+            peak_m = recap.get("highest_peak_map", "Beatmap")
+            peak_cb = recap.get("highest_peak_combo", 0)
+            ctk.CTkLabel(c2, text=f"🔥 Höchster PP-Peak: {peak_val:.1f} PP", font=("Arial", 12, "bold"), text_color="#FF9800").pack(anchor="w", padx=14, pady=2)
+            ctk.CTkLabel(c2, text=f"🗺️ {peak_m[:32]} (Peak bei {peak_cb}x Combo)", font=("Arial", 11), text_color="#00E5FF").pack(anchor="w", padx=14, pady=(0, 3))
+
+        if recap.get("new_top_plays"):
+            tp = recap["new_top_plays"][0]
+            ctk.CTkLabel(c2, text=f"⭐ Neues #{tp.get('rank_in_top', 1)} Top-Play!", font=("Arial", 11, "bold"), text_color="#4CAF50").pack(anchor="w", padx=14, pady=1)
+            ctk.CTkLabel(c2, text=f"{tp.get('name', 'Map')[:32]} (+{tp.get('mod', 'NM')} • {tp.get('pp', 0):.0f}pp)", font=("Arial", 10), text_color="#ffffff").pack(anchor="w", padx=14, pady=1)
+        elif recap.get("best_play"):
+            bp = recap["best_play"]
+            ctk.CTkLabel(c2, text="⭐ Bester Run dieser Session:", font=("Arial", 11, "bold"), text_color="#4CAF50").pack(anchor="w", padx=14, pady=1)
+            ctk.CTkLabel(c2, text=f"{bp.get('name', '')[:30]} (★ {bp.get('sr', 5.0):.1f} • {bp.get('acc', 0):.1f}%)", font=("Arial", 10), text_color="#ffffff").pack(anchor="w", padx=14, pady=1)
+
+        ctk.CTkLabel(c2, text=f"• Hauptfokus heute: {recap.get('primary_skill', 'Allgemein')}", font=("Arial", 11, "bold"), text_color="#BA68C8").pack(anchor="w", padx=14, pady=2)
+
+        # Card 3: Hand- & Ergonomie-Coach
+        health_info = recap.get("health_cooldown", {})
+        c3 = ctk.CTkFrame(body, fg_color="#181e28", corner_radius=12, border_width=1, border_color="#1f364d")
+        c3.pack(fill="x", pady=6)
+
+        ctk.CTkLabel(c3, text="🧘 Hand- & Ergonomie-Coach (Regeneration)", font=("Arial", 13, "bold"), text_color="#00E5FF").pack(anchor="w", padx=14, pady=(12, 4))
+        ctk.CTkLabel(c3, text=health_info.get("title", "Regenerations-Tipp"), font=("Arial", 11, "bold"), text_color="#FFB74D").pack(anchor="w", padx=14, pady=2)
+
+        for step in health_info.get("steps", []):
+            ctk.CTkLabel(c3, text=f"• {step}", font=("Arial", 11), text_color="#e0e0e0", justify="left", wraplength=660).pack(anchor="w", padx=14, pady=2)
+
+        if health_info.get("rest_advice"):
+            ctk.CTkLabel(c3, text=f"💡 {health_info.get('rest_advice')}", font=("Arial", 10, "bold"), text_color="#81C784").pack(anchor="w", padx=14, pady=(4, 12))
+
+        # Card 4: KI-Trainingsplan für morgen
+        c4 = ctk.CTkFrame(body, fg_color="#201828", corner_radius=12, border_width=1, border_color="#3a254c")
+        c4.pack(fill="x", pady=6)
+
+        ctk.CTkLabel(c4, text="🎯 KI-Trainingsplan für MORGEN", font=("Arial", 13, "bold"), text_color="#E040FB").pack(anchor="w", padx=14, pady=(12, 4))
+        if recap.get("ai_summary"):
+            ctk.CTkLabel(c4, text=f"📋 Tages-Fazit: {recap.get('ai_summary')}", font=("Arial", 11), text_color="#cccccc", wraplength=660, justify="left").pack(anchor="w", padx=14, pady=2)
+        ctk.CTkLabel(c4, text=f"💡 Fokus morgen: {recap.get('ai_tomorrow_plan', '')}", font=("Arial", 11, "bold"), text_color="#ffffff", wraplength=660, justify="left").pack(anchor="w", padx=14, pady=(2, 12))
+
+        # Bottom Actions Bar
+        bot_bar = ctk.CTkFrame(card, fg_color="transparent", height=44)
+        bot_bar.pack(fill="x", padx=14, pady=(6, 12))
+
+        copy_status_lbl = ctk.CTkLabel(bot_bar, text="", font=("Arial", 11, "bold"), text_color="#00E676")
+        copy_status_lbl.pack(side="left", padx=10)
+
+        def do_copy_discord():
+            txt = self.format_discord_recap_text(recap)
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            self.update()
+            copy_status_lbl.configure(text="✅ Discord-Card in Zwischenablage kopiert!")
+            self.after(3000, lambda: copy_status_lbl.configure(text="") if copy_status_lbl.winfo_exists() else None)
+
+        ctk.CTkButton(bot_bar, text="📋 Für Discord kopieren", font=("Arial", 12, "bold"), height=34,
+                      fg_color="#5865F2", hover_color="#4752C4", text_color="#ffffff", command=do_copy_discord).pack(side="left", padx=5)
+
+        def open_dash():
+            modal.destroy()
+            self.show_daily_recap_dashboard(recap.get("id"))
+
+        ctk.CTkButton(bot_bar, text="📂 Im Dashboard ansehen", font=("Arial", 12), height=34,
+                      fg_color="#2b2b36", hover_color="#3a3a48", command=open_dash).pack(side="left", padx=5)
+
+        ctk.CTkButton(bot_bar, text="✕ Schließen", font=("Arial", 12, "bold"), height=34, width=90,
+                      fg_color="#1f538d", hover_color="#14375e", command=modal.destroy).pack(side="right", padx=5)
+
+    def show_daily_recap_dashboard(self, selected_recap_id=None):
+        """Opens the full Day & Session Recap Center with historical timeline."""
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        master = ctk.CTkFrame(self, fg_color="#101015")
+        master.pack(fill="both", expand=True)
+        self.draw_lazer_background(master)
+
+        top_bar = ctk.CTkFrame(master, fg_color="#181822", height=60, corner_radius=12)
+        top_bar.pack(fill="x", padx=20, pady=(15, 10))
+        top_bar.pack_propagate(False)
+
+        ctk.CTkButton(top_bar, text="⬅ Hauptmenü", width=100, height=36, font=("Arial", 13, "bold"),
+                      fg_color="#25252e", hover_color="#353540", command=self.show_main_menu).pack(side="left", padx=15, pady=12)
+
+        ctk.CTkLabel(top_bar, text="📊 Tages- & Session-Recap Zentrale", font=("Arial", 18, "bold"), text_color="#7B1FA2").pack(side="left", padx=10)
+
+        main_box = ctk.CTkFrame(master, fg_color="transparent")
+        main_box.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        main_box.grid_columnconfigure(0, weight=1)
+        main_box.grid_columnconfigure(1, weight=3)
+        main_box.grid_rowconfigure(0, weight=1)
+
+        # Left History List Pane
+        left_pane = ctk.CTkFrame(main_box, fg_color="#161620", corner_radius=12, border_width=1, border_color="#242432")
+        left_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        l_hdr = ctk.CTkFrame(left_pane, fg_color="transparent")
+        l_hdr.pack(fill="x", padx=12, pady=(12, 6))
+        ctk.CTkLabel(l_hdr, text="🕒 Bisherige Sessions", font=("Arial", 13, "bold"), text_color="#ffffff").pack(side="left")
+
+        hist_scroll = ctk.CTkScrollableFrame(left_pane, fg_color="transparent")
+        hist_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+
+        # Right Detail Pane
+        right_pane = ctk.CTkFrame(main_box, fg_color="#161620", corner_radius=12, border_width=1, border_color="#242432")
+        right_pane.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        history = getattr(self, "session_recaps_history", []) or []
+
+        def render_detail(recap_item):
+            for w in right_pane.winfo_children():
+                w.destroy()
+
+            r_hdr = ctk.CTkFrame(right_pane, fg_color="transparent")
+            r_hdr.pack(fill="x", padx=18, pady=(14, 8))
+
+            is_live = (recap_item.get("status") == "active")
+            badge_txt = "🟢 LIVE-SESSION LÄUFT" if is_live else f"🏁 SESSION VOM {recap_item.get('date', 'HEUTE')}"
+            badge_col = "#00E676" if is_live else "#00E5FF"
+            ctk.CTkLabel(r_hdr, text=badge_txt, font=("Arial", 16, "bold"), text_color=badge_col).pack(anchor="w")
+            ctk.CTkLabel(r_hdr, text=f"Start: {recap_item.get('start_time_str', '00:00')} • Dauer: {recap_item.get('duration_mins', 0)} Min • Maps: {len(recap_item.get('plays', []))}",
+                         font=("Arial", 11), text_color="#888899").pack(anchor="w")
+
+            detail_scroll = ctk.CTkScrollableFrame(right_pane, fg_color="transparent")
+            detail_scroll.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+            # Stats Grid
+            grid = ctk.CTkFrame(detail_scroll, fg_color="transparent")
+            grid.pack(fill="x", pady=6)
+            grid.grid_columnconfigure(0, weight=1)
+            grid.grid_columnconfigure(1, weight=1)
+
+            # Box 1: Rank & PP
+            b1 = ctk.CTkFrame(grid, fg_color="#1c1c28", corner_radius=10, border_width=1, border_color="#2a2a3e")
+            b1.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=4)
+            ctk.CTkLabel(b1, text="📈 Rang & Performance", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=12, pady=(10, 4))
+            
+            r_del = recap_item.get("rank_delta", 0)
+            r_col = "#00E676" if r_del > 0 else ("#FF5252" if r_del < 0 else "#aaaaaa")
+            r_sgn = "+" if r_del > 0 else ""
+            ctk.CTkLabel(b1, text=f"• Rang: #{recap_item.get('start_rank', 0):,} ➔ #{recap_item.get('end_rank', 0):,} ({r_sgn}{r_del})",
+                         font=("Arial", 11, "bold"), text_color=r_col).pack(anchor="w", padx=12, pady=2)
+
+            pp_d = recap_item.get("pp_delta", 0.0)
+            pp_col = "#00E676" if pp_d > 0 else ("#FF5252" if pp_d < 0 else "#aaaaaa")
+            pp_sgn = "+" if pp_d > 0 else ""
+            ctk.CTkLabel(b1, text=f"• Net-PP: {pp_sgn}{pp_d:.1f} pp (Aktuell: {recap_item.get('end_pp', 0.0):.1f}pp)",
+                         font=("Arial", 11), text_color=pp_col).pack(anchor="w", padx=12, pady=2)
+            ctk.CTkLabel(b1, text=f"• Accuracy: Ø {recap_item.get('avg_accuracy', 0.0):.2f}% • Hits: {recap_item.get('total_hits', 0):,}",
+                         font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=12, pady=(2, 10))
+
+            # Box 2: Highlights
+            b2 = ctk.CTkFrame(grid, fg_color="#1c1c28", corner_radius=10, border_width=1, border_color="#2a2a3e")
+            b2.grid(row=0, column=1, sticky="nsew", padx=(5, 0), pady=4)
+            ctk.CTkLabel(b2, text="🏆 Highlights & Fokus", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=12, pady=(10, 4))
+            ctk.CTkLabel(b2, text=f"• Haupt-Skillset: {recap_item.get('primary_skill', 'Allround')}", font=("Arial", 11, "bold"), text_color="#BA68C8").pack(anchor="w", padx=12, pady=2)
+            ctk.CTkLabel(b2, text=f"• Passes: {recap_item.get('passes_count', 0)} | Fails: {recap_item.get('fails_count', 0)} | Retries: {recap_item.get('retries_count', 0)}",
+                         font=("Arial", 11), text_color="#cccccc").pack(anchor="w", padx=12, pady=(2, 10))
+
+            # Cooldown Box
+            health_i = recap_item.get("health_cooldown", {})
+            if health_i:
+                b3 = ctk.CTkFrame(detail_scroll, fg_color="#181e28", corner_radius=10, border_width=1, border_color="#1f364d")
+                b3.pack(fill="x", pady=6)
+                ctk.CTkLabel(b3, text="🧘 Hand- & Ergonomie-Coach", font=("Arial", 12, "bold"), text_color="#00E5FF").pack(anchor="w", padx=12, pady=(8, 2))
+                ctk.CTkLabel(b3, text=health_i.get("title", ""), font=("Arial", 10, "bold"), text_color="#FFB74D").pack(anchor="w", padx=12, pady=1)
+                for st in health_i.get("steps", []):
+                    ctk.CTkLabel(b3, text=f"• {st}", font=("Arial", 10), text_color="#dddddd", wraplength=540, justify="left").pack(anchor="w", padx=12, pady=1)
+
+            # Tomorrow Plan Box
+            if recap_item.get("ai_tomorrow_plan"):
+                b4 = ctk.CTkFrame(detail_scroll, fg_color="#201828", corner_radius=10, border_width=1, border_color="#3a254c")
+                b4.pack(fill="x", pady=6)
+                ctk.CTkLabel(b4, text="🎯 KI-Trainingsplan für MORGEN", font=("Arial", 12, "bold"), text_color="#E040FB").pack(anchor="w", padx=12, pady=(8, 2))
+                ctk.CTkLabel(b4, text=recap_item.get("ai_tomorrow_plan", ""), font=("Arial", 10, "bold"), text_color="#ffffff", wraplength=540, justify="left").pack(anchor="w", padx=12, pady=(2, 8))
+
+            # Actions
+            b_actions = ctk.CTkFrame(right_pane, fg_color="transparent", height=42)
+            b_actions.pack(fill="x", padx=14, pady=(4, 10))
+
+            def copy_d():
+                txt = self.format_discord_recap_text(recap_item)
+                self.clipboard_clear()
+                self.clipboard_append(txt)
+                self.update()
+
+            ctk.CTkButton(b_actions, text="📋 Für Discord kopieren", font=("Arial", 11, "bold"), height=32,
+                          fg_color="#5865F2", hover_color="#4752C4", command=copy_d).pack(side="left", padx=4)
+
+            if is_live:
+                def manual_finish():
+                    fin = self.finalize_active_session(is_manual=True)
+                    self.active_session = None
+                    self.show_daily_recap_dashboard(fin.get("id") if fin else None)
+
+                ctk.CTkButton(b_actions, text="🏁 Session jetzt finalisieren", font=("Arial", 11, "bold"), height=32,
+                              fg_color="#c62828", hover_color="#b71c1c", command=manual_finish).pack(side="right", padx=4)
+
+        # Build History List
+        first_item = None
+        if self.active_session:
+            first_item = self.active_session
+            s_btn = ctk.CTkButton(hist_scroll, text=f"🟢 Live-Session ({self.active_session.get('duration_mins', 0)}m)",
+                                  font=("Arial", 11, "bold"), fg_color="#1f3b25", hover_color="#285233",
+                                  command=lambda item=self.active_session: render_detail(item))
+            s_btn.pack(fill="x", pady=3)
+
+        for rec in history:
+            if not first_item and (not selected_recap_id or rec.get("id") == selected_recap_id):
+                first_item = rec
+            r_d = rec.get("rank_delta", 0)
+            r_sgn = f"+{r_d}" if r_d > 0 else str(r_d)
+            btn_txt = f"📅 {rec.get('date', 'Unbekannt')} ({rec.get('duration_mins', 0)}m | {r_sgn} Ränge)"
+            ctk.CTkButton(hist_scroll, text=btn_txt, font=("Arial", 10), fg_color="#1f1f2c", hover_color="#2b2b3e",
+                          command=lambda item=rec: render_detail(item)).pack(fill="x", pady=2)
+
+        if first_item:
+            render_detail(first_item)
+        else:
+            ctk.CTkLabel(right_pane, text="Noch keine abgeschlossenen Sessions vorhanden.\nStarte osu! und spiele ein paar Maps – nach 5 Minuten Schließen erscheint dein erstes Recap!",
+                         font=("Arial", 12), text_color="#888899", justify="center").pack(expand=True)
+
+    # ---------------------------------------------------------------------------
     # MAIN MENU
     # ---------------------------------------------------------------------------
-    def show_main_menu(self):
+    
+    # ---------------------------------------------------------------------------
+    # WIDGETS & PP CALCULATOR SYSTEM (CONFIG, DRAG & DROP EDITOR, LIVE HUD)
+    # ---------------------------------------------------------------------------
+    def load_widgets_config(self):
+        default_cfg = {
+            "pp_calculator": {
+                "enabled": True,
+                "x": 1380,
+                "y": 45,
+                "width": 280,
+                "height": 105,
+                "show_peak": True,
+                "show_if_fc": True,
+                "show_map_peak": True,
+                "show_graph": True,
+                "opacity": 0.85
+            },
+            "session_stats": {
+                "enabled": False,
+                "x": 40,
+                "y": 40,
+                "width": 240,
+                "height": 90,
+                "opacity": 0.85
+            },
+            "ur_bar": {
+                "enabled": False,
+                "x": 750,
+                "y": 920,
+                "width": 320,
+                "height": 55,
+                "opacity": 0.85
+            },
+            "ai_coach_tips": {
+                "enabled": False,
+                "x": 1340,
+                "y": 260,
+                "width": 300,
+                "height": 115,
+                "opacity": 0.90
+            }
+        }
+        try:
+            cfg_file = "widgets_config.json"
+            if os.path.exists(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    default_cfg.update(loaded)
+        except Exception:
+            pass
+        return default_cfg
+
+    def save_widgets_config(self):
+        try:
+            with open("widgets_config.json", "w", encoding="utf-8") as f:
+                json.dump(getattr(self, "widgets_config", {}), f, indent=2)
+        except Exception:
+            pass
+
+    def load_map_peaks_history(self):
+        try:
+            if os.path.exists("map_peaks_history.json"):
+                with open("map_peaks_history.json", "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def save_map_peaks_history(self):
+        try:
+            with open("map_peaks_history.json", "w", encoding="utf-8") as f:
+                json.dump(getattr(self, "map_peaks_history", {}), f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def update_map_peak_record(self, map_key, map_title, peak_pp, max_combo, mods_str="NM"):
+        if not hasattr(self, "map_peaks_history"):
+            self.map_peaks_history = self.load_map_peaks_history()
+        
+        entry = self.map_peaks_history.get(map_key, {})
+        prev_peak = entry.get("highest_peak_pp", 0.0)
+        
+        if peak_pp > prev_peak:
+            self.map_peaks_history[map_key] = {
+                "title": map_title,
+                "highest_peak_pp": round(peak_pp, 1),
+                "highest_combo": max_combo,
+                "mods": mods_str,
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }
+            self.save_map_peaks_history()
+            return True, prev_peak
+        return False, prev_peak
+
+    def calculate_live_pp_metrics(self, sr=5.0, acc=100.0, combo=0, max_combo=1000, misses=0, mods_num=0):
+        """High-performance, zero-latency PP and Peak estimation."""
+        if max_combo <= 0: max_combo = 1000
+        combo_ratio = min(1.0, max(0.01, combo / max(1, max_combo)))
+        
+        # Base PP from Star Rating
+        base_pp = ((max(1.0, sr) ** 2.35) * 8.8)
+        
+        # Accuracy Factor (steep curve above 95%)
+        acc_factor = max(0.0, (acc - 55.0) / 45.0) ** 2.6
+        
+        # Miss Penalty
+        miss_pen = (0.96 ** (misses * 2.2)) if misses > 0 else 1.0
+        
+        # Combo Scaling
+        combo_scale = (combo_ratio ** 0.82)
+        
+        current_pp = max(0.0, round(base_pp * acc_factor * combo_scale * miss_pen, 1))
+        
+        # If FC PP (projected if full combo held from this point)
+        fc_acc = max(acc, (acc * combo + 100.0 * (max_combo - combo)) / max(1, max_combo))
+        fc_acc_factor = max(0.0, (fc_acc - 55.0) / 45.0) ** 2.6
+        if_fc_pp = max(current_pp, round(base_pp * fc_acc_factor * 1.0 * (0.97 ** max(0, misses - 1) if misses > 0 else 1.0), 1))
+        
+        return current_pp, if_fc_pp
+
+    
+    # ---------------------------------------------------------------------------
+    # WIDGETS HUB & INTERACTIVE DRAG & DROP POSITION EDITOR
+    # ---------------------------------------------------------------------------
+    def show_widgets_hub(self):
         for widget in self.winfo_children():
             widget.destroy()
 
@@ -3534,26 +4469,367 @@ DEINE ANTWORT-RICHTLINIEN:
         master.pack(fill="both", expand=True)
         self.draw_lazer_background(master)
 
-        frame = ctk.CTkFrame(master, fg_color="#181822", corner_radius=20, border_width=1, border_color="#2e2e3f", width=420, height=520)
+        top_bar = ctk.CTkFrame(master, fg_color="#181822", height=60, corner_radius=12)
+        top_bar.pack(fill="x", padx=20, pady=(15, 10))
+        top_bar.pack_propagate(False)
+
+        ctk.CTkButton(top_bar, text="⬅ Hauptmenü", width=100, height=36, font=("Arial", 13, "bold"),
+                      fg_color="#25252e", hover_color="#353540", command=self.show_main_menu).pack(side="left", padx=15, pady=12)
+
+        ctk.CTkLabel(top_bar, text="🎨 In-Game Widgets & HUD Hub", font=("Arial", 18, "bold"), text_color="#00E5FF").pack(side="left", padx=10)
+
+        ctk.CTkButton(top_bar, text="📐 Widgets anordnen & testen", height=36, font=("Arial", 13, "bold"),
+                      fg_color="#1f538d", hover_color="#14375e", command=self.open_widget_position_editor).pack(side="right", padx=15, pady=12)
+
+        cards_scroll = ctk.CTkScrollableFrame(master, fg_color="transparent")
+        cards_scroll.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+        if not hasattr(self, "widgets_config"):
+            self.widgets_config = self.load_widgets_config()
+
+        grid_frame = ctk.CTkFrame(cards_scroll, fg_color="transparent")
+        grid_frame.pack(expand=True, fill="both", pady=10)
+        grid_frame.grid_columnconfigure(0, weight=1)
+        grid_frame.grid_columnconfigure(1, weight=1)
+
+        # ----------------- WIDGET 1: LIVE PP & PEAK CALCULATOR -----------------
+        w1 = ctk.CTkFrame(grid_frame, fg_color="#161622", corner_radius=16, border_width=2, border_color="#1f538d")
+        w1.grid(row=0, column=0, padx=12, pady=10, sticky="nsew")
+
+        w1_top = ctk.CTkFrame(w1, fg_color="transparent")
+        w1_top.pack(fill="x", padx=16, pady=(14, 4))
+        ctk.CTkLabel(w1_top, text="🔥 Live PP & Peak Calculator", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left")
+        
+        pp_cfg = self.widgets_config.setdefault("pp_calculator", {
+            "enabled": True, "x": 1380, "y": 45, "show_peak": True, "show_if_fc": True, "show_map_peak": True, "show_graph": True
+        })
+
+        def toggle_pp(val=None):
+            pp_cfg["enabled"] = pp_switch.get()
+            self.save_widgets_config()
+
+        pp_switch = ctk.CTkSwitch(w1_top, text="Aktiv", font=("Arial", 12, "bold"), command=toggle_pp)
+        if pp_cfg.get("enabled", True): pp_switch.select()
+        else: pp_switch.deselect()
+        pp_switch.pack(side="right")
+
+        ctk.CTkLabel(w1, text="Echtzeit PP-Anzeige während des Plays mit 0 FPS Verlust. Zeigt aktuellen PP, Peak PP, If-FC PP und den All-Time Map Rekord.",
+                     font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # Sub-Options Box
+        sub_box = ctk.CTkFrame(w1, fg_color="#1e1e2c", corner_radius=10)
+        sub_box.pack(fill="x", padx=14, pady=(0, 14))
+
+        def make_sub_chk(parent, text, key, default=True):
+            var = ctk.BooleanVar(value=pp_cfg.get(key, default))
+            def on_change():
+                pp_cfg[key] = var.get()
+                self.save_widgets_config()
+            chk = ctk.CTkCheckBox(parent, text=text, font=("Arial", 11), variable=var, command=on_change,
+                                  checkbox_width=18, checkbox_height=18)
+            chk.pack(anchor="w", padx=12, pady=4)
+            return chk
+
+        make_sub_chk(sub_box, "📈 Peak-PP anzeigen (Höchster erreichter Wert im Play)", "show_peak", True)
+        make_sub_chk(sub_box, "✨ If-FC PP anzeigen (Was der Run ohne weitere Misses gibt)", "show_if_fc", True)
+        make_sub_chk(sub_box, "🏆 All-Time Map Peak anzeigen (Ewiger Rekord auf dieser Map)", "show_map_peak", True)
+        make_sub_chk(sub_box, "📊 Live-Verlaufsgraph anzeigen", "show_graph", True)
+
+        # ----------------- WIDGET 2: SESSION LIVE-STATS -----------------
+        w2 = ctk.CTkFrame(grid_frame, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2c2c3e")
+        w2.grid(row=0, column=1, padx=12, pady=10, sticky="nsew")
+
+        w2_top = ctk.CTkFrame(w2, fg_color="transparent")
+        w2_top.pack(fill="x", padx=16, pady=(14, 4))
+        ctk.CTkLabel(w2_top, text="📊 Session Live-Stats", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left")
+
+        s_cfg = self.widgets_config.setdefault("session_stats", {"enabled": False, "x": 40, "y": 40})
+        def toggle_session():
+            s_cfg["enabled"] = s_switch.get()
+            self.save_widgets_config()
+
+        s_switch = ctk.CTkSwitch(w2_top, text="Aktiv", font=("Arial", 12, "bold"), command=toggle_session)
+        if s_cfg.get("enabled", False): s_switch.select()
+        else: s_switch.deselect()
+        s_switch.pack(side="right")
+
+        ctk.CTkLabel(w2, text="Kompaktes HUD für heutigen Rang-Gewinn/Verlust, Net-PP Delta, Spielzeit und Pass/Fail-Quote während deiner Session.",
+                     font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 14))
+
+        # ----------------- WIDGET 3: LIVE UNSTABLE RATE BAR -----------------
+        w3 = ctk.CTkFrame(grid_frame, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2c2c3e")
+        w3.grid(row=1, column=0, padx=12, pady=10, sticky="nsew")
+
+        w3_top = ctk.CTkFrame(w3, fg_color="transparent")
+        w3_top.pack(fill="x", padx=16, pady=(14, 4))
+        ctk.CTkLabel(w3_top, text="🎯 Live UR & Timing Error Bar", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left")
+
+        ur_cfg = self.widgets_config.setdefault("ur_bar", {"enabled": False, "x": 750, "y": 920})
+        def toggle_ur():
+            ur_cfg["enabled"] = ur_switch.get()
+            self.save_widgets_config()
+
+        ur_switch = ctk.CTkSwitch(w3_top, text="Aktiv", font=("Arial", 12, "bold"), command=toggle_ur)
+        if ur_cfg.get("enabled", False): ur_switch.select()
+        else: ur_switch.deselect()
+        ur_switch.pack(side="right")
+
+        ctk.CTkLabel(w3, text="Präzisions-Leiste am unteren Bildschirmrand. Zeigt live Timing-Abweichungen (Early/Late) in Millisekunden und die Unstable Rate.",
+                     font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 14))
+
+        # ----------------- WIDGET 4: KI-COACH LIVE TIPPS -----------------
+        w4 = ctk.CTkFrame(grid_frame, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2c2c3e")
+        w4.grid(row=1, column=1, padx=12, pady=10, sticky="nsew")
+
+        w4_top = ctk.CTkFrame(w4, fg_color="transparent")
+        w4_top.pack(fill="x", padx=16, pady=(14, 4))
+        ctk.CTkLabel(w4_top, text="🤖 KI-Coach Live-Tipps", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left")
+
+        ai_cfg = self.widgets_config.setdefault("ai_coach_tips", {"enabled": False, "x": 1340, "y": 260})
+        def toggle_ai_hud():
+            ai_cfg["enabled"] = ai_switch.get()
+            self.save_widgets_config()
+
+        ai_switch = ctk.CTkSwitch(w4_top, text="Aktiv", font=("Arial", 12, "bold"), command=toggle_ai_hud)
+        if ai_cfg.get("enabled", False): ai_switch.select()
+        else: ai_switch.deselect()
+        ai_switch.pack(side="right")
+
+        ctk.CTkLabel(w4, text="Live-Feedback von Gemini direkt auf dem Bildschirm. Gibt sofortige Tipps bei Chokes, Stream-Müdigkeit oder Aim-Korrekturen.",
+                     font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 14))
+
+    # ---------------------------------------------------------------------------
+    # INTERACTIVE DRAG & DROP POSITIONING EDITOR
+    # ---------------------------------------------------------------------------
+    def open_widget_position_editor(self):
+        if getattr(self, "_widget_editor_win", None) and self._widget_editor_win.winfo_exists():
+            self._widget_editor_win.lift()
+            return
+
+        if not hasattr(self, "widgets_config"):
+            self.widgets_config = self.load_widgets_config()
+
+        pp_cfg = self.widgets_config.get("pp_calculator", {"x": 1380, "y": 45, "width": 280, "height": 105})
+        cur_x = pp_cfg.get("x", 1380)
+        cur_y = pp_cfg.get("y", 45)
+
+        editor = ctk.CTkToplevel(self)
+        self._widget_editor_win = editor
+        editor.title("📐 Widget Positionierungs-Editor")
+        editor.geometry(f"320x160+{cur_x}+{cur_y}")
+        editor.attributes("-topmost", True)
+        editor.configure(fg_color="#12121c")
+        editor.resizable(False, False)
+
+        # Drag bar header
+        drag_bar = ctk.CTkFrame(editor, fg_color="#1f538d", height=32, corner_radius=6)
+        drag_bar.pack(fill="x", padx=6, pady=(6, 2))
+        drag_bar.pack_propagate(False)
+
+        ctk.CTkLabel(drag_bar, text="✥ HIER DRÜCKEN & ZIEHEN", font=("Arial", 11, "bold"), text_color="#ffffff").pack(expand=True)
+
+        # Content Simulation
+        preview_box = ctk.CTkFrame(editor, fg_color="#181824", corner_radius=8, border_width=1, border_color="#2b2b3b")
+        preview_box.pack(fill="both", expand=True, padx=6, pady=4)
+
+        top_r = ctk.CTkFrame(preview_box, fg_color="transparent")
+        top_r.pack(fill="x", padx=8, pady=(4, 0))
+        ctk.CTkLabel(top_r, text="🔥 428.5 PP", font=("Arial", 16, "bold"), text_color="#00E5FF").pack(side="left")
+        ctk.CTkLabel(top_r, text="Peak: 512.0 PP", font=("Arial", 12, "bold"), text_color="#4CAF50").pack(side="right")
+
+        bot_r = ctk.CTkFrame(preview_box, fg_color="transparent")
+        bot_r.pack(fill="x", padx=8, pady=(0, 2))
+        ctk.CTkLabel(bot_r, text="If FC: 545.0 PP  |  Map Rekord: 520.4 PP", font=("Arial", 10), text_color="#aaaaaa").pack(side="left")
+
+        # Save Button
+        def save_and_close():
+            try:
+                x = editor.winfo_x()
+                y = editor.winfo_y()
+                pp_cfg["x"] = x
+                pp_cfg["y"] = y
+                self.save_widgets_config()
+            except Exception: pass
+            editor.destroy()
+            self._widget_editor_win = None
+            if hasattr(self, "show_message"):
+                self.show_message("Position gespeichert", f"Die Position ({x}, {y}) wurde erfolgreich gespeichert!")
+
+        ctk.CTkButton(editor, text="💾 Position speichern & schließen", font=("Arial", 11, "bold"), height=26,
+                      fg_color="#2E7D32", hover_color="#1B5E20", command=save_and_close).pack(fill="x", padx=6, pady=(0, 6))
+
+        # Mouse Drag Binding on Drag Bar
+        def on_press(e):
+            editor._offset_x = e.x_root - editor.winfo_x()
+            editor._offset_y = e.y_root - editor.winfo_y()
+
+        def on_motion(e):
+            new_x = e.x_root - getattr(editor, "_offset_x", 0)
+            new_y = e.y_root - getattr(editor, "_offset_y", 0)
+            editor.geometry(f"+{new_x}+{new_y}")
+
+        drag_bar.bind("<ButtonPress-1>", on_press)
+        drag_bar.bind("<B1-Motion>", on_motion)
+        for w in drag_bar.winfo_children():
+            w.bind("<ButtonPress-1>", on_press)
+            w.bind("<B1-Motion>", on_motion)
+
+    
+    # ---------------------------------------------------------------------------
+    # LIVE IN-GAME PP WIDGET OVERLAY (TRANSPARENT & CLICK-THROUGH)
+    # ---------------------------------------------------------------------------
+    def _ensure_live_pp_overlay(self):
+        if not hasattr(self, "widgets_config"):
+            self.widgets_config = self.load_widgets_config()
+        
+        pp_cfg = self.widgets_config.get("pp_calculator", {})
+        if not pp_cfg.get("enabled", True):
+            if getattr(self, "_live_pp_win", None) and self._live_pp_win.winfo_exists():
+                self._live_pp_win.destroy()
+                self._live_pp_win = None
+            return
+
+        if getattr(self, "_live_pp_win", None) is None or not self._live_pp_win.winfo_exists():
+            win = tk.Toplevel(self)
+            self._live_pp_win = win
+            win.overrideredirect(True)
+            win.wm_attributes("-topmost", True)
+            try: win.wm_attributes("-alpha", pp_cfg.get("opacity", 0.85))
+            except: pass
+
+            x = pp_cfg.get("x", 1380)
+            y = pp_cfg.get("y", 45)
+            w = pp_cfg.get("width", 280)
+            h = pp_cfg.get("height", 100)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            win.configure(bg="#101018")
+
+            # Apply Windows Click-Through Style
+            try:
+                import ctypes
+                GWL_EXSTYLE = -20
+                WS_EX_LAYERED = 0x00080000
+                WS_EX_TRANSPARENT = 0x00000020
+                WS_EX_TOPMOST = 0x00000008
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+                if hwnd == 0: hwnd = win.winfo_id()
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST)
+            except Exception:
+                pass
+
+            # Inner UI container
+            box = tk.Frame(win, bg="#141420", bd=1, relief="solid")
+            box.pack(fill="both", expand=True, padx=2, pady=2)
+            win._box = box
+
+            r1 = tk.Frame(box, bg="#141420")
+            r1.pack(fill="x", padx=8, pady=(4, 1))
+            lbl_pp = tk.Label(r1, text="🔥 0.0 PP", font=("Arial", 14, "bold"), fg="#00E5FF", bg="#141420")
+            lbl_pp.pack(side="left")
+            lbl_peak = tk.Label(r1, text="Peak: 0.0 PP", font=("Arial", 10, "bold"), fg="#4CAF50", bg="#141420")
+            lbl_peak.pack(side="right")
+            win._lbl_pp = lbl_pp
+            win._lbl_peak = lbl_peak
+
+            r2 = tk.Frame(box, bg="#141420")
+            r2.pack(fill="x", padx=8, pady=(0, 2))
+            lbl_fc = tk.Label(r2, text="If FC: 0.0 PP", font=("Arial", 9), fg="#FFA726", bg="#141420")
+            lbl_fc.pack(side="left")
+            lbl_map_peak = tk.Label(r2, text="Map: 0.0 PP", font=("Arial", 9), fg="#888899", bg="#141420")
+            lbl_map_peak.pack(side="right")
+            win._lbl_fc = lbl_fc
+            win._lbl_map_peak = lbl_map_peak
+
+            # Mini Canvas Graph
+            cv = tk.Canvas(box, height=24, bg="#10101a", bd=0, highlightthickness=0)
+            cv.pack(fill="x", padx=8, pady=(2, 4))
+            win._cv = cv
+            win._graph_points = []
+
+    def update_live_pp_hud(self, cur_pp=0.0, peak_pp=0.0, if_fc_pp=0.0, map_peak_pp=0.0):
+        if not getattr(self, "_live_pp_win", None) or not self._live_pp_win.winfo_exists():
+            self._ensure_live_pp_overlay()
+        
+        win = getattr(self, "_live_pp_win", None)
+        if not win or not win.winfo_exists(): return
+
+        try:
+            win._lbl_pp.config(text=f"🔥 {cur_pp:.1f} PP")
+            win._lbl_peak.config(text=f"Peak: {peak_pp:.1f} PP")
+            win._lbl_fc.config(text=f"If FC: {if_fc_pp:.1f} PP")
+            if map_peak_pp > 0:
+                win._lbl_map_peak.config(text=f"Rekord: {map_peak_pp:.1f} PP", fg="#BA68C8")
+            else:
+                win._lbl_map_peak.config(text="Map: -", fg="#888899")
+
+            # Update mini-graph
+            pts = getattr(win, "_graph_points", [])
+            pts.append(cur_pp)
+            if len(pts) > 40: pts.pop(0)
+            win._graph_points = pts
+
+            cv = win._cv
+            cv.delete("all")
+            w = cv.winfo_width() or 250
+            h = cv.winfo_height() or 24
+            max_p = max(10.0, max(pts))
+            
+            if len(pts) > 1:
+                step_x = w / max(1, len(pts) - 1)
+                poly_coords = [0, h]
+                for idx_p, p_val in enumerate(pts):
+                    px = idx_p * step_x
+                    py = h - (p_val / max_p * (h - 4)) - 2
+                    poly_coords.extend([px, py])
+                poly_coords.extend([w, h])
+                cv.create_polygon(poly_coords, fill="#182c3f", outline="")
+                for idx_p in range(len(pts) - 1):
+                    x1 = idx_p * step_x
+                    y1 = h - (pts[idx_p] / max_p * (h - 4)) - 2
+                    x2 = (idx_p + 1) * step_x
+                    y2 = h - (pts[idx_p + 1] / max_p * (h - 4)) - 2
+                    cv.create_line(x1, y1, x2, y2, fill="#00E5FF", width=2)
+        except Exception:
+            pass
+
+    def show_main_menu(self):
+        self._start_uho_presence_heartbeat_loop()
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        master = ctk.CTkFrame(self, fg_color="#121216")
+        master.pack(fill="both", expand=True)
+        self.draw_lazer_background(master)
+
+        frame = ctk.CTkFrame(master, fg_color="#181822", corner_radius=20, border_width=1, border_color="#2e2e3f", width=430, height=610)
         frame.place(relx=0.5, rely=0.5, anchor="center")
         frame.pack_propagate(False)
 
-        ctk.CTkLabel(frame, text="UHO Hub", font=("Arial", 32, "bold"), text_color="#3b8ed0").pack(pady=(24, 4))
-        ctk.CTkLabel(frame, text="Dein All-in-One osu! Trainings-Hub", font=("Arial", 12), text_color="#888899").pack(pady=(0, 18))
+        ctk.CTkLabel(frame, text="UHO Hub", font=("Arial", 32, "bold"), text_color="#3b8ed0").pack(pady=(16, 2))
+        ctk.CTkLabel(frame, text="Dein All-in-One osu! Trainings-Hub", font=("Arial", 12), text_color="#888899").pack(pady=(0, 10))
 
-        ctk.CTkButton(frame, text="📈 Training", font=("Arial", 16, "bold"), width=320, height=48, corner_radius=10,
+        ctk.CTkButton(frame, text="📈 Training", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
                       fg_color="#1f538d", hover_color="#14375e",
-                      command=self.show_training_mode_selection).pack(pady=7)
+                      command=self.show_training_mode_selection).pack(pady=5)
 
-        ctk.CTkButton(frame, text="🎯 Skill-Analyse", font=("Arial", 16, "bold"), width=320, height=48, corner_radius=10,
-                      fg_color="#E91E63", hover_color="#C2185B", command=self.show_skill_analyse).pack(pady=7)
+        ctk.CTkButton(frame, text="🎯 Skill-Analyse", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
+                      fg_color="#E91E63", hover_color="#C2185B", command=self.show_skill_analyse).pack(pady=5)
 
-        ctk.CTkButton(frame, text="🌐 Multiplayer", font=("Arial", 16, "bold"), width=320, height=48, corner_radius=10,
+        ctk.CTkButton(frame, text="📊 Tages- & Session-Recap", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
+                      fg_color="#7B1FA2", hover_color="#6A1B9A", text_color="#ffffff",
+                      command=self.show_daily_recap_dashboard).pack(pady=5)
+
+        ctk.CTkButton(frame, text="🎨 In-Game Widgets & HUD", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
+                      fg_color="#00838F", hover_color="#006064", text_color="#ffffff",
+                      command=self.show_widgets_hub).pack(pady=5)
+
+        ctk.CTkButton(frame, text="🌐 Multiplayer", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
                       fg_color="#00BFA5", hover_color="#00897B", text_color="#ffffff",
-                      command=self.show_multiplayer_hub).pack(pady=7)
+                      command=self.show_multiplayer_hub).pack(pady=5)
 
-        ctk.CTkButton(frame, text="⚙️ Einstellungen", font=("Arial", 14, "bold"), width=320, height=44, corner_radius=10,
-                      fg_color="#2b2b36", hover_color="#3a3a48", command=self.show_settings).pack(pady=7)
+        ctk.CTkButton(frame, text="⚙️ Einstellungen", font=("Arial", 14, "bold"), width=330, height=40, corner_radius=10,
+                      fg_color="#2b2b36", hover_color="#3a3a48", command=self.show_settings).pack(pady=5)
 
         help_btn = ctk.CTkButton(master, text="?", width=32, height=32, font=("Arial", 16, "bold"),
                                  fg_color="#22222a", hover_color="#333340", text_color="#aaaaaa",
@@ -4251,9 +5527,66 @@ DEINE ANTWORT-RICHTLINIEN:
         self.host_rot_feed.configure(state="disabled")
 
     # ---------------------------------------------------------------------------
-    # FREUNDE & ONLINE-COMMUNITY
+    # FREUNDE & ONLINE-COMMUNITY (ECHTE LIVE PRESENCE & UHO HUB VS OSU! BADGES)
     # ---------------------------------------------------------------------------
+    def _start_uho_presence_heartbeat_loop(self):
+        """Sendet alle 20 Sekunden einen echten Heartbeat an den Render-Server."""
+        if getattr(self, "_uho_heartbeat_loop_running", False):
+            return
+        self._uho_heartbeat_loop_running = True
+
+        def _loop():
+            while True:
+                try:
+                    u_name = getattr(self, "osu_username", "").strip()
+                    if u_name:
+                        act = getattr(self, "_current_user_activity", "In UHO Hub aktiv")
+                        payload = {
+                            "username": u_name,
+                            "status": act,
+                            "version": CURRENT_APP_VERSION
+                        }
+                        requests.post(f"{UHO_AUTH_SERVER_URL}/heartbeat", json=payload, timeout=5)
+                except Exception:
+                    pass
+                time.sleep(20)
+
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def fetch_uho_live_presence(self, callback=None):
+        """Fragt die aktuell echten online Spieler vom Render Server ab."""
+        def _run():
+            live_dict = {}
+            try:
+                r = requests.get(f"{UHO_AUTH_SERVER_URL}/active_users", timeout=4)
+                if r.status_code == 200:
+                    data = r.json()
+                    for u in data.get("active_users", []):
+                        un = u.get("username", "").strip()
+                        if un and un.lower() not in ["banchobot", "gemini ai", "gemini"]:
+                            live_dict[un.lower()] = u
+            except Exception:
+                pass
+
+            # Ensure local player is always marked online
+            my_u = getattr(self, "osu_username", "").strip()
+            if my_u and my_u.lower() not in live_dict:
+                live_dict[my_u.lower()] = {
+                    "username": my_u,
+                    "status": "🟢 In UHO Hub aktiv",
+                    "version": CURRENT_APP_VERSION,
+                    "seconds_ago": 0
+                }
+
+            self._cached_live_uho_users = live_dict
+            if callback:
+                self.after(0, lambda: callback(live_dict))
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def show_friends_and_community(self):
+        self._start_uho_presence_heartbeat_loop()
+
         for widget in self.winfo_children():
             widget.destroy()
 
@@ -4268,7 +5601,7 @@ DEINE ANTWORT-RICHTLINIEN:
         ctk.CTkButton(top_bar, text="⬅ Zurück", width=90, height=34, font=("Arial", 12, "bold"),
                       fg_color="#25252e", hover_color="#353540", command=self.show_multiplayer_hub).pack(side="left", padx=15, pady=12)
 
-        ctk.CTkLabel(top_bar, text="👥 Freunde & Online-Community (Live Presence)", font=("Arial", 18, "bold"), text_color="#FF4081").pack(side="left", padx=10)
+        ctk.CTkLabel(top_bar, text="👥 Freunde & Online-Community (Echte Live Presence)", font=("Arial", 18, "bold"), text_color="#FF4081").pack(side="left", padx=10)
 
         main_grid = ctk.CTkFrame(master, fg_color="transparent")
         main_grid.pack(fill="both", expand=True, padx=20, pady=(0, 15))
@@ -4279,7 +5612,9 @@ DEINE ANTWORT-RICHTLINIEN:
         f_left = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#302028")
         f_left.grid(row=0, column=0, padx=(0, 10), pady=5, sticky="nsew")
 
-        ctk.CTkLabel(f_left, text="👥 Meine Freundesliste", font=("Arial", 16, "bold"), text_color="#FF4081").pack(anchor="w", padx=18, pady=(15, 6))
+        f_hdr = ctk.CTkFrame(f_left, fg_color="transparent")
+        f_hdr.pack(fill="x", padx=18, pady=(15, 6))
+        ctk.CTkLabel(f_hdr, text="👥 Meine Freundesliste", font=("Arial", 16, "bold"), text_color="#FF4081").pack(side="left")
 
         # Add friend row
         add_row = ctk.CTkFrame(f_left, fg_color="transparent")
@@ -4290,7 +5625,10 @@ DEINE ANTWORT-RICHTLINIEN:
         friends_scroll = ctk.CTkScrollableFrame(f_left, fg_color="transparent")
         friends_scroll.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
-        def render_friends():
+        def render_friends(live_users=None):
+            if live_users is None:
+                live_users = getattr(self, "_cached_live_uho_users", {})
+
             for w in friends_scroll.winfo_children(): w.destroy()
             fl = getattr(self, "uho_friends_list", [])
             if not fl:
@@ -4299,14 +5637,31 @@ DEINE ANTWORT-RICHTLINIEN:
                 return
 
             for fr in fl:
-                c = ctk.CTkFrame(friends_scroll, fg_color="#20151c", corner_radius=10, border_width=1, border_color="#3b2432")
+                u_low = fr.strip().lower()
+                is_uho_user = u_low in live_users
+
+                c = ctk.CTkFrame(friends_scroll, fg_color="#1c1622" if is_uho_user else "#181820",
+                                 corner_radius=10, border_width=1,
+                                 border_color="#00E5FF" if is_uho_user else "#2c2c3a")
                 c.pack(fill="x", pady=4)
                 
                 c_top = ctk.CTkFrame(c, fg_color="transparent")
                 c_top.pack(fill="x", padx=10, pady=8)
                 
                 ctk.CTkLabel(c_top, text=f"👤 {fr}", font=("Arial", 13, "bold"), text_color="#ffffff").pack(side="left")
-                ctk.CTkLabel(c_top, text="🟢 ONLINE", font=("Arial", 9, "bold"), fg_color="#1b3820", text_color="#00E676", corner_radius=4).pack(side="left", padx=8)
+                
+                # UHO Hub vs osu! Only Badge
+                if is_uho_user:
+                    ctk.CTkLabel(c_top, text="⚡ UHO Hub User", font=("Arial", 9, "bold"),
+                                 fg_color="#0a2838", text_color="#00E5FF", corner_radius=4).pack(side="left", padx=6)
+                    u_status = live_users[u_low].get("status", "In UHO Hub aktiv")
+                    ctk.CTkLabel(c_top, text=f"🟢 {u_status}", font=("Arial", 9, "bold"),
+                                 fg_color="#11331c", text_color="#00E676", corner_radius=4).pack(side="left", padx=4)
+                else:
+                    ctk.CTkLabel(c_top, text="🎮 osu! Spieler", font=("Arial", 9),
+                                 fg_color="#20202a", text_color="#888899", corner_radius=4).pack(side="left", padx=6)
+                    ctk.CTkLabel(c_top, text="⚪ Offline / Kein UHO Hub", font=("Arial", 9),
+                                 fg_color="#1a1a22", text_color="#777788", corner_radius=4).pack(side="left", padx=4)
 
                 def remove_f(u=fr):
                     if u in self.uho_friends_list:
@@ -4317,7 +5672,7 @@ DEINE ANTWORT-RICHTLINIEN:
                 def challenge_f(u=fr):
                     self.show_multiplayer_match_setup()
 
-                ctk.CTkButton(c_top, text="⚔️ Herausfordern", width=110, height=26, font=("Arial", 10, "bold"),
+                ctk.CTkButton(c_top, text="⚔️ Match", width=75, height=26, font=("Arial", 10, "bold"),
                               fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=challenge_f).pack(side="right", padx=2)
                 ctk.CTkButton(c_top, text="✕", width=26, height=26, font=("Arial", 10, "bold"),
                               fg_color="#3a2028", hover_color="#502028", text_color="#ff8888", command=remove_f).pack(side="right", padx=2)
@@ -4336,34 +5691,69 @@ DEINE ANTWORT-RICHTLINIEN:
         ctk.CTkButton(add_row, text="➕ Hinzufügen", width=100, height=32, font=("Arial", 11, "bold"),
                       fg_color="#FF4081", hover_color="#E91E63", text_color="#ffffff", command=add_f).pack(side="right")
 
-        render_friends()
-
-        # Right: Server & Community Status
+        # Right: Server & Community Status (ECHTE SPIELER)
         f_right = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#302028")
         f_right.grid(row=0, column=1, padx=(10, 0), pady=5, sticky="nsew")
 
-        ctk.CTkLabel(f_right, text="🌐 UHO Hub Community & Live Presence", font=("Arial", 16, "bold"), text_color="#00E5FF").pack(anchor="w", padx=18, pady=(15, 6))
-        ctk.CTkLabel(f_right, text=f"Verbunden mit Render Server: {UHO_AUTH_SERVER_URL}", font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=18, pady=(0, 12))
+        r_hdr = ctk.CTkFrame(f_right, fg_color="transparent")
+        r_hdr.pack(fill="x", padx=18, pady=(15, 6))
+        ctk.CTkLabel(r_hdr, text="🌐 UHO Hub Community & Live Presence", font=("Arial", 16, "bold"), text_color="#00E5FF").pack(side="left")
 
-        srv_box = ctk.CTkFrame(f_right, fg_color="#121620", corner_radius=10, border_width=1, border_color="#203040")
+        def refresh_live_presence():
+            sync_btn.configure(text="⏳...", state="disabled")
+            def _done(live_data):
+                render_community_panel(live_data)
+                render_friends(live_data)
+                if sync_btn.winfo_exists():
+                    sync_btn.configure(text="🔄 Aktualisieren", state="normal")
+            self.fetch_uho_live_presence(callback=_done)
+
+        sync_btn = ctk.CTkButton(r_hdr, text="🔄 Aktualisieren", width=110, height=28, font=("Arial", 11, "bold"),
+                                 fg_color="#2b2b38", hover_color="#00E5FF", text_color="#ffffff", command=refresh_live_presence)
+        sync_btn.pack(side="right")
+
+        ctk.CTkLabel(f_right, text=f"Server: {UHO_AUTH_SERVER_URL} (Render Cloud)", font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=18, pady=(0, 10))
+
+        srv_box = ctk.CTkScrollableFrame(f_right, fg_color="#121620", corner_radius=10, border_width=1, border_color="#203040")
         srv_box.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
-        ctk.CTkLabel(srv_box, text="📡 Aktive Spieler im UHO Hub Netzwerk:", font=("Arial", 12, "bold"), text_color="#00E5FF").pack(anchor="w", padx=14, pady=(12, 6))
+        def render_community_panel(live_users):
+            for w in srv_box.winfo_children(): w.destroy()
 
-        my_u = getattr(self, "osu_username", "Spieler") or "Spieler"
-        active_sample = [
-            (my_u, "🟢 Online (In der App)", "#00E676"),
-            ("BanchoBot", "🤖 IRC Schiedsrichter aktiv", "#00E5FF"),
-            ("Gemini AI", "✨ Trainings-Coach bereit", "#BA68C8")
-        ]
-        for name, st, col in active_sample:
-            row = ctk.CTkFrame(srv_box, fg_color="#181e2a", corner_radius=8)
-            row.pack(fill="x", padx=14, pady=4)
-            ctk.CTkLabel(row, text=f"• {name}", font=("Arial", 12, "bold"), text_color="#ffffff").pack(side="left", padx=10, pady=8)
-            ctk.CTkLabel(row, text=st, font=("Arial", 11), text_color=col).pack(side="right", padx=10, pady=8)
+            ctk.CTkLabel(srv_box, text=f"📡 Echte aktive Spieler im UHO Hub Netzwerk ({len(live_users)} online):",
+                         font=("Arial", 12, "bold"), text_color="#00E5FF").pack(anchor="w", padx=10, pady=(6, 8))
 
-        ctk.CTkLabel(srv_box, text="💡 Freunde können direkt über UHO Hub synchronisiert picken und bannen, oder die Chat-Befehle !pick und !ban im Spiel nutzen.",
-                     font=("Arial", 11), text_color="#8899aa", justify="left", wraplength=340).pack(anchor="w", padx=14, pady=(15, 12))
+            my_uname = getattr(self, "osu_username", "Spieler") or "Spieler"
+
+            for u_low, data in live_users.items():
+                uname = data.get("username", u_low)
+                st = data.get("status", "Online in UHO Hub")
+                is_self = (uname.lower() == my_uname.lower())
+
+                row = ctk.CTkFrame(srv_box, fg_color="#1e2838" if is_self else "#181e2a", corner_radius=8,
+                                   border_width=1 if is_self else 0, border_color="#00E5FF")
+                row.pack(fill="x", padx=10, pady=3)
+
+                label_text = f"• {uname} (Du)" if is_self else f"• {uname}"
+                ctk.CTkLabel(row, text=label_text, font=("Arial", 12, "bold"),
+                             text_color="#00E5FF" if is_self else "#ffffff").pack(side="left", padx=10, pady=8)
+
+                tag_box = ctk.CTkFrame(row, fg_color="transparent")
+                tag_box.pack(side="right", padx=10, pady=8)
+
+                ctk.CTkLabel(tag_box, text="⚡ UHO Hub", font=("Arial", 9, "bold"),
+                             fg_color="#0a2838", text_color="#00E5FF", corner_radius=4).pack(side="left", padx=(0, 6))
+
+                ctk.CTkLabel(tag_box, text=f"🟢 {st}", font=("Arial", 11), text_color="#00E676").pack(side="left")
+
+            if len(live_users) <= 1:
+                info_box = ctk.CTkFrame(srv_box, fg_color="#181822", corner_radius=8)
+                info_box.pack(fill="x", padx=10, pady=10)
+                ctk.CTkLabel(info_box, text="ℹ️ Aktuell sind keine weiteren Spieler in UHO Hub online.\nSobald ein Freund UHO Hub startet, erscheint er hier automatisch in Echtzeit!",
+                             font=("Arial", 11), text_color="#888899", justify="center").pack(padx=12, pady=10)
+
+        # Initial fetch
+        self.fetch_uho_live_presence(callback=lambda data: (render_community_panel(data), render_friends(data)))
 
     def _mp_bot_log_callback(self, text, color="#aaaaaa"):
         if not hasattr(self, "mp_match") or not isinstance(self.mp_match, dict):
@@ -5805,36 +7195,36 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 if st == "available":
                     if phase == "protect" and m["turn"] == "player" and slot != "TB":
                         def make_prot(s=slot): return lambda: self.tourney_player_do_protect(s)
-                        ctk.CTkButton(action_frame, text="🛡️ Save", width=54, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=2)
+                        ctk.CTkButton(action_frame, text="🛡️ Save", width=58, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=1)
                     elif phase == "ban" and m["turn"] == "player" and slot != "TB":
                         def make_ban(s=slot): return lambda: self.tourney_player_do_ban(s)
-                        ctk.CTkButton(action_frame, text="🚫 Ban", width=48, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=2)
+                        ctk.CTkButton(action_frame, text="🚫 Ban", width=52, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=1)
                     elif phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
                 elif st == "protected_player":
                     if phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
-                    ctk.CTkLabel(action_frame, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 10, "bold"), text_color="#00E5FF").pack(side="right", padx=4)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
+                    ctk.CTkLabel(action_frame, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 9, "bold"), text_color="#00E5FF").pack(side="right", padx=3)
                 elif st == "protected_bot":
                     if phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
-                    ctk.CTkLabel(action_frame, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#BA68C8").pack(side="right", padx=4)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
+                    ctk.CTkLabel(action_frame, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 9, "bold"), text_color="#BA68C8").pack(side="right", padx=3)
                 elif st == "banned_player":
-                    ctk.CTkLabel(action_frame, text="🚫 BANNED (Du)", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text="🚫 BANNED (Du)", font=("Arial", 9, "bold"), text_color="#FF5252").pack(side="right", padx=3)
                 elif st == "banned_bot":
-                    ctk.CTkLabel(action_frame, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 9, "bold"), text_color="#FF5252").pack(side="right", padx=3)
                 elif st == "won_player":
-                    ctk.CTkLabel(action_frame, text="✅ GEWONNEN", font=("Arial", 10, "bold"), text_color="#00E676").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text="✅ GEWONNEN", font=("Arial", 9, "bold"), text_color="#00E676").pack(side="right", padx=3)
                 elif st == "won_bot":
-                    ctk.CTkLabel(action_frame, text=f"❌ VERLOREN", font=("Arial", 10, "bold"), text_color="#FF4081").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text="❌ VERLOREN", font=("Arial", 9, "bold"), text_color="#FF4081").pack(side="right", padx=3)
             return
 
         # Initial build
@@ -5898,17 +7288,14 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 card.pack(fill="x", padx=4, pady=3)
 
                 c_row = ctk.CTkFrame(card, fg_color="transparent")
-                c_row.pack(fill="x", padx=8, pady=6)
+                c_row.pack(fill="x", padx=6, pady=5)
 
-                ctk.CTkLabel(c_row, text=slot, font=("Arial", 12, "bold"), text_color=col, width=42, anchor="w").pack(side="left")
+                # Left slot label
+                ctk.CTkLabel(c_row, text=slot, font=("Arial", 12, "bold"), text_color=col, width=38, anchor="w").pack(side="left", padx=(2, 4))
 
-                info_f = ctk.CTkFrame(c_row, fg_color="transparent")
-                info_f.pack(side="left", fill="x", expand=True, padx=4)
-                
-                m_name = map_data.get("name", "Map")
-                ctk.CTkLabel(info_f, text=m_name[:40], font=("Arial", 11, "bold"), text_color="#ffffff", anchor="w").pack(anchor="w")
-                ctk.CTkLabel(info_f, text=f"★ {map_data.get('sr', 5.0):.2f} • {map_data.get('bpm', 180)} BPM • {map_data.get('len', 120)}s",
-                             font=("Arial", 9), text_color="#888899", anchor="w").pack(anchor="w")
+                # Right action & link buttons container (PACKED FIRST to ensure no clipping!)
+                right_btns = ctk.CTkFrame(c_row, fg_color="transparent")
+                right_btns.pack(side="right", padx=(2, 0))
 
                 bid = map_data.get("id")
                 def make_direct(b=bid):
@@ -5917,13 +7304,22 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 def make_web(b=bid):
                     webbrowser.open(f"https://osu.ppy.sh/b/{b}")
 
-                ctk.CTkButton(c_row, text="direct", width=44, height=22, font=("Arial", 9, "bold"),
+                ctk.CTkButton(right_btns, text="direct", width=46, height=22, font=("Arial", 9, "bold"),
                               fg_color="#E91E63", hover_color="#C2185B", command=make_direct).pack(side="right", padx=(2, 0))
-                ctk.CTkButton(c_row, text="🌐 web", width=44, height=22, font=("Arial", 9, "bold"),
+                ctk.CTkButton(right_btns, text="🌐 web", width=46, height=22, font=("Arial", 9, "bold"),
                               fg_color="#2b2b38", hover_color="#3a3a4c", command=make_web).pack(side="right", padx=(2, 0))
 
-                action_frame = ctk.CTkFrame(c_row, fg_color="transparent")
-                action_frame.pack(side="right")
+                action_frame = ctk.CTkFrame(right_btns, fg_color="transparent")
+                action_frame.pack(side="right", padx=(0, 2))
+
+                # Center map info (PACKED LAST to consume remaining space cleanly)
+                info_f = ctk.CTkFrame(c_row, fg_color="transparent")
+                info_f.pack(side="left", fill="x", expand=True, padx=(2, 4))
+                
+                m_name = map_data.get("name", "Map")
+                ctk.CTkLabel(info_f, text=m_name[:34], font=("Arial", 11, "bold"), text_color="#ffffff", anchor="w").pack(anchor="w", fill="x")
+                ctk.CTkLabel(info_f, text=f"★ {map_data.get('sr', 5.0):.2f} • {map_data.get('bpm', 180)} BPM • {map_data.get('len', 120)}s",
+                             font=("Arial", 9), text_color="#888899", anchor="w").pack(anchor="w", fill="x")
 
                 self._tourney_card_widgets[slot] = {
                     "card": card,
@@ -5934,36 +7330,36 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 if st == "available":
                     if phase == "protect" and m["turn"] == "player" and slot != "TB":
                         def make_prot(s=slot): return lambda: self.tourney_player_do_protect(s)
-                        ctk.CTkButton(action_frame, text="🛡️ Save", width=54, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=2)
+                        ctk.CTkButton(action_frame, text="🛡️ Save", width=58, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=1)
                     elif phase == "ban" and m["turn"] == "player" and slot != "TB":
                         def make_ban(s=slot): return lambda: self.tourney_player_do_ban(s)
-                        ctk.CTkButton(action_frame, text="🚫 Ban", width=48, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=2)
+                        ctk.CTkButton(action_frame, text="🚫 Ban", width=52, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=1)
                     elif phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
                 elif st == "protected_player":
                     if phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
-                    ctk.CTkLabel(action_frame, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 10, "bold"), text_color="#00E5FF").pack(side="right", padx=4)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
+                    ctk.CTkLabel(action_frame, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 9, "bold"), text_color="#00E5FF").pack(side="right", padx=3)
                 elif st == "protected_bot":
                     if phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
-                    ctk.CTkLabel(action_frame, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#BA68C8").pack(side="right", padx=4)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
+                    ctk.CTkLabel(action_frame, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 9, "bold"), text_color="#BA68C8").pack(side="right", padx=3)
                 elif st == "banned_player":
-                    ctk.CTkLabel(action_frame, text="🚫 BANNED (Du)", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text="🚫 BANNED (Du)", font=("Arial", 9, "bold"), text_color="#FF5252").pack(side="right", padx=3)
                 elif st == "banned_bot":
-                    ctk.CTkLabel(action_frame, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 9, "bold"), text_color="#FF5252").pack(side="right", padx=3)
                 elif st == "won_player":
-                    ctk.CTkLabel(action_frame, text="✅ GEWONNEN", font=("Arial", 10, "bold"), text_color="#00E676").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text="✅ GEWONNEN", font=("Arial", 9, "bold"), text_color="#00E676").pack(side="right", padx=3)
                 elif st == "won_bot":
-                    ctk.CTkLabel(action_frame, text=f"❌ VERLOREN", font=("Arial", 10, "bold"), text_color="#FF4081").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text=f"❌ VERLOREN", font=("Arial", 9, "bold"), text_color="#FF4081").pack(side="right", padx=3)
 
     def tourney_do_roll(self):
         m = self.tourney_match
@@ -6171,6 +7567,8 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         except: pass
 
     def process_tourney_round_result(self, last_p):
+        try: self.record_play_in_active_session(last_p)
+        except: pass
         m = self.tourney_match
         cur_slot = m.get("current_pick")
         if not cur_slot: return
@@ -6901,20 +8299,20 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         grid_frame = ctk.CTkFrame(cards_container, fg_color="transparent")
         grid_frame.pack(expand=True, pady=10)
 
-        # ----------------- CARD 1: LEVEL-TRAINING -----------------
+        # ----------------- CARD 1: LEVEL-TRAINING (MODS) -----------------
         c1 = ctk.CTkFrame(grid_frame, fg_color="#181822", corner_radius=16, border_width=2, border_color="#1f538d", width=380, height=220)
         c1.grid(row=0, column=0, padx=15, pady=15)
         c1.pack_propagate(False)
 
         c1_top = ctk.CTkFrame(c1, fg_color="transparent")
         c1_top.pack(fill="x", padx=16, pady=(16, 4))
-        ctk.CTkLabel(c1_top, text="🏆 Level", font=("Arial", 18, "bold"), text_color="#ffffff").pack(side="left")
+        ctk.CTkLabel(c1_top, text="🏆 Level-Training (Mods)", font=("Arial", 18, "bold"), text_color="#ffffff").pack(side="left")
         ctk.CTkLabel(c1_top, text=" VERFÜGBAR ", font=("Arial", 10, "bold"), fg_color="#1b382b", text_color="#4CAF50", corner_radius=4).pack(side="right")
 
-        ctk.CTkLabel(c1, text="4.0★ bis 10.0★ Stufenaufstieg über 8 Skillsets. Meistere Level für Level mit 5 S-Ranks, 2 PFCs und 2 Maps über 3 Minuten.",
+        ctk.CTkLabel(c1, text="4.0★ bis 10.0★ Stufenaufstieg für NoMod, DoubleTime, Hidden, HardRock uvm. Meistere Level für Level mit 5 S-Ranks, 2 PFCs und 2 Maps über 3 Minuten.",
                      font=("Arial", 12), text_color="#aaaaaa", justify="left", wraplength=340).pack(padx=16, pady=(4, 12), anchor="w")
 
-        ctk.CTkButton(c1, text="🚀 Level-Training starten ➔", font=("Arial", 13, "bold"), height=38,
+        ctk.CTkButton(c1, text="🚀 Mod wählen & starten ➔", font=("Arial", 13, "bold"), height=38,
                       fg_color="#1f538d", hover_color="#14375e", command=self.show_training_skillset_selection).pack(fill="x", padx=16, side="bottom", pady=16)
 
         # ----------------- CARD 2: KI-ANALYSIERTES TRAINING -----------------
@@ -7095,6 +8493,20 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 is_negative = any(neg in msg_lower for neg in ["keine", "kein", "nicht mehr", "stop", "bloß kein", "keinen", "will nicht", "lass mal sein"])
                 is_skip_intent = any(sk in msg_lower for sk in ["überspring", "überspringen", "skip", "nächste schwäche", "nächstes problem", "nächste map", "andere map", "was anderes", "wechsel"])
                 is_fun_mode = any(w in msg_lower for w in ["spaß", "fun", "aus spaß", "nur zum spaß", "just for fun", "was für spaß", "geile map", "chillen", "abgehen"])
+
+                # Check whether user is asking a general coaching / information question vs commanding a map switch
+                is_pure_question = (
+                    "?" in msg
+                    or any(q_word in msg_lower for q_word in ["wie kann ich", "wie lerne", "wie geht", "warum", "was bedeutet", "was ist", "welche", "welches", "tipps für", "tipps gegen", "hast du tipps", "wie verbessere", "wie spiele", "wie trainiere", "kannst du mir erklären", "erklär mir"])
+                )
+                is_explicit_map_request = (
+                    is_skip_intent
+                    or is_fun_mode
+                    or any(cmd in msg_lower for cmd in [
+                        "gib mir", "zeig mir", "such mir", "finde", "wechsel", "wechseln", "neue map", "andere map", "nächste map",
+                        "lass uns", "spiel lieber", "schalte auf", "skip", "überspring", "überspringe", "ich will", "ich möchte", "bitte map", "noch eine map", "andere diff", "andere sterne"
+                    ])
+                )
                 
                 # Check persistent mod preference / mod dependency ("nur Hidden", "nur HardRock", "nur HR")
                 is_only_mod = any(w in msg_lower for w in ["nur hd", "nur hidden", "nur hr", "nur hardrock", "immer hd", "immer hr", "kann nur hr", "kann nur hd", "ohne hr kann ich", "ohne hd kann ich", "mit jeder mod"])
@@ -7176,7 +8588,7 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                     did_update_map = True
                     coach_directive_note = "Spieler möchte die aktuelle Map / Schwäche überspringen. Rotiere zur nächsten Herausforderung."
                     self.pick_next_ai_training_map(rotate_weakness=True)
-                elif requested_skill or requested_sr is not None or requested_mod is not None or mod_crutch_detected:
+                elif (requested_skill or requested_sr is not None or requested_mod is not None or mod_crutch_detected) and (is_explicit_map_request or not is_pure_question):
                     did_update_map = True
                     new_skill = requested_skill or getattr(self, "ai_training_target_skill", "Streams")
                     self.ai_training_target_skill = new_skill
@@ -7620,6 +9032,8 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
                     return
 
                 last_p = matching_play
+                try: self.record_play_in_active_session(last_p)
+                except: pass
                 bid = str(last_p.get("beatmap_id"))
                 h300 = int(last_p.get("count300", 0))
                 h100 = int(last_p.get("count100", 0))
@@ -7628,6 +9042,20 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
                 combo = int(last_p.get("maxcombo", 0))
                 tot = h300 + h100 + h50 + miss
                 acc = ((h300 * 300 + h100 * 100 + h50 * 50) / (tot * 300) * 100) if tot > 0 else 0
+                rank = str(last_p.get("rank", "")).upper()
+                is_fail_or_retry = (rank == "F")
+
+                # 1. Quick-Retry Detection (Early reset / choke in first few notes)
+                is_quick_retry = is_fail_or_retry and (tot < 45 or combo < 20)
+                is_real_fail = is_fail_or_retry and not is_quick_retry
+                is_full_pass = not is_fail_or_retry
+
+                if is_quick_retry:
+                    def update_quick_retry():
+                        if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
+                            self.ai_train_sync_lbl.configure(text=f"🔄 Quick-Retry erkannt (#{tot} Noten) – Spiele direkt weiter!", text_color="#FFA726")
+                    self.after(0, update_quick_retry)
+                    return
 
                 map_name = cur_map.get("name", "Gespielte Map")
                 map_sr = cur_map.get("sr", 5.0)
@@ -7672,20 +9100,20 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
                     coach_prompt = f"""Du bist der offizielle Pro-Level osu! KI-Coach und Cheftrainer für osu! Standard (Mode 0).
 WICHTIG: Antworte ZU 100% AUF DEUTSCH! Verwende kein einziges Wort auf Englisch (außer osu!-Begriffe wie Stream, Aim, Burst, FC, Mods wie DT/HR/HD/EZ).
 
-Der Spieler '{user}' hat soeben eine Runde im Live-Training ({target_skill}) abgeschlossen:
+Der Spieler '{user}' hat soeben eine Runde im Live-Training ({target_skill}) gespielt ({'FEHLGESCHLAGEN / FAIL' if is_real_fail else 'ERFOLGREICH BEENDET'}):
 Map: {map_name} (★ {map_sr:.1f}, Skillset: {target_skill}, BPM: {map_bpm}, Geforderter Mod: {prescribed_mod})
 Gespielte Mods: {played_mods_str}
 Ziel: {map_goal}
 
 Score & Replay-Telemetrie:
-- Accuracy: {acc:.2f}% | 300s: {h300} | 100s: {h100} | 50s: {h50} | Misses: {miss} | Max Combo: {combo}{deep_telem_info}
+- Status: {'💀 Fail bei Note #' + str(tot) if is_real_fail else '🏆 Pass'} | Accuracy: {acc:.2f}% | 300s: {h300} | 100s: {h100} | 50s: {h50} | Misses: {miss} | Max Combo: {combo}{deep_telem_info}
 - Bisher bekanntes Hardware-Setup: {setup_info}
 
 KERNZIEL: Schwächen und Belastungsgrenzen (Fingerlocking, Overaiming, Reading-Fatigue, High-OD Unstable Rate) finden und aktiv ausbessern!
 Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch (3-5 prägnante Sätze):
-1. Analysiere das Abschneiden auf dieser Map/Mod-Kombination und sprich die konkrete Miss-/Choke-Ursache anhand der Telemetrie an.
-2. Was muss der Spieler im nächsten Versuch mechanisch konkret korrigieren (z. B. Handgelenk-Führung, Lockere Finger, Klick-Release, Reading-Fokus)?
-3. Falls Tapping-, Aiming- oder Mod-Probleme auffallen, stelle ihm eine kurze Nachfrage zu seinem Setup oder gib einen passenden Hardware-/Setting-Tipp!"""
+1. Analysiere das Abschneiden und die konkrete Ursache für den {'Fail / Choke' if is_real_fail else 'Score'}.
+2. Was muss der Spieler mechanisch korrigieren (z. B. Handgelenk-Führung, Lockere Finger, Klick-Release, Reading-Fokus)?
+3. {'Mache ihm Mut und erkläre, ob die Map für ihn machbar ist!' if is_real_fail else 'Motiviere ihn für die nächste Steigerung!'}"""
                     try:
                         g_model = getattr(self, "selected_ai_model", "gemini-3.6-flash")
                         g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self.gemini_key}"
@@ -7696,10 +9124,69 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                         resp = requests.post(g_url, json=payload, timeout=12)
                         res_j = resp.json()
                         ai_coaching_text = res_j["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    except Exception as e:
+                    except Exception:
                         pass
 
-                # Calculate adaptive difficulty delta based on performance (Misses & Acc)
+                # 2. Real Fail Handling (Nur mit Knopfdruck skippen, KI fragt nach Aktion)
+                if is_real_fail:
+                    is_passable = (acc >= 85.0 or tot >= 120 or combo >= 80)
+                    if is_passable:
+                        fail_verdict = f"💀 **Map nicht bestanden (Fail)** – aber du warst nah dran ({acc:.1f}% Acc bis Note #{tot})! Mit etwas mehr Lockerheit schaffst du den Pass."
+                    else:
+                        fail_verdict = f"💀 **Map nicht bestanden (Fail)** – Choke bei Note #{tot} ({acc:.1f}% Acc). Diese Pattern waren mechanisch sehr fordernd."
+
+                    if not ai_coaching_text:
+                        ai_coaching_text = "Achte auf eine entspannte Handhaltung und versuche, die Noten nicht hektisch zu spamen."
+
+                    fail_feedback = f"{fail_verdict}\n\n🤖 **Coach-Analyse:**\n{ai_coaching_text}\n\n💡 *Die Map bleibt geladen. Möchtest du sie nochmal versuchen oder überspringen?*"
+
+                    def update_fail_feed():
+                        if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
+                            self.ai_train_sync_lbl.configure(text=f"💀 Fail erfasst ({acc:.1f}% bis Note #{tot}) • Wähle nächste Aktion", text_color="#FFA726")
+                            self.add_modern_chat_bubble("ai", fail_feedback)
+
+                            q_title = "💀 Runde nicht bestanden (Fail) – Wie möchtest du weitermachen?"
+                            q_sub = f"Map: {map_name[:40]} • {acc:.1f}% Acc • Abbruch bei Note #{tot}"
+                            if is_passable:
+                                q_opts = [
+                                    "🔄 Nochmal versuchen (Die Map ist machbar, ich hol mir den Pass!)",
+                                    "⏭️ Map skippen & nächste Trainings-Map laden",
+                                    "💡 Coach-Tipp & Detail-Choke-Analyse im Chat vertiefen",
+                                    "📉 Schwierigkeit minimal senken (-0.2★) für mehr Stabilität",
+                                    "☕ Skillset wechseln (z. B. auf Aim oder Tech)"
+                                ]
+                            else:
+                                q_opts = [
+                                    "⏭️ Map skippen & passendere Trainings-Map laden",
+                                    "📉 Schwierigkeit senken (-0.35★) – war zu schwer",
+                                    "🔄 Trotzdem nochmal versuchen (Sturheit siegt!)",
+                                    "☕ Skillset wechseln (z. B. auf Aim oder Tech)",
+                                    "💬 Setup-/Hardware-Tipp vom Coach anfordern"
+                                ]
+
+                            def on_fail_choice(c_idx, c_txt):
+                                if c_idx == -1 or not c_txt: return
+                                if "Nochmal versuchen" in c_txt or "Trotzdem" in c_txt:
+                                    self.add_modern_chat_bubble("ai", f"💪 **Starker Kampfgeist!** Wir bleiben auf **{map_name}**. Konzentriere dich auf die Miss-Stelle bei Note #{tot}!")
+                                    if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
+                                        self.ai_train_sync_lbl.configure(text=f"🔄 Bereit für Re-Try auf: {map_name[:25]}...", text_color="#00E5FF")
+                                elif "skippen" in c_txt or "nächste" in c_txt:
+                                    self.add_modern_chat_bubble("ai", "⏭️ **Map übersprungen.** Ich bereite die nächste Map für dich vor!")
+                                    self.pick_next_ai_training_map(rotate_weakness=True)
+                                elif "senken" in c_txt:
+                                    self.add_modern_chat_bubble("ai", "📉 **Schwierigkeit angepasst.** Nächste Map wird etwas zugänglicher (-0.3★) gewählt.")
+                                    self.pick_next_ai_training_map(adaptive_delta=-0.30)
+                                elif "Skillset wechseln" in c_txt:
+                                    self.handle_ai_question_response(3, "Skillset wechseln")
+                                else:
+                                    self.add_modern_chat_bubble("ai", f"💡 **Coach-Tipp:** Achte bei schnellen Passagen auf eine lockere Handhaltung. Du kannst die Map jederzeit per Klick auf 'Nächste Map' links überspringen.")
+
+                            self.after(1000, lambda: self.show_ai_question_modal(title=q_title, subtitle=q_sub, options=q_opts, callback=on_fail_choice))
+
+                    self.after(0, update_fail_feed)
+                    return
+
+                # 3. Full Pass Handling
                 delta = 0.0
                 if miss == 0 and acc >= 98.5:
                     delta = +0.30  # Flawless -> strong difficulty push
@@ -7744,7 +9231,7 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                     self._rounds_since_feedback_prompt = 0
                 self._rounds_since_feedback_prompt += 1
 
-                feedback = f"✅ Runde automatisch erfasst ({played_mods_str})!\nAcc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | Misses: {miss}\n\n🤖 Coach-Analyse:\n{ai_coaching_text}\n\n{mod_warning + chr(10) + chr(10) if mod_warning else ''}{adapt_msg}"
+                feedback = f"✅ Runde erfolgreich abgeschlossen ({played_mods_str})!\nAcc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | Misses: {miss}\n\n🤖 Coach-Analyse:\n{ai_coaching_text}\n\n{mod_warning + chr(10) + chr(10) if mod_warning else ''}{adapt_msg}"
 
                 should_ask_question = (self._rounds_since_feedback_prompt >= 2 or miss >= 3)
                 if should_ask_question:
@@ -7778,7 +9265,6 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                                 ]
                             self.after(1000, lambda: self.show_ai_question_modal(title=q_title, subtitle=q_sub, options=q_opts))
                         else:
-                            # Automatically select next adjusted map with dynamic skillset rotation & mods!
                             self.after(1200, lambda: self.pick_next_ai_training_map(adaptive_delta=delta) if hasattr(self, 'ai_train_map_title') and self.ai_train_map_title.winfo_exists() else None)
 
                 self.after(0, update_feed)
@@ -8949,6 +10435,8 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
         for widget in self.winfo_children():
             widget.destroy()
 
+        self._tester_card_widgets = {}
+
         master = ctk.CTkFrame(self, fg_color="#121216")
         master.pack(fill="both", expand=True)
         self.draw_lazer_background(master)
@@ -9118,12 +10606,23 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
         if not getattr(self, "current_ai_skill_test", None):
             return
 
-        # Check if cards are already built
-        if not hasattr(self, "_tester_card_widgets"):
-            self._tester_card_widgets = {}
+        # Check if cards are already built and still alive in the DOM
+        cards_alive = (
+            hasattr(self, "_tester_card_widgets")
+            and isinstance(self._tester_card_widgets, dict)
+            and len(self._tester_card_widgets) == len(self.current_ai_skill_test)
+            and all(
+                isinstance(w_dict, dict)
+                and w_dict.get("card")
+                and w_dict["card"].winfo_exists()
+                and w_dict.get("status_frame")
+                and w_dict["status_frame"].winfo_exists()
+                for w_dict in self._tester_card_widgets.values()
+            )
+        )
 
         # If already built and matches test maps count, update in-place without destroying frames (ZERO FLICKER!)
-        if len(self._tester_card_widgets) == len(self.current_ai_skill_test):
+        if cards_alive:
             for category, m_info in self.current_ai_skill_test.items():
                 w_dict = self._tester_card_widgets.get(category)
                 if w_dict and w_dict.get("status_frame") and w_dict["status_frame"].winfo_exists():
@@ -9133,8 +10632,11 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                         child.destroy()
                     if sub:
                         sc = sub.get('skill_score', calculate_skill_test_score(sub.get('acc', 0), sub.get('misses', 0)))
+                        att = sub.get('attempts', 1)
+                        tag = f"🎯 Best: {sc:.0f}/100" if att > 1 else f"🎯 Score: {sc:.0f}/100"
+                        att_str = f" (#{att})" if att > 1 else ""
                         sub_col = "#00E676" if sc >= 80 else ("#00E5FF" if sc >= 65 else ("#FFA726" if sc >= 50 else "#FF5252"))
-                        ctk.CTkLabel(s_frame, text=f"🎯 Score: {sc:.0f}/100\n({sub.get('acc', 0):.1f}% • {sub.get('misses', 0)} Miss)",
+                        ctk.CTkLabel(s_frame, text=f"{tag}{att_str}\n({sub.get('acc', 0):.1f}% • {sub.get('misses', 0)} Miss)",
                                      font=("Arial", 10, "bold"), text_color=sub_col, justify="center").pack(side="right")
                     else:
                         ctk.CTkLabel(s_frame, text="⏳ Offen", font=("Arial", 10), text_color="#777788").pack(side="right")
@@ -9142,7 +10644,8 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
 
         # Initial build
         for w in self.tester_maps_scroll.winfo_children():
-            w.destroy()
+            try: w.destroy()
+            except: pass
         self._tester_card_widgets = {}
 
         for category, m_info in self.current_ai_skill_test.items():
@@ -9166,8 +10669,11 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
             sub = self.skill_tester_submissions.get(category)
             if sub:
                 sc = sub.get('skill_score', calculate_skill_test_score(sub.get('acc', 0), sub.get('misses', 0)))
+                att = sub.get('attempts', 1)
+                tag = f"🎯 Best: {sc:.0f}/100" if att > 1 else f"🎯 Score: {sc:.0f}/100"
+                att_str = f" (#{att})" if att > 1 else ""
                 sub_col = "#00E676" if sc >= 80 else ("#00E5FF" if sc >= 65 else ("#FFA726" if sc >= 50 else "#FF5252"))
-                ctk.CTkLabel(status_frame, text=f"🎯 Score: {sc:.0f}/100\n({sub.get('acc', 0):.1f}% • {sub.get('misses', 0)} Miss)",
+                ctk.CTkLabel(status_frame, text=f"{tag}{att_str}\n({sub.get('acc', 0):.1f}% • {sub.get('misses', 0)} Miss)",
                              font=("Arial", 10, "bold"), text_color=sub_col, justify="center").pack(side="right")
             else:
                 ctk.CTkLabel(status_frame, text="⏳ Offen", font=("Arial", 10), text_color="#777788").pack(side="right")
@@ -9286,6 +10792,8 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                 prev_count = len(getattr(self, "skill_tester_submissions", {}))
 
                 for play in plays:
+                    try: self.record_play_in_active_session(play)
+                    except: pass
                     bid = str(play.get("beatmap_id"))
                     for cat, minfo in getattr(self, "current_ai_skill_test", {}).items():
                         if str(minfo.get("id")) == bid:
@@ -9314,21 +10822,36 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                             )
 
                             existing = self.skill_tester_submissions.get(cat)
-                            if not existing or existing.get("score", 0) != play_score or existing.get("acc") != acc:
-                                new_play_found = True
+                            play_signature = f"{play_score}_{acc:.2f}_{miss}_{max_combo}"
+                            last_sig = existing.get("last_sig") if existing else None
 
-                            self.skill_tester_submissions[cat] = {
-                                "acc": round(acc, 2),
-                                "misses": miss,
-                                "h300": h300,
-                                "h100": h100,
-                                "h50": h50,
-                                "combo": max_combo,
-                                "skill_score": calculated_skill,
-                                "score": play_score,
-                                "map": minfo["name"],
-                                "sr": map_sr
-                            }
+                            if last_sig != play_signature:
+                                new_play_found = True
+                                curr_att = (existing.get("attempts", 0) + 1) if existing else 1
+                                existing_score = existing.get("skill_score", -1) if existing else -1
+
+                                # Only replace highscore if this attempt is better or equal
+                                is_better = (existing is None) or (calculated_skill > existing_score) or (calculated_skill == existing_score and play_score >= existing.get("score", 0))
+
+                                if is_better:
+                                    self.skill_tester_submissions[cat] = {
+                                        "acc": round(acc, 2),
+                                        "misses": miss,
+                                        "h300": h300,
+                                        "h100": h100,
+                                        "h50": h50,
+                                        "combo": max_combo,
+                                        "skill_score": calculated_skill,
+                                        "score": play_score,
+                                        "map": minfo["name"],
+                                        "sr": map_sr,
+                                        "attempts": curr_att,
+                                        "last_sig": play_signature
+                                    }
+                                else:
+                                    # Keep existing personal best, update attempt counter
+                                    self.skill_tester_submissions[cat]["attempts"] = curr_att
+                                    self.skill_tester_submissions[cat]["last_sig"] = play_signature
                             matched += 1
 
                             self.log_ai_event(
@@ -9514,7 +11037,7 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         ctk.CTkButton(top_bar, text="⬅ Modi", width=90, height=36, font=("Arial", 13, "bold"),
                       fg_color="#25252e", hover_color="#353540", command=self.show_training_mode_selection).pack(side="left", padx=15, pady=12)
 
-        ctk.CTkLabel(top_bar, text="🏆 Level-Training: Wähle dein Skillset", font=("Arial", 18, "bold"), text_color="#3b8ed0").pack(side="left", padx=10)
+        ctk.CTkLabel(top_bar, text="🏆 Level-Training: Wähle deinen Mod / Modus", font=("Arial", 18, "bold"), text_color="#3b8ed0").pack(side="left", padx=10)
 
         ctk.CTkButton(top_bar, text="?", width=32, height=32, font=("Arial", 16, "bold"),
                       fg_color="#22222a", hover_color="#333340", command=lambda: self.show_help("progression")).pack(side="right", padx=15)
@@ -9522,26 +11045,30 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         container = ctk.CTkFrame(master, fg_color="transparent")
         container.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        skillsets = [
-            ("🎯 Aim", "Aim", "#1f538d"),
-            ("⚡ Speed", "Speed", "#E91E63"),
-            ("🔋 Stamina", "Stamina", "#00BFA5"),
-            ("🔧 Tech", "Tech", "#9C27B0"),
-            ("🎯 Accuracy", "Acc", "#FFA726"),
-            ("🌊 Streams", "Streams", "#00E5FF"),
-            ("🔄 Alternating", "Alternating", "#AB47BC"),
-            ("🔍 Precision", "Precision", "#26A69A")
+        mods_list = [
+            ("🔘 NoMod (NM)", "NM", "#1f538d"),
+            ("⚡ DoubleTime (DT)", "DT", "#E91E63"),
+            ("🕶️ Hidden (HD)", "HD", "#9C27B0"),
+            ("🛡️ HardRock (HR)", "HR", "#00897B"),
+            ("🕶️🛡️ HDHR", "HDHR", "#0288D1"),
+            ("🕶️⚡ HDDT", "HDDT", "#FB8C00"),
+            ("🔦 Flashlight (FL)", "FL", "#5E35B1"),
+            ("🟢 Easy (EZ)", "EZ", "#2E7D32")
         ]
 
-        grid_frame = ctk.CTkFrame(container, fg_color="transparent")
+        grid_frame = ctk.CTkFrame(container, fg_color="#16161f", corner_radius=18, border_width=1, border_color="#2a2a38", width=760, height=220)
         grid_frame.place(relx=0.5, rely=0.5, anchor="center")
+        grid_frame.pack_propagate(False)
 
-        for i, (label, mode_id, color) in enumerate(skillsets):
+        inner_grid = ctk.CTkFrame(grid_frame, fg_color="transparent")
+        inner_grid.place(relx=0.5, rely=0.5, anchor="center")
+
+        for i, (label, mode_id, color) in enumerate(mods_list):
             r = i // 4
             c = i % 4
-            btn = ctk.CTkButton(grid_frame, text=label, font=("Arial", 15, "bold"), width=180, height=80, corner_radius=12,
-                                fg_color=color, hover_color="#333344", command=lambda m=mode_id: self.start_with_mod(m))
-            btn.grid(row=r, column=c, padx=10, pady=10)
+            btn = ctk.CTkButton(inner_grid, text=label, font=("Arial", 13, "bold"), width=165, height=68, corner_radius=12,
+                                fg_color=color, hover_color="#3a3a4d", command=lambda m=mode_id: self.start_with_mod(m))
+            btn.grid(row=r, column=c, padx=8, pady=8)
 
     def start_with_mod(self, mod_name):
         self.save_file = f"save_data_{mod_name}.json"
@@ -9681,6 +11208,21 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
 
     def process_replay_parsed(self, parsed, level_str):
         try:
+            h300_tmp = parsed.get('300s', 0)
+            h100_tmp = parsed.get('100s', 0)
+            h50_tmp = parsed.get('50s', 0)
+            miss_tmp = parsed.get('misses', 0)
+            tot_tmp = h300_tmp + h100_tmp + h50_tmp + miss_tmp
+            acc_tmp = ((h300_tmp * 300 + h100_tmp * 100 + h50_tmp * 50) / (tot_tmp * 300) * 100) if tot_tmp > 0 else 0
+            mock_p = {
+                "beatmap_id": parsed.get("beatmap_hash", ""),
+                "count300": h300_tmp, "count100": h100_tmp, "count50": h50_tmp, "countmiss": miss_tmp,
+                "maxcombo": parsed.get("combo", 0), "rank": "S" if (acc_tmp >= 93.0 and miss_tmp == 0) else "A",
+                "score": parsed.get("score", 0)
+            }
+            self.record_play_in_active_session(mock_p)
+        except: pass
+        try:
             if "levels" not in self.data: self.data["levels"] = {}
             if level_str not in self.data["levels"]: self.data["levels"][level_str] = {"s_ranks": [], "pfcs": [], "min3_maps": []}
             
@@ -9747,13 +11289,13 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         top_bar.pack_propagate(False)
 
         mod_name = self.save_file.replace("save_data_", "").replace(".json", "")
-        ctk.CTkButton(top_bar, text="⬅ Skillsets", width=90, height=34, font=("Arial", 12, "bold"),
+        ctk.CTkButton(top_bar, text="⬅ Mod-Auswahl", width=110, height=34, font=("Arial", 12, "bold"),
                       fg_color="#25252e", hover_color="#353540", command=self.show_training_skillset_selection).pack(side="left", padx=15, pady=13)
 
         ctk.CTkLabel(top_bar, text=f"📈 Level-Training: {mod_name}", font=("Arial", 18, "bold"), text_color="#3b8ed0").pack(side="left", padx=10)
 
         ctk.CTkButton(top_bar, text="🎯 Zum aktuellen Level", height=34, font=("Arial", 12, "bold"),
-                      command=self.jump_to_current, fg_color="#1f538d").pack(side="left", padx=15)
+                      command=self.jump_to_current_animated, fg_color="#1f538d", hover_color="#14375e").pack(side="left", padx=15)
 
         ctk.CTkButton(top_bar, text="?", width=32, height=32, font=("Arial", 16, "bold"),
                       fg_color="#22222a", hover_color="#333340", command=lambda: self.show_help("progression")).pack(side="right", padx=15)
@@ -9761,28 +11303,183 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         self.scrollable_frame = ctk.CTkScrollableFrame(master, orientation="horizontal", fg_color="transparent")
         self.scrollable_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
+        # Initialize window start to around active level
+        self.current_window_start = max(0, self.current_level_idx - 2)
         self.render_cards()
-        self.after(200, self.jump_to_current)
+        self.after(100, self.jump_to_current_animated)
 
-    def jump_to_current(self):
+    def _bind_horizontal_scroll(self, widget):
+        # 1. 2.5x Faster than previous (30 units per step - 10x base speed)
+        def _on_wheel(event):
+            if hasattr(self, "scrollable_frame") and self.scrollable_frame.winfo_exists():
+                canvas = self.scrollable_frame._parent_canvas
+                units = -30 if event.delta > 0 else 30
+                canvas.xview_scroll(units, "units")
+
+        # 2. Mouse Drag "Ice Slide" Inertia Physics
+        def _on_drag_start(event):
+            if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists(): return
+            if hasattr(self, "_slide_after_id") and self._slide_after_id:
+                try: self.after_cancel(self._slide_after_id)
+                except: pass
+                self._slide_after_id = None
+            self._is_dragging = True
+            self._drag_start_x = event.x_root
+            self._drag_last_x = event.x_root
+            self._drag_last_time = time.time()
+            self._drag_velocity = 0.0
+
+        def _on_drag_move(event):
+            if not getattr(self, "_is_dragging", False): return
+            if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists(): return
+            canvas = self.scrollable_frame._parent_canvas
+            
+            dx = self._drag_last_x - event.x_root
+            now = time.time()
+            dt = max(0.001, now - getattr(self, "_drag_last_time", now))
+            
+            bbox = canvas.bbox("all")
+            total_w = (bbox[2] - bbox[0]) if bbox else 2400
+            if total_w > 0:
+                frac_delta = dx / total_w
+                current_frac = canvas.xview()[0]
+                new_frac = max(0.0, min(1.0, current_frac + frac_delta))
+                canvas.xview_moveto(new_frac)
+                self._drag_velocity = frac_delta / dt
+            
+            self._drag_last_x = event.x_root
+            self._drag_last_time = now
+
+        def _on_drag_end(event):
+            self._is_dragging = False
+            vel = getattr(self, "_drag_velocity", 0.0)
+            # 60% slower launch velocity for gentler ice slide
+            self._drag_velocity = vel * 0.40
+            if abs(self._drag_velocity) > 0.0003:
+                self._do_ice_slide()
+
+        try:
+            widget.bind("<MouseWheel>", _on_wheel)
+            # Only bind drag to frames, canvas, and labels (avoid capturing button clicks)
+            widget_class = widget.__class__.__name__
+            if "Button" not in widget_class:
+                widget.bind("<ButtonPress-1>", _on_drag_start, add="+")
+                widget.bind("<B1-Motion>", _on_drag_move, add="+")
+                widget.bind("<ButtonRelease-1>", _on_drag_end, add="+")
+                # Also allow middle-click drag anywhere
+                widget.bind("<ButtonPress-2>", _on_drag_start, add="+")
+                widget.bind("<B2-Motion>", _on_drag_move, add="+")
+                widget.bind("<ButtonRelease-2>", _on_drag_end, add="+")
+
+            for child in widget.winfo_children():
+                self._bind_horizontal_scroll(child)
+        except: pass
+
+    def _do_ice_slide(self):
+        if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists(): return
+        if getattr(self, "_is_dragging", False): return
+        
+        canvas = self.scrollable_frame._parent_canvas
+        current_frac = canvas.xview()[0]
+        vel = getattr(self, "_drag_velocity", 0.0)
+        
+        # Step fraction for 60 FPS
+        step_frac = vel * 0.016
+        new_frac = max(0.0, min(1.0, current_frac + step_frac))
+        canvas.xview_moveto(new_frac)
+        
+        # 60% slower glide friction (0.86 deceleration per frame for smooth, controlled stop)
+        self._drag_velocity = vel * 0.86
+        
+        if abs(self._drag_velocity) > 0.0001 and 0.0 < new_frac < 1.0:
+            self._slide_after_id = self.after(16, self._do_ice_slide)
+        else:
+            self._drag_velocity = 0.0
+            self._slide_after_id = None
+
+    def jump_to_current_animated(self):
         if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists():
             return
-        total = len(self.levels)
-        if total == 0: return
-        fraction = max(0.0, min(1.0, self.current_level_idx / total))
-        self.scrollable_frame._parent_canvas.xview_moveto(fraction)
+        
+        # Center the window around current level
+        target_window = max(0, self.current_level_idx - 2)
+        if target_window != getattr(self, "current_window_start", 0):
+            self.current_window_start = target_window
+            self.render_cards()
+
+        canvas = self.scrollable_frame._parent_canvas
+        total_items = 8 + (1 if self.current_window_start > 0 else 0) + (1 if self.current_window_start + 8 < len(self.levels) else 0)
+        pos = (self.current_level_idx - self.current_window_start) + (1 if self.current_window_start > 0 else 0)
+        target_frac = max(0.0, min(1.0, (pos - 0.5) / max(1, total_items - 1)))
+        
+        current_frac = canvas.xview()[0]
+        steps = 8
+        def step(i=0):
+            if not self.winfo_exists() or not self.scrollable_frame.winfo_exists(): return
+            t = (i + 1) / steps
+            frac = current_frac + (target_frac - current_frac) * t
+            canvas.xview_moveto(frac)
+            if i + 1 < steps:
+                self.after(16, lambda: step(i + 1))
+        step()
 
     def set_current_level(self, idx):
         self.current_level_idx = idx
         self.save_data()
         self.render_cards()
-        self.jump_to_current()
+        self.jump_to_current_animated()
 
     def render_cards(self):
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
-        for idx in range(len(self.levels)):
+
+        if not hasattr(self, "current_window_start"):
+            self.current_window_start = max(0, self.current_level_idx - 2)
+
+        page_size = 8
+        start_idx = self.current_window_start
+        end_idx = min(len(self.levels), start_idx + page_size)
+
+        # 1. Previous page button if not at start
+        if start_idx > 0:
+            prev_frame = ctk.CTkFrame(self.scrollable_frame, width=160, height=440, corner_radius=16,
+                                      fg_color="#181824", border_width=1, border_color="#2b2b3b")
+            prev_frame.pack(side="left", padx=8, pady=10, fill="y")
+            prev_frame.pack_propagate(False)
+
+            prev_target = max(0, start_idx - page_size)
+            ctk.CTkLabel(prev_frame, text="◀ Vorherige\nLevel", font=("Arial", 14, "bold"), text_color="#3b8ed0").pack(expand=True)
+            ctk.CTkLabel(prev_frame, text=f"★ {self.levels[prev_target]:.1f} - {self.levels[start_idx-1]:.1f}",
+                         font=("Arial", 11), text_color="#888899").pack(pady=(0, 15))
+            def load_prev(target=prev_target):
+                self.current_window_start = target
+                self.render_cards()
+            ctk.CTkButton(prev_frame, text="Laden ◀", font=("Arial", 12, "bold"), width=120, height=34,
+                          fg_color="#1f538d", hover_color="#14375e", command=load_prev).pack(pady=(0, 20))
+
+        # 2. Render Cards in current window
+        for idx in range(start_idx, end_idx):
             self.draw_card(idx, is_active=(idx == self.current_level_idx))
+
+        # 3. Next page button if not at end
+        if end_idx < len(self.levels):
+            next_frame = ctk.CTkFrame(self.scrollable_frame, width=160, height=440, corner_radius=16,
+                                      fg_color="#181824", border_width=1, border_color="#2b2b3b")
+            next_frame.pack(side="left", padx=8, pady=10, fill="y")
+            next_frame.pack_propagate(False)
+
+            next_end = min(len(self.levels) - 1, end_idx + page_size - 1)
+            ctk.CTkLabel(next_frame, text="Weitere\nLevel ▶", font=("Arial", 14, "bold"), text_color="#3b8ed0").pack(expand=True)
+            ctk.CTkLabel(next_frame, text=f"★ {self.levels[end_idx]:.1f} - {self.levels[next_end]:.1f}",
+                         font=("Arial", 11), text_color="#888899").pack(pady=(0, 15))
+            def load_next(target=end_idx):
+                self.current_window_start = target
+                self.render_cards()
+            ctk.CTkButton(next_frame, text="Laden ▶", font=("Arial", 12, "bold"), width=120, height=34,
+                          fg_color="#1f538d", hover_color="#14375e", command=load_next).pack(pady=(0, 20))
+
+        # Bind horizontal scrolling to all created elements
+        self._bind_horizontal_scroll(self.scrollable_frame)
 
     def draw_card(self, level_idx, is_active):
         level = self.levels[level_idx]
@@ -9796,6 +11493,7 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         s_count = len(level_data.get("s_ranks", []))
         pfc_count = len(level_data.get("pfcs", []))
         m3_count = len(level_data.get("min3_maps", []))
+        total_plays = s_count + pfc_count + m3_count
 
         is_passed = (s_count >= 5 and pfc_count >= 2 and m3_count >= 2) and not level_data.get("skipped", False)
         is_skipped = level_data.get("skipped", False)
@@ -9821,44 +11519,125 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
             title = "GESPERRT"
             title_color = "#777788"
 
-        frame = ctk.CTkFrame(self.scrollable_frame, width=300, height=500, corner_radius=18,
+        frame = ctk.CTkFrame(self.scrollable_frame, width=280, height=440, corner_radius=16,
                              border_width=2, fg_color=bg_color, border_color=border_color)
-        frame.pack(side="left", padx=12, pady=15, fill="y")
+        frame.pack(side="left", padx=10, pady=10, fill="y")
         frame.pack_propagate(False)
 
-        header = ctk.CTkFrame(frame, fg_color="transparent")
-        header.pack(fill="x", pady=(12, 0), padx=10)
+        # Top Header Bar (Select button if inactive)
+        top_h = ctk.CTkFrame(frame, fg_color="transparent", height=28)
+        top_h.pack(fill="x", padx=10, pady=(8, 0))
+        top_h.pack_propagate(False)
 
         if not is_active and not is_passed:
-            ctk.CTkButton(header, text="Auswählen", width=90, height=26, font=("Arial", 11),
+            ctk.CTkButton(top_h, text="Auswählen", width=84, height=24, font=("Arial", 11, "bold"),
                           fg_color="#2b2b36", hover_color="#3a3a48",
                           command=lambda idx=level_idx: self.set_current_level(idx)).pack(side="right")
 
-        ctk.CTkLabel(frame, text=title, font=("Arial", 15, "bold"), text_color=title_color).pack(pady=(10, 2))
-        ctk.CTkLabel(frame, text=f"{level_str} ★", font=("Arial", 28, "bold"), text_color="#ffffff").pack(pady=(0, 15))
+        # Level Title & Stars at top
+        ctk.CTkLabel(frame, text=title, font=("Arial", 13, "bold"), text_color=title_color).pack(pady=(2, 2))
+        ctk.CTkLabel(frame, text=f"{level_str} ★", font=("Arial", 28, "bold"), text_color="#ffffff").pack(pady=(0, 6))
+
+        # Requirements Section (Clickable to show details)
+        req_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        req_frame.pack(fill="x", padx=14, pady=4)
 
         if is_passed:
-            ctk.CTkLabel(frame, text="🎉 Alle Anforderungen gemeistert!", font=("Arial", 13), text_color="#4CAF50").pack(pady=10)
+            ctk.CTkLabel(req_frame, text="🎉 Alle Anforderungen gemeistert!", font=("Arial", 13, "bold"), text_color="#4CAF50").pack(pady=10)
         else:
             s_col = "#4CAF50" if s_count >= 5 else "#ffffff"
             pfc_col = "#4CAF50" if pfc_count >= 2 else "#ffffff"
             m3_col = "#4CAF50" if m3_count >= 2 else "#ffffff"
 
-            ctk.CTkLabel(frame, text=f"{s_count}/5 S-Ranks", font=("Arial", 14, "bold"), text_color=s_col).pack(pady=4)
-            ctk.CTkLabel(frame, text=f"{pfc_count}/2 PFCs", font=("Arial", 14, "bold"), text_color=pfc_col).pack(pady=4)
-            ctk.CTkLabel(frame, text=f"{m3_count}/2 3min+ Maps", font=("Arial", 14, "bold"), text_color=m3_col).pack(pady=4)
+            ctk.CTkLabel(req_frame, text=f"{s_count}/5 S-Ranks", font=("Arial", 14, "bold"), text_color=s_col).pack(pady=3)
+            ctk.CTkLabel(req_frame, text=f"{pfc_count}/2 PFCs (Perfect FC)", font=("Arial", 14, "bold"), text_color=pfc_col).pack(pady=3)
+            ctk.CTkLabel(req_frame, text=f"{m3_count}/2 Maps (> 3 Min)", font=("Arial", 14, "bold"), text_color=m3_col).pack(pady=3)
 
-            if is_active:
-                dnd_box = ctk.CTkLabel(frame, text="📂 .osr Replay hier ablegen", font=("Arial", 12),
-                                       bg_color="#22222f", width=240, height=50, corner_radius=8)
-                dnd_box.pack(pady=15)
-                try:
-                    dnd_box.drop_target_register(TkinterDnD.DND_FILES)
-                    dnd_box.dnd_bind('<<Drop>>', lambda e, l=level_str: self.handle_drop(e, l))
-                except: pass
+        # Gespielte Maps Details Button
+        ctk.CTkButton(frame, text=f"🔍 Gespielte Maps ({total_plays})", font=("Arial", 11, "bold"), height=26,
+                      fg_color="#232332", hover_color="#323244", text_color="#00E5FF",
+                      command=lambda l=level_str: self.show_level_plays_modal(l)).pack(padx=14, pady=(6, 4), fill="x")
 
-                ctk.CTkButton(frame, text="Level Überspringen", font=("Arial", 11), height=28,
-                              fg_color="#c62828", hover_color="#b71c1c", command=lambda l=level_str: self.skip_level(l)).pack(side="bottom", pady=15)
+        # Active Level Actions (Search String & Skip)
+        if is_active:
+            action_frame = ctk.CTkFrame(frame, fg_color="transparent")
+            action_frame.pack(fill="x", padx=14, pady=(10, 0))
+
+            next_lvl = round(level + 0.09, 2)
+            search_str = f"stars>={level:.2f} stars<={next_lvl:.2f} mode=osu status=r"
+
+            copy_btn = ctk.CTkButton(action_frame, text="📋 Suchstring kopieren", font=("Arial", 12, "bold"), height=34,
+                                     fg_color="#1f538d", hover_color="#14375e")
+            
+            def copy_search_str(s=search_str, btn=copy_btn):
+                self.clipboard_clear()
+                self.clipboard_append(s)
+                self.update()
+                btn.configure(text="✅ Kopiert!", fg_color="#2E7D32")
+                self.after(2000, lambda: btn.configure(text="📋 Suchstring kopieren", fg_color="#1f538d") if btn.winfo_exists() else None)
+
+            copy_btn.configure(command=copy_search_str)
+            copy_btn.pack(fill="x", pady=(0, 6))
+
+            ctk.CTkButton(action_frame, text="Level Überspringen", font=("Arial", 11), height=26,
+                          fg_color="#c62828", hover_color="#b71c1c", command=lambda l=level_str: self.skip_level(l)).pack(fill="x")
+
+    def show_level_plays_modal(self, level_str):
+        self.show_overlay()
+
+        if "levels" not in self.data: self.data["levels"] = {}
+        level_data = self.data["levels"].get(level_str, {"s_ranks": [], "pfcs": [], "min3_maps": []})
+
+        s_ranks = level_data.get("s_ranks", [])
+        pfcs = level_data.get("pfcs", [])
+        min3_maps = level_data.get("min3_maps", [])
+
+        modal = ctk.CTkFrame(self.overlay, fg_color="#14141c", corner_radius=16, border_width=2, border_color="#1f538d", width=620, height=520)
+        modal.place(relx=0.5, rely=0.5, anchor="center")
+        modal.pack_propagate(False)
+
+        top_h = ctk.CTkFrame(modal, fg_color="transparent")
+        top_h.pack(fill="x", padx=16, pady=(16, 8))
+        ctk.CTkLabel(top_h, text=f"🏆 Level {level_str} ★ - Gespielte Maps", font=("Arial", 18, "bold"), text_color="#00E5FF").pack(side="left")
+        ctk.CTkButton(top_h, text="✕", width=32, height=32, font=("Arial", 14, "bold"), fg_color="#2b2b36", hover_color="#c62828",
+                      command=self.hide_overlay).pack(side="right")
+
+        scroll = ctk.CTkScrollableFrame(modal, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=16, pady=(0, 14))
+
+        def render_play_group(title_text, plays_list, icon="⭐"):
+            ctk.CTkLabel(scroll, text=f"{icon} {title_text} ({len(plays_list)})", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w", pady=(10, 4))
+            if not plays_list:
+                ctk.CTkLabel(scroll, text="   Noch keine Maps in dieser Kategorie gespielt.", font=("Arial", 12), text_color="#777788").pack(anchor="w", pady=(0, 6))
+                return
+            for p in plays_list:
+                card = ctk.CTkFrame(scroll, fg_color="#1d1d28", corner_radius=10, border_width=1, border_color="#2f2f40")
+                card.pack(fill="x", pady=3)
+                
+                # Map Name / Score Info
+                map_name = p.get("title") or p.get("beatmap_title") or p.get("beatmap_id") or p.get("hash") or "Unbekannte Beatmap"
+                acc = p.get("acc") or p.get("accuracy") or 0.0
+                combo = p.get("combo") or p.get("maxcombo") or 0
+                miss = p.get("misses") or p.get("countmiss") or 0
+                date_str = p.get("timestamp") or p.get("date") or ""
+
+                top_r = ctk.CTkFrame(card, fg_color="transparent")
+                top_r.pack(fill="x", padx=10, pady=(6, 2))
+                ctk.CTkLabel(top_r, text=f"{map_name}", font=("Arial", 12, "bold"), text_color="#3b8ed0", anchor="w").pack(side="left")
+                if acc:
+                    ctk.CTkLabel(top_r, text=f"{acc:.2f}%", font=("Arial", 12, "bold"), text_color="#4CAF50").pack(side="right")
+
+                bot_r = ctk.CTkFrame(card, fg_color="transparent")
+                bot_r.pack(fill="x", padx=10, pady=(0, 6))
+                ctk.CTkLabel(bot_r, text=f"Max Combo: {combo}x | Misses: {miss} {f'| {date_str[:16]}' if date_str else ''}",
+                             font=("Arial", 11), text_color="#aaaaaa", anchor="w").pack(side="left")
+
+        render_play_group("S-Ranks (Ziel: 5)", s_ranks, "⭐")
+        render_play_group("Perfect FCs (Ziel: 2)", pfcs, "🎯")
+        render_play_group("3 Minuten+ Maps (Ziel: 2)", min3_maps, "⏱️")
+
+        ctk.CTkButton(modal, text="Schließen", font=("Arial", 12, "bold"), height=34,
+                      fg_color="#1f538d", hover_color="#14375e", command=self.hide_overlay).pack(fill="x", padx=16, pady=(0, 14))
 
     def skip_level(self, level_str):
         def do_skip():
