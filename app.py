@@ -412,57 +412,68 @@ def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
 
 def calculate_skill_test_score(acc, misses, h50=0, maxcombo=0, map_sr=5.5, player_sr=5.5):
     """
-    Berechnet die echte Skillset-Punktzahl (0 - 100) fuer eine gespielte Test-Map:
-    - Bestraft Misses (Combo-Breaks) drastisch:
-      * 0 Misses (FC) & 99%+ Acc -> 96 - 100 Punkte (Meisterhaft)
-      * 0 Misses & 97.5% Acc -> 90 - 95 Punkte (Souveraener FC)
-      * 1 Miss (Choke) & 98% Acc -> 80 - 85 Punkte
-      * 2 Misses & 98% Acc -> 70 - 75 Punkte
-      * 3 Misses & 98% Acc -> 58 - 65 Punkte
-      * 5 Misses & 98% Acc -> 42 - 50 Punkte (Pass mit Fehlern, KEINE 98 Punkte!)
-      * 8+ Misses -> 20 - 35 Punkte (Deutlicher Struggle)
-      * 15+ Misses -> 10 - 20 Punkte
+    Berechnet die faire, kalibrierte Skillset-Punktzahl (0 - 100) fuer eine gespielte Test-Map:
+    - 0 Misses (FC) & 99%+ Acc -> 96 - 100 Punkte (Meisterhaft)
+    - 0 Misses & 97.5% Acc -> 90 - 95 Punkte (Souveraener FC)
+    - 1 Miss (Choke) & 97%+ Acc -> 80 - 88 Punkte
+    - 2-3 Misses & 93%+ Acc -> 65 - 78 Punkte (Solider A-Rank Pass)
+    - 4-6 Misses & 92%+ Acc -> 50 - 64 Punkte
+    - 8+ Misses / Low Acc -> 25 - 45 Punkte
     """
     if acc <= 0:
         return 0.0
 
-    # 1. Base Score derived from Accuracy (exponential scaling)
-    if acc >= 95.0:
-        base = 85.0 + ((acc - 95.0) / 5.0) * 15.0
+    # 1. Base Score derived from Accuracy (smooth realistic curve)
+    if acc >= 98.0:
+        base = 92.0 + ((acc - 98.0) / 2.0) * 8.0   # 98% -> 92, 100% -> 100
+    elif acc >= 95.0:
+        base = 82.0 + ((acc - 95.0) / 3.0) * 10.0  # 95% -> 82, 98% -> 92
     elif acc >= 90.0:
-        base = 68.0 + ((acc - 90.0) / 5.0) * 17.0
+        base = 68.0 + ((acc - 90.0) / 5.0) * 14.0  # 90% -> 68, 95% -> 82
     elif acc >= 80.0:
-        base = 40.0 + ((acc - 80.0) / 10.0) * 28.0
+        base = 45.0 + ((acc - 80.0) / 10.0) * 23.0  # 80% -> 45, 90% -> 68
     else:
-        base = max(10.0, acc * 0.5)
+        base = max(15.0, acc * 0.55)
 
-    # 2. Miss Penalty (heavy penalty per miss / combo break)
+    # 2. Miss Penalty (balanced scaling so A-ranks never crash to 5 pts)
     if misses == 0:
         miss_penalty = 0.0
     elif misses == 1:
-        miss_penalty = 12.0
+        miss_penalty = 6.0
     elif misses == 2:
-        miss_penalty = 22.0
+        miss_penalty = 12.0
     elif misses == 3:
-        miss_penalty = 32.0
+        miss_penalty = 18.0
     elif misses == 4:
-        miss_penalty = 40.0
+        miss_penalty = 24.0
     elif misses <= 6:
-        miss_penalty = 48.0 + (misses - 4) * 5.0  # 5 misses -> -53 pts!
+        miss_penalty = 24.0 + (misses - 4) * 4.0   # 5 misses -> -28 pts
     elif misses <= 10:
-        miss_penalty = 58.0 + (misses - 6) * 3.5  # 10 misses -> -72 pts!
+        miss_penalty = 32.0 + (misses - 6) * 3.0   # 10 misses -> -44 pts
     else:
-        miss_penalty = 72.0 + min(20.0, (misses - 10) * 1.5)
+        miss_penalty = 44.0 + min(25.0, (misses - 10) * 1.5)
 
-    # 3. 50s Tapping Instability Penalty
-    h50_penalty = min(15.0, h50 * 2.5)
+    # 3. 50s Tapping Instability Penalty (max 10 pts)
+    h50_penalty = min(10.0, h50 * 1.5)
 
     # 4. SR Difficulty Scaling Bonus/Adjustment
     sr_ratio = (map_sr / max(3.5, player_sr))
-    sr_mult = max(0.85, min(1.15, sr_ratio))
+    sr_mult = max(0.90, min(1.15, sr_ratio))
 
-    final_score = (base - miss_penalty - h50_penalty) * sr_mult
-    return round(max(5.0, min(100.0, final_score)), 1)
+    raw_calc = (base - miss_penalty - h50_penalty) * sr_mult
+
+    # Safe floor guarantees based on Accuracy & Pass Quality (e.g. 93% A-rank >= 50 pts)
+    if acc >= 95.0 and misses <= 3:
+        floor_val = 65.0
+    elif acc >= 92.0 and misses <= 5:
+        floor_val = 50.0
+    elif acc >= 88.0:
+        floor_val = 35.0
+    else:
+        floor_val = 10.0
+
+    final_score = max(floor_val, min(100.0, raw_calc))
+    return round(final_score, 1)
 
 import customtkinter as ctk
 from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -1579,6 +1590,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.processed_replays = set()
         self.last_deep_replay_telemetry = None
         self.deep_replay_history = []
+        self.ai_debug_logs = []
         self._dir_mtimes = {}
 
         # Scan existing replays to initialize baseline
@@ -1604,6 +1616,27 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.show_tutorial_welcome()
         else:
             self.show_main_menu()
+
+    def log_ai_event(self, category, input_summary, prompt_text=None, raw_ai_response=None, calculations=None):
+        """Records an AI prompt, reasoning, response, and scoring calculation into the diagnostic log."""
+        if not hasattr(self, "ai_debug_logs") or not isinstance(self.ai_debug_logs, list):
+            self.ai_debug_logs = []
+        
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "category": category,
+            "inputs": input_summary,
+            "calculations": calculations,
+            "prompt": prompt_text,
+            "raw_ai_response": raw_ai_response
+        }
+        self.ai_debug_logs.insert(0, entry)
+        if len(self.ai_debug_logs) > 50:
+            self.ai_debug_logs = self.ai_debug_logs[:50]
+        try:
+            self.save_global_settings()
+        except:
+            pass
 
     def record_deep_replay_play(self, parsed):
         """Records a parsed replay into the holistic session history and last telemetry slot."""
@@ -1686,6 +1719,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     if data.get('user_setup_profile'): self.user_setup_profile = data.get('user_setup_profile')
                     if data.get('last_deep_replay_telemetry'): self.last_deep_replay_telemetry = data.get('last_deep_replay_telemetry')
                     if data.get('deep_replay_history'): self.deep_replay_history = data.get('deep_replay_history')
+                    if data.get('ai_debug_logs'): self.ai_debug_logs = data.get('ai_debug_logs')
             except: pass
 
     def save_global_settings(self):
@@ -1710,7 +1744,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             'has_osu_supporter': getattr(self, 'has_osu_supporter', False),
             'user_setup_profile': getattr(self, 'user_setup_profile', {}),
             'last_deep_replay_telemetry': getattr(self, 'last_deep_replay_telemetry', None),
-            'deep_replay_history': getattr(self, 'deep_replay_history', [])
+            'deep_replay_history': getattr(self, 'deep_replay_history', []),
+            'ai_debug_logs': getattr(self, 'ai_debug_logs', [])
         }
         try:
             with open(self.settings_file, 'w', encoding='utf-8') as f:
@@ -2125,6 +2160,73 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                           fg_color="#E91E63", hover_color="#C2185B", command=save_ai_settings).pack(side="left")
             ai_save_lbl = ctk.CTkLabel(ai_save_frame, text="", font=("Arial", 12))
             ai_save_lbl.pack(side="left", padx=15)
+
+            ctk.CTkLabel(scroll_content, text="KI-DIAGNOSE & GEDANKENPROTOKOLL", font=("Arial", 11, "bold"), text_color="#666677").pack(anchor="w", pady=(20, 8))
+
+            c_log = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
+            c_log.pack(fill="x", pady=6)
+
+            c_log_text = ctk.CTkFrame(c_log, fg_color="transparent")
+            c_log_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
+
+            log_count = len(getattr(self, "ai_debug_logs", []))
+            ctk.CTkLabel(c_log_text, text=f"📋 KI-Gedankengang & Fehler-Protokoll ({log_count} Events)", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c_log_text, text="Protokolliert automatisch alle Prompts, Gemini-Gedankengänge, Roh-Antworten und Score-Berechnungen zur Fehlerbehebung.",
+                         font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
+
+            log_actions = ctk.CTkFrame(c_log, fg_color="transparent")
+            log_actions.pack(side="right", padx=16, pady=10)
+
+            def export_ai_diagnostics():
+                desktop = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
+                out_file = os.path.join(desktop, "uho_ai_diagnostics.txt")
+                logs = getattr(self, "ai_debug_logs", [])
+                
+                report_lines = [
+                    "=" * 70,
+                    f"UHO HUB - KI-DIAGNOSE & GEDANKENPROTOKOLL (v{CURRENT_APP_VERSION})",
+                    f"Erstellt am: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"Spieler: {getattr(self, 'osu_username', 'Unbekannt')}",
+                    f"KI-Modell: {getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}",
+                    f"Gesamtanzahl protokollierter KI-Events: {len(logs)}",
+                    "=" * 70,
+                    ""
+                ]
+                
+                if not logs:
+                    report_lines.append("Keine KI-Events protokolliert. Führe erst eine Profil-Analyse, ein KI-Training oder einen Skill Test durch.")
+                else:
+                    for idx, item in enumerate(logs):
+                        report_lines.append(f"--- [EVENT #{idx+1}] {item.get('timestamp', '')} | Kategorie: {item.get('category', 'Allgemein')} ---")
+                        report_lines.append(f"📌 INPUTS / SCORES:\n{json.dumps(item.get('inputs', {}), indent=2, ensure_ascii=False)}")
+                        if item.get('calculations'):
+                            report_lines.append(f"\n🔢 BERECHNUNGEN & SCORING:\n{json.dumps(item.get('calculations', {}), indent=2, ensure_ascii=False)}")
+                        if item.get('prompt'):
+                            report_lines.append(f"\n🤖 GESENDETER PROMPT AN GEMINI:\n{item.get('prompt')}")
+                        if item.get('raw_ai_response'):
+                            report_lines.append(f"\n💡 GEMINI ROH-ANTWORT & GEDANKENGANG:\n{item.get('raw_ai_response')}")
+                        report_lines.append("\n" + ("-" * 60) + "\n")
+                        
+                content = "\n".join(report_lines)
+                try:
+                    with open(out_file, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    try:
+                        self.clipboard_clear()
+                        self.clipboard_append(content)
+                    except:
+                        pass
+                    self.show_message("✅ KI-Diagnose exportiert", f"Das vollständige KI-Gedankenprotokoll wurde auf deinem Desktop gespeichert:\n\n📄 {out_file}\n\n(Zusätzlich in die Zwischenablage kopiert!)")
+                except Exception as e:
+                    self.show_message("Fehler beim Export", f"Konnte Datei nicht schreiben: {e}")
+
+            def clear_ai_diagnostics():
+                self.ai_debug_logs = []
+                self.save_global_settings()
+                self.show_settings(active_tab="ai")
+
+            ctk.CTkButton(log_actions, text="🗑️ Leeren", width=80, height=34, fg_color="#3a1e22", hover_color="#5a222a", text_color="#ff8888", command=clear_ai_diagnostics).pack(side="right", padx=(6, 0))
+            ctk.CTkButton(log_actions, text="📋 Log exportieren", width=145, height=34, fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", font=("Arial", 12, "bold"), command=export_ai_diagnostics).pack(side="right")
 
         elif active_tab == "about":
             ctk.CTkLabel(scroll_content, text="APP INFORMATIONEN & UPDATES", font=("Arial", 11, "bold"), text_color="#666677").pack(anchor="w", pady=(15, 8))
@@ -6469,6 +6571,26 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                 if not ai_coaching_text:
                     ai_coaching_text = f"{adapt_msg}\n\nAchte auf gleichmäßiges Tapping und ruhiges Aiming."
 
+                self.log_ai_event(
+                    category="Live KI-Training Coach",
+                    input_summary={
+                        "map": map_name,
+                        "sr": map_sr,
+                        "bpm": map_bpm,
+                        "prescribed_mod": prescribed_mod,
+                        "played_mod": played_mods_str,
+                        "acc": round(acc, 2),
+                        "misses": miss,
+                        "combo": combo,
+                        "300s": h300,
+                        "100s": h100,
+                        "50s": h50
+                    },
+                    prompt_text=coach_prompt if getattr(self, "gemini_key", "") else None,
+                    raw_ai_response=ai_coaching_text,
+                    calculations={"adaptive_sr_delta": delta, "adapt_msg": adapt_msg}
+                )
+
                 feedback = f"✅ Runde automatisch erfasst ({played_mods_str})!\nAcc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | Misses: {miss}\n\n🤖 Coach-Analyse:\n{ai_coaching_text}\n\n{mod_warning + chr(10) + chr(10) if mod_warning else ''}{adapt_msg}"
 
                 def update_feed():
@@ -6764,6 +6886,25 @@ Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
                     
                     if not rep:
                         rep = f"🎯 **Aim:** Über alle {agg['total_plays']} Maps zeigt sich ein systematischer Overaim von {over_pct:.1f}%. Reduziere deine Tablet-Area um ca. 2mm in der Breite, um die Jump-Stabilität zu erhöhen.\n\n⚡ **Tapping:** Deine Hold-Times (K1: {k1_hold:.1f}ms / K2: {k2_hold:.1f}ms) weisen einen Versatz von {hold_gap:.1f}ms auf. Achte auf gleichmäßigen Fingerdruck bei Streams.\n\n🩸 **Miss-Ursachen:** Die meisten Fehler entstehen durch Dekompensation bei schnellen Jump-Winkeln.\n\n🔥 **Trainings-Fokus:** Absolviere täglich 15 Minuten gezieltes CS 4.8+ Jump-Training und 180-200 BPM Finger-Control Maps."
+
+                    self.log_ai_event(
+                        category="Deep Replay KI-Gesamtanalyse",
+                        input_summary={
+                            "total_plays": agg.get('total_plays', 0),
+                            "avg_acc": agg.get('avg_acc', 0.0),
+                            "total_misses": agg.get('total_misses', 0),
+                            "max_combo": agg.get('max_combo', 0)
+                        },
+                        prompt_text=prompt if getattr(self, "gemini_key", "") else None,
+                        raw_ai_response=rep,
+                        calculations={
+                            "avg_overaim": over_pct,
+                            "avg_underaim": under_pct,
+                            "k1_hold": k1_hold,
+                            "k2_hold": k2_hold,
+                            "top_issues": agg.get('top_systemic_issues', [])
+                        }
+                    )
 
                     def _done():
                         if ai_res_box.winfo_exists():
@@ -7496,6 +7637,23 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
             self.last_profile_player = username
             self.save_global_settings()
 
+            self.log_ai_event(
+                category=f"Profil-Analyse: {username}",
+                input_summary={
+                    "username": username,
+                    "rank": rank_val,
+                    "pp": pp_val,
+                    "profile_acc": u_acc if 'u_acc' in locals() else 0.0,
+                    "top_plays_analyzed": len(enriched_top_plays)
+                },
+                prompt_text=prompt if getattr(self, "gemini_key", "") else None,
+                raw_ai_response=raw_text if ('raw_text' in locals() and raw_text) else feedback_text,
+                calculations={
+                    "scores": user_scores,
+                    "player_stats": player_stats
+                }
+            )
+
             def update_ui():
                 self.draw_profile_radar(user_scores)
                 self.profile_ai_box.configure(state="normal")
@@ -7966,6 +8124,27 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                             }
                             matched += 1
 
+                            self.log_ai_event(
+                                category=f"Skill-Tester Map: {cat}",
+                                input_summary={
+                                    "category": cat,
+                                    "map": minfo.get("name"),
+                                    "sr": map_sr,
+                                    "player_effective_sr": player_sr,
+                                    "acc": round(acc, 2),
+                                    "misses": miss,
+                                    "combo": max_combo,
+                                    "300s": h300,
+                                    "100s": h100,
+                                    "50s": h50,
+                                    "play_score": play_score
+                                },
+                                calculations={
+                                    "calculated_skill_score": calculated_skill,
+                                    "formula": "calculate_skill_test_score(acc, misses, h50, maxcombo, map_sr, player_sr)"
+                                }
+                            )
+
                 def done():
                     if not hasattr(self, 'tester_dnd_status') or not self.tester_dnd_status.winfo_exists():
                         return
@@ -8061,6 +8240,7 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
 
             ai_resp = ""
             calibrated_scores = {}
+            raw_text = ""
             if getattr(self, "gemini_key", ""):
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}:generateContent?key={self.gemini_key}"
@@ -8077,7 +8257,15 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
                 except Exception as e:
                     ai_resp = f"Analyse der {len(subs)} Test-Maps:\n\n" + "\n".join([f"• {k}: {v.get('skill_score', v.get('acc')):.0f} Pkt ({v.get('acc'):.1f}%, {v.get('misses')} Miss)" for k, v in subs.items()])
             else:
-                ai_resp = f"Offline-Auswertung:\nDu hast {len(subs)}/8 Maps erfolgreich absolviert!\n\n" + "\n".join([f"• {k}: {v.get('skill_score', v.get('acc')):.0f} Pkt ({v.get('acc'):.1f}%, {v.get('misses')} Miss)" for k, v in subs.items()])
+                ai_resp = f"Analyse der {len(subs)} Test-Maps (Ohne Gemini Key):\n\n" + "\n".join([f"• {k}: {v.get('skill_score', v.get('acc')):.0f} Pkt ({v.get('acc'):.1f}%, {v.get('misses')} Miss)" for k, v in subs.items()])
+
+            self.log_ai_event(
+                category="Skill-Tester Zertifikat (Gemini)",
+                input_summary={"submissions_count": len(subs), "categories": list(subs.keys())},
+                prompt_text=prompt if getattr(self, "gemini_key", "") else None,
+                raw_ai_response=raw_text if raw_text else ai_resp,
+                calculations={"calibrated_scores": calibrated_scores}
+            )
 
             # Calibrate fallback scores from mathematical formula if not returned
             for cat, sub in subs.items():
