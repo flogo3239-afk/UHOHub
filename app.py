@@ -993,7 +993,7 @@ def compute_aggregate_deep_telemetry(replays_list):
     quad_bl = sum(m.get('quadrants', {}).get('BL', 25.0) for m in metrics_list) / len(metrics_list)
     quad_br = sum(m.get('quadrants', {}).get('BR', 25.0) for m in metrics_list) / len(metrics_list)
 
-    # Collect and rank all systemic choke reasons
+    # Collect and rank all systemic choke reasons (top 5 most frequent across all plays)
     choke_counter = {}
     for m in metrics_list:
         for reason in m.get('choke_reasons', []):
@@ -1001,7 +1001,7 @@ def compute_aggregate_deep_telemetry(replays_list):
                 continue
             choke_counter[reason] = choke_counter.get(reason, 0) + 1
 
-    top_systemic_issues = sorted(choke_counter.items(), key=lambda x: x[1], reverse=True)
+    top_systemic_issues = sorted(choke_counter.items(), key=lambda x: x[1], reverse=True)[:5]
 
     return {
         'total_plays': total_plays,
@@ -6705,7 +6705,7 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
 
             choke_hdr = ctk.CTkFrame(choke_card, fg_color="transparent")
             choke_hdr.pack(fill="x", padx=16, pady=(14, 6))
-            ctk.CTkLabel(choke_hdr, text="🩸 Systemische Fehlerquellen (Über alle Maps gehäuft)", font=("Arial", 15, "bold"), text_color="#FF9800").pack(side="left")
+            ctk.CTkLabel(choke_hdr, text="🩸 Top 5 Systemische Fehlerquellen (Häufigste Chokes der Session)", font=("Arial", 15, "bold"), text_color="#FF9800").pack(side="left")
 
             issues = agg["top_systemic_issues"]
             if not issues:
