@@ -22,7 +22,7 @@ try:
 except Exception:
     winreg = None
 
-CURRENT_APP_VERSION = "2.5.1"
+CURRENT_APP_VERSION = "2.5.2"
 GITHUB_REPO = "flogo3239-afk/UHOHub"
 
 def get_resource_path(relative_path):
@@ -2413,14 +2413,22 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 except Exception as e:
                     self.show_message("Fehler beim Export", f"Konnte Datei nicht schreiben: {e}")
 
-            def clear_ai_diagnostics():
-                self.ai_debug_logs = []
-                self.ai_user_feedback = {}
-                self.save_global_settings()
-                self.show_settings(active_tab="ai")
-
-            ctk.CTkButton(log_actions, text="🗑️ Leeren", width=80, height=34, fg_color="#3a1e22", hover_color="#5a222a", text_color="#ff8888", command=clear_ai_diagnostics).pack(side="right", padx=(6, 0))
             ctk.CTkButton(log_actions, text="📋 Log exportieren", width=145, height=34, fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", font=("Arial", 12, "bold"), command=export_ai_diagnostics).pack(side="right")
+
+            # Danger Zone: Reset AI Memory Card
+            ctk.CTkLabel(scroll_content, text="GEFÄHRLICHE ZONE (RESET)", font=("Arial", 11, "bold"), text_color="#ff5252").pack(anchor="w", pady=(22, 8))
+
+            c_danger = ctk.CTkFrame(scroll_content, fg_color="#241418", corner_radius=10, border_width=1, border_color="#c62828")
+            c_danger.pack(fill="x", pady=6)
+
+            c_danger_text = ctk.CTkFrame(c_danger, fg_color="transparent")
+            c_danger_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
+            ctk.CTkLabel(c_danger_text, text="🔥 Alle gelernten KI-Daten & Gedächtnis löschen", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c_danger_text, text="Setzt alle erlernten Schwächen, Vorlieben, Daumen-Feedbacks, Replay-Telemetrien, Hardware-Setups und den Skill-Radar vollständig auf Werkseinstellung zurück (Sicherheits-Bestätigung erforderlich).",
+                         font=("Arial", 11), text_color="#ffcdd2").pack(anchor="w", pady=(2, 0))
+
+            ctk.CTkButton(c_danger, text="🗑️ KI-Gedächtnis zurücksetzen...", font=("Arial", 12, "bold"), height=36, width=220,
+                          fg_color="#c62828", hover_color="#b71c1c", text_color="#ffffff", command=self.show_reset_ai_memory_modal).pack(side="right", padx=16)
 
         elif active_tab == "about":
             ctk.CTkLabel(scroll_content, text="APP INFORMATIONEN & UPDATES", font=("Arial", 11, "bold"), text_color="#666677").pack(anchor="w", pady=(15, 8))
@@ -2971,8 +2979,130 @@ del "%~f0" & exit
         _apply(root_widget)
 
     # ---------------------------------------------------------------------------
-    # INTERAKTIVE MULTIPLE-CHOICE KI-FRAGEN (MATCHING DESIGN media_1787688868040.png)
+    # SICHERHEITS-MODAL: KI-GEDÄCHTNIS & GELERNTE DATEN ZURÜCKSETZEN ("DELETE")
     # ---------------------------------------------------------------------------
+    def show_reset_ai_memory_modal(self):
+        """
+        Öffnet einen Sicherheitsdialog, der das Löschen aller von der KI erlernten Daten
+        erst nach expliziter Eingabe von "DELETE" in ein Textfeld freischaltet.
+        """
+        modal = ctk.CTkToplevel(self)
+        modal.title("⚠️ KI-Gedächtnis zurücksetzen")
+        modal.geometry("640x510")
+        modal.minsize(540, 440)
+        modal.configure(fg_color="#121216")
+        modal.attributes("-topmost", True)
+
+        try:
+            modal.update_idletasks()
+            w = 640
+            h = 510
+            x = self.winfo_x() + (self.winfo_width() // 2) - (w // 2)
+            y = self.winfo_y() + (self.winfo_height() // 2) - (h // 2)
+            modal.geometry(f"{w}x{h}+{max(30, x)}+{max(30, y)}")
+        except Exception:
+            pass
+
+        card = ctk.CTkFrame(modal, fg_color="#181822", corner_radius=16, border_width=1, border_color="#c62828")
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        # Header
+        hdr = ctk.CTkFrame(card, fg_color="transparent")
+        hdr.pack(fill="x", padx=20, pady=(18, 6))
+        ctk.CTkLabel(hdr, text="⚠️ KI-Gedächtnis & gelernte Daten zurücksetzen", font=("Arial", 16, "bold"), text_color="#FF5252").pack(side="left")
+
+        # Warning explanation
+        warn_box = ctk.CTkFrame(card, fg_color="#2a1418", corner_radius=10, border_width=1, border_color="#c62828")
+        warn_box.pack(fill="x", padx=20, pady=(4, 12))
+        
+        warn_text = (
+            "Diese Aktion setzt alle von der KI erlernten Daten und Anpassungen vollständig zurück:\n\n"
+            "• Alle Daumen-Hoch/Runter Bewertungen für Maps & Feedback\n"
+            "• Dein Hardware- & Ergonomie-Profil (DPI, Tablet-Area, Rapid Trigger)\n"
+            "• Gespeicherter Replay-Telemetrie-Verlauf & Choke-Diagnosen\n"
+            "• Profil-Skill-Radar, ermittelte Schwächen & Skill-Testergebnisse\n"
+            "• Live-Coaching Trainingsverlauf, Mod-Ausschlüsse & Chat-Historie"
+        )
+        ctk.CTkLabel(warn_box, text=warn_text, font=("Arial", 11), text_color="#ffcdd2", justify="left").pack(padx=14, pady=10, anchor="w")
+
+        # Confirmation instruction
+        ctk.CTkLabel(card, text='Tippe zur Bestätigung DELETE in das folgende Textfeld:', font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=22, pady=(4, 6))
+
+        input_frame = ctk.CTkFrame(card, fg_color="transparent")
+        input_frame.pack(fill="x", padx=20, pady=(0, 6))
+
+        confirm_entry = ctk.CTkEntry(input_frame, placeholder_text='Tippe "DELETE" hier ein...', font=("Consolas", 14, "bold"),
+                                     height=40, border_color="#444455", text_color="#ffffff")
+        confirm_entry.pack(fill="x")
+
+        status_lbl = ctk.CTkLabel(card, text="", font=("Arial", 11, "bold"))
+        status_lbl.pack(anchor="w", padx=22, pady=(0, 6))
+
+        # Bottom buttons
+        bot_bar = ctk.CTkFrame(card, fg_color="transparent", height=44)
+        bot_bar.pack(fill="x", padx=20, pady=(6, 14), side="bottom")
+        bot_bar.pack_propagate(False)
+
+        def do_cancel():
+            modal.destroy()
+
+        def do_delete():
+            user_input = confirm_entry.get().strip()
+            if user_input != "DELETE":
+                status_lbl.configure(text='❌ Bestätigung fehlgeschlagen! Bitte tippe exakt "DELETE" ein.', text_color="#FF5252")
+                confirm_entry.configure(border_color="#FF5252")
+                return
+
+            # Perform complete AI memory reset
+            self.ai_user_feedback = {}
+            self.user_setup_profile = {}
+            self.last_deep_replay_telemetry = None
+            self.deep_replay_history = []
+            self.ai_debug_logs = []
+            self.ai_training_history = []
+            self.last_profile_analysis = None
+            self.last_profile_player = ""
+            self.has_analyzed_self = False
+            self.skill_tester_submissions = {}
+            self.current_ai_skill_test = None
+            self.tester_results = {}
+            self.chat_history = []
+            self._rounds_since_feedback_prompt = 0
+            self._persistent_mod_pref = None
+            if hasattr(self, "_banned_mods"):
+                self._banned_mods = set()
+            self._user_requested_mod = None
+            self._user_requested_sr = None
+
+            self.save_global_settings()
+            modal.destroy()
+
+            self.show_message("✅ KI-Gedächtnis zurückgesetzt",
+                              "Alle gelernten Daten, Vorlieben, Feedbacks, Hardware-Profile und der Skill-Radar der KI wurden erfolgreich auf Werkseinstellungen zurückgesetzt!")
+            self.show_settings(active_tab="ai")
+
+        del_btn = ctk.CTkButton(bot_bar, text="🔥 Alles endgültig löschen", font=("Arial", 13, "bold"), height=36,
+                                fg_color="#331c20", hover_color="#c62828", text_color="#ff8888", corner_radius=8,
+                                state="disabled", command=do_delete)
+        del_btn.pack(side="right")
+
+        ctk.CTkButton(bot_bar, text="Abbrechen", font=("Arial", 12), height=36, width=90,
+                      fg_color="transparent", hover_color="#22222c", text_color="#888899",
+                      command=do_cancel).pack(side="right", padx=(0, 10))
+
+        def on_key_release(event=None):
+            val = confirm_entry.get().strip()
+            if val == "DELETE":
+                confirm_entry.configure(border_color="#00E676")
+                status_lbl.configure(text="✅ Bestätigt! Klicke auf den Button, um alle Daten zu löschen.", text_color="#00E676")
+                del_btn.configure(state="normal", fg_color="#c62828", hover_color="#b71c1c", text_color="#ffffff")
+            else:
+                confirm_entry.configure(border_color="#444455")
+                status_lbl.configure(text="", text_color="#888899")
+                del_btn.configure(state="disabled", fg_color="#331c20", text_color="#ff8888")
+
+        confirm_entry.bind("<KeyRelease>", on_key_release)
+        confirm_entry.bind("<Return>", lambda e: do_delete() if confirm_entry.get().strip() == "DELETE" else None)
     def show_ai_question_modal(self, title=None, subtitle=None, options=None, callback=None, default_idx=0):
         """
         Öffnet einen modernen, interaktiven Multiple-Choice Dialog im exakten Stil des Referenz-Screenshots.
