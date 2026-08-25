@@ -1597,8 +1597,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         
         self.load_global_settings()
         self.scan_all_local_osu_replays(max_replays=25)
-        self.start_cloud_keep_alive()
-        self.start_global_play_monitor()
         self.after(3500, self.start_auto_update_checker)
         if not getattr(self, "uho_api_key", ""):
             self.show_uho_auth_screen()
@@ -1718,6 +1716,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4)
         except: pass
+
+    def draw_lazer_background(self, master_widget):
+        """Subtle background decorator for modern dark lazer aesthetic."""
+        pass
 
     def bind_hover(self, widget, hover_color="#333", default_color="#2a2a2a"):
         def on_enter(e):
