@@ -529,13 +529,14 @@ def get_hwid():
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]
 
 class BanchoRefereeBot:
-    """Automated osu! Bancho IRC Referee Bot: creates lobbies, sends in-game invites, sets maps/mods, and tracks match outcomes."""
-    def __init__(self, username, irc_password, on_log=None, on_match_created=None, on_round_ended=None):
+    """Automated osu! Bancho IRC Referee Bot: creates lobbies, sends in-game invites, sets maps/mods, broadcasts pools, handles in-game chat commands, and tracks outcomes."""
+    def __init__(self, username, irc_password, on_log=None, on_match_created=None, on_round_ended=None, on_chat_command=None):
         self.username = username
         self.irc_password = irc_password
         self.on_log = on_log or (lambda msg, col="#ffffff": None)
         self.on_match_created = on_match_created or (lambda match_id, channel: None)
         self.on_round_ended = on_round_ended or (lambda: None)
+        self.on_chat_command = on_chat_command or (lambda sender, cmd, arg, full: None)
         
         self.sock = None
         self.running = False
@@ -546,14 +547,22 @@ class BanchoRefereeBot:
         self.pending_lobby_name = "UHO Hub Match"
         self.pending_password = ""
 
+        # Host-Rotation Tracker
+        self.is_host_rotation_mode = False
+        self.host_queue = []
+        self.current_host_idx = 0
+
     def log(self, text, color="#aaaaaa"):
         if self.on_log:
             try: self.on_log(text, color)
             except: pass
 
-    def connect_and_host(self, lobby_name="UHO Hub Match", password=""):
+    def connect_and_host(self, lobby_name="UHO Hub Match", password="", host_rotation=False, initial_players=None):
         self.pending_lobby_name = lobby_name
         self.pending_password = password
+        self.is_host_rotation_mode = host_rotation
+        self.host_queue = [p.strip().replace(" ", "_") for p in (initial_players or []) if p.strip()]
+        self.current_host_idx = 0
         self.running = True
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
@@ -581,28 +590,75 @@ class BanchoRefereeBot:
         if clean_u:
             self.send_mp(f"mp invite {clean_u}")
 
-    def set_map(self, beatmap_id, mods=None):
+    def set_map(self, beatmap_id, mods=None, enforce_nf=True):
         self.send_mp(f"mp map {beatmap_id}")
+        time.sleep(0.3)
         if mods:
             m = str(mods).strip().upper()
             if m in ["FM", "FREEMOD"]:
-                self.send_mp("mp mods Freemod")
+                self.send_mp("mp mods Freemod NF" if enforce_nf else "mp mods Freemod")
             elif m in ["NM", "NOMOD", "NONE"]:
-                self.send_mp("mp mods None")
+                self.send_mp("mp mods NF" if enforce_nf else "mp mods None")
+            elif m in ["TB", "TIEBREAKER"]:
+                self.send_mp("mp mods Freemod NF" if enforce_nf else "mp mods Freemod")
             else:
-                self.send_mp(f"mp mods {m}")
+                self.send_mp(f"mp mods {m} NF" if enforce_nf else f"mp mods {m}")
+        else:
+            self.send_mp("mp mods NF" if enforce_nf else "mp mods None")
 
     def set_team_mode(self, team_size=1):
         if team_size <= 1:
-            self.send_mp("mp set 0 1 2") # Head-to-Head, ScoreV2
+            self.send_mp("mp set 0 1 2") # Head-to-Head, ScoreV2, 2 Slots
         else:
-            self.send_mp(f"mp set 2 1 {max(2, min(16, team_size * 2))}") # TeamVs, ScoreV2
+            self.send_mp(f"mp set 2 1 {max(2, min(16, team_size * 2))}") # TeamVs, ScoreV2, N Slots
 
     def start_countdown(self, seconds=10):
         self.send_mp(f"mp start {seconds}")
 
     def abort_match(self):
         self.send_mp("mp abort")
+
+    def set_host(self, username):
+        clean_u = username.strip().replace(" ", "_")
+        if clean_u:
+            self.send_mp(f"mp host {clean_u}")
+            self.send_channel_message(f"👑 Host übergeben an: {clean_u}!")
+
+    def rotate_next_host(self):
+        if not self.host_queue:
+            return None
+        self.current_host_idx = (self.current_host_idx + 1) % len(self.host_queue)
+        next_host = self.host_queue[self.current_host_idx]
+        self.set_host(next_host)
+        return next_host
+
+    def broadcast_mappool(self, pool_dict, stage_name="Turnier"):
+        if not self.channel or not pool_dict:
+            return
+        def _bg():
+            time.sleep(0.8)
+            self.send_channel_message(f"🏆 --- UHO Hub Offizieller Mappool ({stage_name}) ---")
+            
+            # Format slots in readable lines
+            slot_order = ["NM1", "NM2", "NM3", "NM4", "NM5", "NM6", "HD1", "HD2", "HD3", "HR1", "HR2", "HR3", "DT1", "DT2", "DT3", "FM1", "FM2", "FM3", "TB"]
+            lines_chunk = []
+            curr_line = []
+            for s in sorted(pool_dict.keys(), key=lambda x: slot_order.index(x) if x in slot_order else 99):
+                m = pool_dict[s]
+                curr_line.append(f"[{s}] {m.get('name', 'Map')[:32]} (★ {m.get('sr', 5.0):.2f})")
+                if len(curr_line) >= 3:
+                    lines_chunk.append(" | ".join(curr_line))
+                    curr_line = []
+            if curr_line:
+                lines_chunk.append(" | ".join(curr_line))
+
+            for l in lines_chunk:
+                time.sleep(0.7)
+                self.send_channel_message(l)
+
+            time.sleep(0.7)
+            self.send_channel_message("📌 Ingame-Befehle: !roll | !save <slot> | !ban <slot> | !pick <slot> | !maps | !score | !ready")
+        threading.Thread(target=_bg, daemon=True).start()
 
     def close_lobby(self):
         if self.channel:
@@ -686,14 +742,41 @@ class BanchoRefereeBot:
                         if "PRIVMSG" in line:
                             parts = line.split("PRIVMSG", 1)
                             sender = parts[0].split("!")[0].lstrip(":")
-                            msg_content = parts[1].split(":", 1)[1] if ":" in parts[1] else parts[1]
+                            target_ch = parts[1].split(":", 1)[0].strip()
+                            msg_content = parts[1].split(":", 1)[1].strip() if ":" in parts[1] else parts[1].strip()
                             self.log(f"💬 [{sender}]: {msg_content}", "#dddddd")
+
+                            # Detect Player joined for Host Queue
+                            if sender == "BanchoBot" and "joined in slot" in msg_content:
+                                m_join = re.search(r'([A-Za-z0-9_\-\[\] ]+) joined in slot', msg_content)
+                                if m_join:
+                                    j_user = m_join.group(1).strip().replace(" ", "_")
+                                    if j_user not in self.host_queue:
+                                        self.host_queue.append(j_user)
+
+                            # Detect Player left for Host Queue
+                            if sender == "BanchoBot" and "left the match" in msg_content:
+                                m_left = re.search(r'([A-Za-z0-9_\-\[\] ]+) left the match', msg_content)
+                                if m_left:
+                                    l_user = m_left.group(1).strip().replace(" ", "_")
+                                    if l_user in self.host_queue:
+                                        self.host_queue.remove(l_user)
 
                             # Detect finished round from BanchoBot
                             if sender == "BanchoBot" and ("Match has ended" in msg_content or "All players finished" in msg_content or "finished playing" in msg_content):
                                 self.log("🔔 Runde in osu! beendet! Werte Ergebnisse aus...", "#00E5FF")
+                                if self.is_host_rotation_mode:
+                                    threading.Thread(target=lambda: (time.sleep(2.0), self.rotate_next_host()), daemon=True).start()
                                 if self.on_round_ended:
                                     self.on_round_ended()
+
+                            # Detect in-game chat commands from players (Romaji style)
+                            if msg_content.startswith("!") and sender != "BanchoBot":
+                                cmd_parts = msg_content[1:].strip().split(" ", 1)
+                                cmd = cmd_parts[0].lower()
+                                arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+                                if self.on_chat_command:
+                                    threading.Thread(target=lambda s=sender, c=cmd, a=arg, f=msg_content: self.on_chat_command(s, c, a, f), daemon=True).start()
 
                 except socket.timeout:
                     self._send_raw("PING irc.ppy.sh")
@@ -1804,6 +1887,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     if data.get('deep_replay_history'): self.deep_replay_history = data.get('deep_replay_history')
                     if data.get('ai_debug_logs'): self.ai_debug_logs = data.get('ai_debug_logs')
                     if data.get('ai_user_feedback'): self.ai_user_feedback = data.get('ai_user_feedback')
+                    if data.get('uho_friends_list'): self.uho_friends_list = data.get('uho_friends_list')
             except: pass
 
     def save_global_settings(self):
@@ -1830,7 +1914,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             'last_deep_replay_telemetry': getattr(self, 'last_deep_replay_telemetry', None),
             'deep_replay_history': getattr(self, 'deep_replay_history', []),
             'ai_debug_logs': getattr(self, 'ai_debug_logs', []),
-            'ai_user_feedback': getattr(self, 'ai_user_feedback', {})
+            'ai_user_feedback': getattr(self, 'ai_user_feedback', {}),
+            'uho_friends_list': getattr(self, 'uho_friends_list', [])
         }
         try:
             with open(self.settings_file, 'w', encoding='utf-8') as f:
@@ -3235,43 +3320,64 @@ DEINE ANTWORT-RICHTLINIEN:
         c1_top = ctk.CTkFrame(c1, fg_color="transparent")
         c1_top.pack(fill="x", padx=16, pady=(16, 4))
         ctk.CTkLabel(c1_top, text="🏆 Turnier-Match", font=("Arial", 18, "bold"), text_color="#ffffff").pack(side="left")
-        ctk.CTkLabel(c1_top, text=" ✨ LIVE REFEREE BOT ", font=("Arial", 10, "bold"), fg_color="#00BFA5", text_color="#000000", corner_radius=4).pack(side="right")
+        ctk.CTkLabel(c1_top, text=" SCOREV2 + NO-FAIL ", font=("Arial", 10, "bold"), fg_color="#00BFA5", text_color="#000000", corner_radius=4).pack(side="right")
 
-        ctk.CTkLabel(c1, text="1v1 bis 4v4 Head-to-Head & Team VS. Der automatische Bancho-Bot erstellt die Ingame-Lobby, lädt Spieler automatisch ein und stellt Mappool-Picks sofort ein.",
+        ctk.CTkLabel(c1, text="1v1 bis 4v4 OWC/ET Scrims. Vollautomatische Bancho-Lobby mit NoFail-Pflicht, Mappool-Broadcast und Romaji-Style Chat-Befehlen (!pick, !ban, !save).",
                      font=("Arial", 12), text_color="#aaeedd", justify="left", wraplength=340).pack(padx=16, pady=(4, 12), anchor="w")
 
-        ctk.CTkButton(c1, text="⚔️ Match erstellen ➔", font=("Arial", 13, "bold"), height=38,
+        ctk.CTkButton(c1, text="⚔️ Turnier-Match erstellen ➔", font=("Arial", 13, "bold"), height=38,
                       fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=self.show_multiplayer_match_setup).pack(fill="x", padx=16, side="bottom", pady=16)
 
-        # CARD 2: CUSTOM SCRIMS & MAPPOOL
-        c2 = ctk.CTkFrame(grid_frame, fg_color="#181824", corner_radius=16, border_width=2, border_color="#00E5FF", width=380, height=220)
+        # CARD 2: BANCHO LOUNGE (HOST ROTATION)
+        c2 = ctk.CTkFrame(grid_frame, fg_color="#1a1828", corner_radius=16, border_width=2, border_color="#9C27B0", width=380, height=220)
         c2.grid(row=0, column=1, padx=15, pady=15)
         c2.pack_propagate(False)
 
         c2_top = ctk.CTkFrame(c2, fg_color="transparent")
         c2_top.pack(fill="x", padx=16, pady=(16, 4))
-        ctk.CTkLabel(c2_top, text="🛠️ Custom Scrims", font=("Arial", 18, "bold"), text_color="#ffffff").pack(side="left")
-        ctk.CTkLabel(c2_top, text=" CUSTOM POOLS ", font=("Arial", 10, "bold"), fg_color="#00E5FF", text_color="#000000", corner_radius=4).pack(side="right")
+        ctk.CTkLabel(c2_top, text="🔄 Bancho Lounge", font=("Arial", 18, "bold"), text_color="#ffffff").pack(side="left")
+        ctk.CTkLabel(c2_top, text=" HOST-ROTATION ", font=("Arial", 10, "bold"), fg_color="#BA68C8", text_color="#000000", corner_radius=4).pack(side="right")
 
-        ctk.CTkLabel(c2, text="Erstelle eigene Mappools per Drag & Drop oder Link-Eingabe und trage Scrim-Matches mit Freunden aus – mit automatischer KI-Auffüllung.",
-                     font=("Arial", 12), text_color="#bbddff", justify="left", wraplength=340).pack(padx=16, pady=(4, 12), anchor="w")
+        ctk.CTkLabel(c2, text="Entspannte Community-Lobby mit automatischer Host-Übergabe nach jeder Runde, einstellbarem Passwort und optionalem KI-Autopilot für ausgeglichene Maps.",
+                     font=("Arial", 12), text_color="#e1bee7", justify="left", wraplength=340).pack(padx=16, pady=(4, 12), anchor="w")
 
-        ctk.CTkButton(c2, text="🛠️ Custom Mappool öffnen ➔", font=("Arial", 13, "bold"), height=38,
-                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000",
-                      command=lambda: self.show_custom_mappool_builder(from_multiplayer=True)).pack(fill="x", padx=16, side="bottom", pady=16)
+        ctk.CTkButton(c2, text="🔄 Host-Rotation starten ➔", font=("Arial", 13, "bold"), height=38,
+                      fg_color="#AB47BC", hover_color="#8E24AA", text_color="#ffffff",
+                      command=self.show_host_rotation_setup).pack(fill="x", padx=16, side="bottom", pady=16)
 
-        # CARD 3: CO-OP SKILL-CHALLENGES
-        c3 = ctk.CTkFrame(grid_frame, fg_color="#221826", corner_radius=16, border_width=2, border_color="#E91E63", width=380, height=220)
-        c3.grid(row=1, column=0, columnspan=2, padx=15, pady=15)
+        # CARD 3: CUSTOM SCRIMS & MAPPOOL
+        c3 = ctk.CTkFrame(grid_frame, fg_color="#181824", corner_radius=16, border_width=2, border_color="#00E5FF", width=380, height=220)
+        c3.grid(row=1, column=0, padx=15, pady=15)
         c3.pack_propagate(False)
 
         c3_top = ctk.CTkFrame(c3, fg_color="transparent")
         c3_top.pack(fill="x", padx=16, pady=(16, 4))
-        ctk.CTkLabel(c3_top, text="🔮 Co-Op Skill-Challenge & Team-Zertifikate", font=("Arial", 18, "bold"), text_color="#ffffff").pack(side="left")
-        ctk.CTkLabel(c3_top, text=" IN ENTWICKLUNG ", font=("Arial", 10, "bold"), fg_color="#442233", text_color="#ff88aa", corner_radius=4).pack(side="right")
+        ctk.CTkLabel(c3_top, text="🛠️ Custom Scrims", font=("Arial", 18, "bold"), text_color="#ffffff").pack(side="left")
+        ctk.CTkLabel(c3_top, text=" CUSTOM POOLS ", font=("Arial", 10, "bold"), fg_color="#00E5FF", text_color="#000000", corner_radius=4).pack(side="right")
 
-        ctk.CTkLabel(c3, text="Meistere gemeinsam mit deinem Team simultane Benchmark-Tests über alle 8 Skillsets und erhalte offizielle Team-Auswertungen von Gemini AI.",
-                     font=("Arial", 12), text_color="#ddbbcc", justify="left", wraplength=720).pack(padx=16, pady=(4, 12), anchor="w")
+        ctk.CTkLabel(c3, text="Erstelle eigene Mappools per Drag & Drop oder Link-Eingabe und trage Scrim-Matches mit Freunden aus – mit automatischer KI-Auffüllung.",
+                     font=("Arial", 12), text_color="#bbddff", justify="left", wraplength=340).pack(padx=16, pady=(4, 12), anchor="w")
+
+        ctk.CTkButton(c3, text="🛠️ Custom Mappool öffnen ➔", font=("Arial", 13, "bold"), height=38,
+                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000",
+                      command=lambda: self.show_custom_mappool_builder(from_multiplayer=True)).pack(fill="x", padx=16, side="bottom", pady=16)
+
+        # CARD 4: FREUNDE & ONLINE-COMMUNITY
+        c4 = ctk.CTkFrame(grid_frame, fg_color="#1e1822", corner_radius=16, border_width=2, border_color="#FF4081", width=380, height=220)
+        c4.grid(row=1, column=1, padx=15, pady=15)
+        c4.pack_propagate(False)
+
+        c4_top = ctk.CTkFrame(c4, fg_color="transparent")
+        c4_top.pack(fill="x", padx=16, pady=(16, 4))
+        ctk.CTkLabel(c4_top, text="👥 Freunde & Community", font=("Arial", 18, "bold"), text_color="#ffffff").pack(side="left")
+        ctk.CTkLabel(c4_top, text=" LIVE PRESENCE ", font=("Arial", 10, "bold"), fg_color="#FF4081", text_color="#000000", corner_radius=4).pack(side="right")
+
+        ctk.CTkLabel(c4, text="Sieh wer gerade in UHO Hub online ist, verwalte deine Freundesliste und lade Mitspieler mit einem Klick zu synchronisierten Matches ein.",
+                     font=("Arial", 12), text_color="#ffcdd2", justify="left", wraplength=340).pack(padx=16, pady=(4, 12), anchor="w")
+
+        ctk.CTkButton(c4, text="👥 Freunde & Status öffnen ➔", font=("Arial", 13, "bold"), height=38,
+                      fg_color="#FF4081", hover_color="#E91E63", text_color="#ffffff",
+                      command=self.show_friends_and_community).pack(fill="x", padx=16, side="bottom", pady=16)
 
     def show_multiplayer_match_setup(self):
         for widget in self.winfo_children():
@@ -3288,7 +3394,7 @@ DEINE ANTWORT-RICHTLINIEN:
         ctk.CTkButton(top_bar, text="⬅ Zurück", width=90, height=34, font=("Arial", 12, "bold"),
                       fg_color="#25252e", hover_color="#353540", command=self.show_multiplayer_hub).pack(side="left", padx=15, pady=12)
 
-        ctk.CTkLabel(top_bar, text="⚔️ Multiplayer Match-Konfiguration", font=("Arial", 18, "bold"), text_color="#00BFA5").pack(side="left", padx=10)
+        ctk.CTkLabel(top_bar, text="⚔️ Multiplayer Match-Konfiguration (ScoreV2 + No-Fail)", font=("Arial", 18, "bold"), text_color="#00BFA5").pack(side="left", padx=10)
 
         main_scroll = ctk.CTkScrollableFrame(master, fg_color="transparent")
         main_scroll.pack(fill="both", expand=True, padx=20, pady=(0, 15))
@@ -3344,10 +3450,10 @@ DEINE ANTWORT-RICHTLINIEN:
         bot_box_h = ctk.CTkFrame(bot_box, fg_color="transparent")
         bot_box_h.pack(fill="x", padx=12, pady=(10, 4))
         ctk.CTkLabel(bot_box_h, text="🤖 Ingame Referee Bot", font=("Arial", 13, "bold"), text_color="#00BFA5").pack(side="left")
-        ctk.CTkLabel(bot_box_h, text=" EMPFOHLEN ", font=("Arial", 9, "bold"), fg_color="#00BFA5", text_color="#000000", corner_radius=4).pack(side="left", padx=8)
+        ctk.CTkLabel(bot_box_h, text=" ROMAJI-STYLE CHAT ", font=("Arial", 9, "bold"), fg_color="#00BFA5", text_color="#000000", corner_radius=4).pack(side="left", padx=8)
 
         use_bot_var = ctk.BooleanVar(value=True)
-        ctk.CTkSwitch(bot_box, text="Automatischer Bancho-Bot (Erstellt Raum & lädt ein)", variable=use_bot_var,
+        ctk.CTkSwitch(bot_box, text="Automatischer Bancho-Bot (Chat !pick/!ban + ScoreV2)", variable=use_bot_var,
                       font=("Arial", 11, "bold"), progress_color="#00BFA5").pack(anchor="w", padx=12, pady=(0, 6))
 
         irc_info_lbl = ctk.CTkLabel(bot_box, text="", font=("Arial", 10), justify="left")
@@ -3376,7 +3482,7 @@ DEINE ANTWORT-RICHTLINIEN:
         f_right = ctk.CTkFrame(grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2a2a38")
         f_right.grid(row=0, column=1, padx=(10, 0), pady=5, sticky="nsew")
 
-        ctk.CTkLabel(f_right, text="🎯 2. Mappool & Regeln", font=("Arial", 16, "bold"), text_color="#00BFA5").pack(anchor="w", padx=18, pady=(15, 8))
+        ctk.CTkLabel(f_right, text="🎯 2. Mappool, Regeln & Passwort", font=("Arial", 16, "bold"), text_color="#00BFA5").pack(anchor="w", padx=18, pady=(15, 8))
 
         # Tournament Selector
         ctk.CTkLabel(f_right, text="Turnier:", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=18, pady=(2, 2))
@@ -3417,7 +3523,7 @@ DEINE ANTWORT-RICHTLINIEN:
 
         # Protects & Bans Row
         row_pb = ctk.CTkFrame(f_right, fg_color="transparent")
-        row_pb.pack(fill="x", padx=18, pady=(2, 12))
+        row_pb.pack(fill="x", padx=18, pady=(2, 8))
         row_pb.grid_columnconfigure(0, weight=1)
         row_pb.grid_columnconfigure(1, weight=1)
 
@@ -3433,7 +3539,12 @@ DEINE ANTWORT-RICHTLINIEN:
         ban_opt = ctk.CTkOptionMenu(f_b, values=["Auto (Standard)", "1 Ban pro Team", "2 Bans pro Team", "0 Bans"], font=("Arial", 11), fg_color="#262635", button_color="#353548", height=32)
         ban_opt.pack(fill="x", pady=(2, 0))
 
-        # Bottom Action Bar (Fixed at bottom so it's always accessible and visible)
+        # Lobby Passwort
+        ctk.CTkLabel(f_right, text="🔒 Lobby-Passwort (optional):", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=18, pady=(4, 2))
+        pwd_entry = ctk.CTkEntry(f_right, placeholder_text="z.B. tournament123 (leer für Standard)", font=("Arial", 12), height=32)
+        pwd_entry.pack(fill="x", padx=18, pady=(0, 12))
+
+        # Bottom Action Bar
         bottom_bar = ctk.CTkFrame(master, fg_color="#181822", height=64, corner_radius=12)
         bottom_bar.pack(fill="x", padx=20, pady=(6, 12), side="bottom")
         bottom_bar.pack_propagate(False)
@@ -3447,7 +3558,6 @@ DEINE ANTWORT-RICHTLINIEN:
                 t2_n = t2_name_entry.get().strip() or "Team Blau"
                 t2_pl = [p.strip() for p in t2_players_entry.get().split(",") if p.strip()] or ["Gegner1"]
 
-                # Automatically save username
                 if not getattr(self, "osu_username", "") and t1_pl:
                     self.osu_username = t1_pl[0]
                     self.save_global_settings()
@@ -3461,9 +3571,9 @@ DEINE ANTWORT-RICHTLINIEN:
                 f_val = fmt_opt.get()
                 pr_val = prot_opt.get()
                 ba_val = ban_opt.get()
+                pwd_val = pwd_entry.get().strip()
                 use_bot = use_bot_var.get()
 
-                # If bot requested but no IRC password, prompt user
                 if use_bot and not getattr(self, "osu_irc_password", ""):
                     dialog = ctk.CTkInputDialog(text="Gib dein Server-Passwort von https://osu.ppy.sh/p/irc ein:\n(Wird für automatische Ingame-Lobbies & Einladungen benötigt)", title="osu! IRC-Server-Passwort")
                     val = dialog.get_input()
@@ -3477,7 +3587,7 @@ DEINE ANTWORT-RICHTLINIEN:
                     t2_name=t2_n, t2_players=t2_pl,
                     tourney=t_val, division=d_val, year=y_val, stage=st_val,
                     fmt_name=f_val, prot_setting=pr_val, ban_setting=ba_val,
-                    use_bot=use_bot
+                    use_bot=use_bot, password=pwd_val
                 )
             except Exception as e:
                 import traceback
@@ -3486,7 +3596,7 @@ DEINE ANTWORT-RICHTLINIEN:
         ctk.CTkButton(bottom_bar, text="🚀 Ingame-Lobby erstellen & Multiplayer-Match starten ➔", font=("Arial", 14, "bold"), height=46,
                       fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=on_launch).pack(fill="both", expand=True, padx=12, pady=9)
 
-    def start_multiplayer_match(self, mode_str, team_size, t1_name, t1_players, t2_name, t2_players, tourney, division, year, stage, fmt_name, prot_setting, ban_setting, use_bot):
+    def start_multiplayer_match(self, mode_str, team_size, t1_name, t1_players, t2_name, t2_players, tourney, division, year, stage, fmt_name, prot_setting, ban_setting, use_bot, password=""):
         # Target Wins parsing
         target_wins = 5
         if "First to 4" in fmt_name or "Best of 7" in fmt_name: target_wins = 4
@@ -3519,6 +3629,8 @@ DEINE ANTWORT-RICHTLINIEN:
         else:
             pool = self.generate_tournament_mappool(min_sr, max_sr, year=year, tourney_key=tourney, div_key=division, stage=stage)
 
+        final_pwd = password or f"uho{random.randint(100, 999)}"
+
         self.mp_match = {
             "mode_str": mode_str,
             "team_size": team_size,
@@ -3550,6 +3662,7 @@ DEINE ANTWORT-RICHTLINIEN:
             "use_irc_bot": use_bot,
             "irc_channel": None,
             "match_id": None,
+            "password": final_pwd,
             "bot_logs": []
         }
 
@@ -3559,19 +3672,417 @@ DEINE ANTWORT-RICHTLINIEN:
             u_irc = getattr(self, "osu_irc_password", "")
             if u_name and u_irc:
                 lobby_name = f"UHO Hub: {t1_name} vs {t2_name}"
-                pwd = f"uho{random.randint(100, 999)}"
                 self.mp_referee_bot = BanchoRefereeBot(
                     username=u_name,
                     irc_password=u_irc,
                     on_log=self._mp_bot_log_callback,
                     on_match_created=self._mp_on_match_created,
-                    on_round_ended=self._mp_on_round_ended
+                    on_round_ended=self._mp_on_round_ended,
+                    on_chat_command=self._mp_on_chat_command
                 )
-                self.mp_referee_bot.connect_and_host(lobby_name=lobby_name, password=pwd)
+                self.mp_referee_bot.connect_and_host(lobby_name=lobby_name, password=final_pwd)
             else:
                 self.show_message("Schiedsrichter-Hinweis", "Kein IRC-Passwort hinterlegt. Das Match startet im interaktiven Schiedsrichter-Modus mit Live-Score-Sync.")
 
         self.show_multiplayer_match_lobby()
+
+    def _mp_on_chat_command(self, sender, cmd, arg, full_msg):
+        """Processes in-game Romaji-style commands sent to #mp_<id> (e.g. !pick, !ban, !save, !roll, !maps)."""
+        if not hasattr(self, "mp_match") or not self.mp_match:
+            return
+        m = self.mp_match
+        bot = getattr(self, "mp_referee_bot", None)
+        sender_clean = sender.strip().replace(" ", "_").lower()
+
+        t1_list = [p.lower().replace(" ", "_") for p in m.get("team1_players", [])]
+        t2_list = [p.lower().replace(" ", "_") for p in m.get("team2_players", [])]
+
+        sender_team = None
+        if sender_clean in t1_list: sender_team = "team1"
+        elif sender_clean in t2_list: sender_team = "team2"
+        else:
+            if sender_clean in m.get("team1_name", "").lower(): sender_team = "team1"
+            elif sender_clean in m.get("team2_name", "").lower(): sender_team = "team2"
+            else: sender_team = m.get("active_team", "team1")
+
+        phase = m.get("phase", "roll")
+
+        if cmd in ["roll", "dice", "wuerfeln"]:
+            if phase == "roll":
+                if sender_team and m["rolls"].get(sender_team) is None:
+                    self.after(0, lambda t=sender_team: self.handle_mp_roll(t))
+                else:
+                    if bot: bot.send_channel_message(f"@{sender}: Dein Team hat bereits gewürfelt ({m['rolls'].get(sender_team)})!")
+            else:
+                if bot: bot.send_channel_message(f"@{sender}: Die Roll-Phase ist bereits beendet.")
+
+        elif cmd in ["save", "protect", "schuetzen"]:
+            if phase in ["protect1", "protect2"]:
+                if sender_team == m.get("active_team"):
+                    slot = arg.upper()
+                    if slot in m.get("pool", {}) and m["pool"][slot].get("state") == "available":
+                        self.after(0, lambda s=slot: self.handle_mp_protect(s))
+                    else:
+                        if bot: bot.send_channel_message(f"@{sender}: Slot '{slot}' ist ungültig oder nicht mehr verfügbar.")
+                else:
+                    if bot: bot.send_channel_message(f"@{sender}: Dein Team ist gerade nicht an der Reihe für Save/Protect!")
+            else:
+                if bot: bot.send_channel_message(f"@{sender}: Aktuell ist keine Save/Protect-Phase.")
+
+        elif cmd in ["ban", "bann", "bannen"]:
+            if phase in ["ban1", "ban2"]:
+                if sender_team == m.get("active_team"):
+                    slot = arg.upper()
+                    if slot in m.get("pool", {}) and m["pool"][slot].get("state") == "available":
+                        self.after(0, lambda s=slot: self.handle_mp_ban(s))
+                    else:
+                        if bot: bot.send_channel_message(f"@{sender}: Slot '{slot}' ist ungültig oder bereits geschützt/gebannt.")
+                else:
+                    if bot: bot.send_channel_message(f"@{sender}: Dein Team ist gerade nicht an der Reihe für Bans!")
+            else:
+                if bot: bot.send_channel_message(f"@{sender}: Aktuell ist keine Ban-Phase.")
+
+        elif cmd in ["pick", "choose", "select", "waehlen"]:
+            if phase == "pick":
+                if sender_team == m.get("active_team"):
+                    slot = arg.upper()
+                    if slot in m.get("pool", {}) and m["pool"][slot].get("state") in ["available", "protected"]:
+                        self.after(0, lambda s=slot: self.handle_mp_pick(s))
+                    else:
+                        if bot: bot.send_channel_message(f"@{sender}: Slot '{slot}' ist ungültig oder bereits gespielt/gebannt.")
+                else:
+                    if bot: bot.send_channel_message(f"@{sender}: Dein Team ist gerade nicht mit Picken am Zug!")
+            else:
+                if bot: bot.send_channel_message(f"@{sender}: Aktuell ist keine Pick-Phase.")
+
+        elif cmd in ["maps", "pool", "mappool"]:
+            if bot:
+                avail = [f"[{s}] {data['name'][:24]} (★ {data['sr']:.2f})" for s, data in m.get("pool", {}).items() if data.get("state") in ["available", "protected"]]
+                if avail:
+                    bot.send_channel_message(f"📋 Verfügbare Maps ({len(avail)}): " + " | ".join(avail[:5]))
+                    if len(avail) > 5:
+                        time.sleep(0.6)
+                        bot.send_channel_message("... " + " | ".join(avail[5:10]))
+                else:
+                    bot.send_channel_message("📋 Alle Maps wurden bereits gespielt oder gebannt.")
+
+        elif cmd in ["score", "stand", "punkte"]:
+            if bot:
+                t1 = m.get("team1_name", "Team Rot")
+                s1 = m.get("team1_score", 0)
+                t2 = m.get("team2_name", "Team Blau")
+                s2 = m.get("team2_score", 0)
+                tw = m.get("target_wins", 5)
+                bot.send_channel_message(f"📊 Spielstand: {t1} [{s1}] : [{s2}] {t2} (First to {tw})")
+
+        elif cmd in ["ready", "start", "gogo"]:
+            if phase == "playing" and bot:
+                bot.send_channel_message("🚀 Countdown gestartet! Macht euch bereit.")
+                bot.start_countdown(10)
+            elif bot:
+                bot.send_channel_message("⚠️ Noch keine Map gewählt. Bitte zuerst !pick <slot> nutzen!")
+
+        elif cmd in ["help", "commands", "befehle"]:
+            if bot:
+                bot.send_channel_message("📌 Befehle: !roll | !save <slot> | !ban <slot> | !pick <slot> | !maps | !score | !ready")
+
+    # ---------------------------------------------------------------------------
+    # HOST ROTATION LOBBY (BANCHO LOUNGE)
+    # ---------------------------------------------------------------------------
+    def show_host_rotation_setup(self):
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        master = ctk.CTkFrame(self, fg_color="#121216")
+        master.pack(fill="both", expand=True)
+        self.draw_lazer_background(master)
+
+        top_bar = ctk.CTkFrame(master, fg_color="#181822", height=60, corner_radius=12)
+        top_bar.pack(fill="x", padx=20, pady=(12, 8))
+        top_bar.pack_propagate(False)
+
+        ctk.CTkButton(top_bar, text="⬅ Zurück", width=90, height=34, font=("Arial", 12, "bold"),
+                      fg_color="#25252e", hover_color="#353540", command=self.show_multiplayer_hub).pack(side="left", padx=15, pady=12)
+
+        ctk.CTkLabel(top_bar, text="🔄 Bancho Lounge (Host-Rotation Setup)", font=("Arial", 18, "bold"), text_color="#BA68C8").pack(side="left", padx=10)
+
+        main_box = ctk.CTkFrame(master, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2e2a3a", width=620, height=480)
+        main_box.place(relx=0.5, rely=0.52, anchor="center")
+        main_box.pack_propagate(False)
+
+        ctk.CTkLabel(main_box, text="🔄 Host-Rotation Konfiguration", font=("Arial", 18, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(20, 4))
+        ctk.CTkLabel(main_box, text="Der BanchoBot übergibt nach jedem gespielten Song automatisch den Host an den nächsten Spieler.", font=("Arial", 11), text_color="#aaaaaa").pack(anchor="w", padx=24, pady=(0, 16))
+
+        # Lobby Name
+        ctk.CTkLabel(main_box, text="Lobby-Name:", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
+        lobby_name_entry = ctk.CTkEntry(main_box, placeholder_text="z.B. UHO Hub: Host Rotation", font=("Arial", 12), height=34)
+        lobby_name_entry.insert(0, "UHO Hub: Host Rotation")
+        lobby_name_entry.pack(fill="x", padx=24, pady=(0, 10))
+
+        # Password
+        ctk.CTkLabel(main_box, text="🔒 Passwort (optional, leer für öffentlich):", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
+        pwd_entry = ctk.CTkEntry(main_box, placeholder_text="z.B. chill123", font=("Arial", 12), height=34)
+        pwd_entry.pack(fill="x", padx=24, pady=(0, 10))
+
+        # Initial Players
+        ctk.CTkLabel(main_box, text="👥 Spieler einladen (kommagetrennt):", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
+        pl_entry = ctk.CTkEntry(main_box, placeholder_text="Spieler1, Spieler2, Spieler3...", font=("Arial", 12), height=34)
+        def_user = getattr(self, "osu_username", "") or "Spieler1"
+        pl_entry.insert(0, def_user)
+        pl_entry.pack(fill="x", padx=24, pady=(0, 10))
+
+        # Rotation Mode
+        ctk.CTkLabel(main_box, text="Modus:", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
+        rot_mode_opt = ctk.CTkOptionMenu(main_box, values=["Normal (Spieler wählen reihum ihre Maps)", "🤖 KI-Autopilot (KI wählt ausgewogene Maps für die Gruppe)"],
+                                         font=("Arial", 12, "bold"), fg_color="#2b2035", button_color="#3e2a4f", height=34)
+        rot_mode_opt.pack(fill="x", padx=24, pady=(0, 18))
+
+        def launch_rotation():
+            l_name = lobby_name_entry.get().strip() or "UHO Hub: Host Rotation"
+            pwd = pwd_entry.get().strip()
+            raw_pl = [p.strip() for p in pl_entry.get().split(",") if p.strip()]
+            ai_picker = "KI-Autopilot" in rot_mode_opt.get()
+            self.start_host_rotation_lobby(l_name, pwd, raw_pl, ai_picker)
+
+        ctk.CTkButton(main_box, text="🚀 Host-Rotation Lobby erstellen & öffnen ➔", font=("Arial", 14, "bold"), height=44,
+                      fg_color="#AB47BC", hover_color="#8E24AA", text_color="#ffffff", command=launch_rotation).pack(fill="x", padx=24, pady=(6, 20))
+
+    def start_host_rotation_lobby(self, lobby_name, password, initial_players, ai_picker=False):
+        u_name = getattr(self, "osu_username", "") or (initial_players[0] if initial_players else "Spieler")
+        u_irc = getattr(self, "osu_irc_password", "")
+
+        if not u_irc:
+            dialog = ctk.CTkInputDialog(text="Gib dein IRC-Server-Passwort von https://osu.ppy.sh/p/irc ein:", title="osu! IRC-Server-Passwort")
+            val = dialog.get_input()
+            if val is not None and val.strip():
+                self.osu_irc_password = val.strip()
+                self.save_global_settings()
+                u_irc = val.strip()
+
+        self.host_rotation_data = {
+            "lobby_name": lobby_name,
+            "password": password,
+            "players": list(initial_players),
+            "ai_picker": ai_picker,
+            "logs": []
+        }
+
+        if u_name and u_irc:
+            self.mp_referee_bot = BanchoRefereeBot(
+                username=u_name,
+                irc_password=u_irc,
+                on_log=self._host_rot_log_callback,
+                on_match_created=self._host_rot_on_created
+            )
+            self.mp_referee_bot.connect_and_host(lobby_name=lobby_name, password=password, host_rotation=True, initial_players=initial_players)
+
+        self.show_host_rotation_lobby_view()
+
+    def _host_rot_log_callback(self, text, color="#aaaaaa"):
+        if not hasattr(self, "host_rotation_data"): return
+        entry = f"[{time.strftime('%H:%M:%S')}] {text}"
+        self.host_rotation_data.setdefault("logs", []).append(entry)
+        self.host_rotation_data["logs"] = self.host_rotation_data["logs"][-30:]
+
+        def update_ui():
+            if hasattr(self, "host_rot_feed") and self.host_rot_feed.winfo_exists():
+                self.host_rot_feed.configure(state="normal")
+                self.host_rot_feed.delete("1.0", "end")
+                self.host_rot_feed.insert("1.0", "\n".join(self.host_rotation_data.get("logs", [])))
+                self.host_rot_feed.configure(state="disabled")
+                try: self.host_rot_feed.see("end")
+                except: pass
+        self.after(0, update_ui)
+
+    def _host_rot_on_created(self, match_id, channel):
+        self._host_rot_log_callback(f"🚀 Ingame-Lobby erstellt: {channel}", "#00E676")
+        def _bg():
+            time.sleep(1.0)
+            if getattr(self, "mp_referee_bot", None):
+                self.mp_referee_bot.set_team_mode(1)
+                for p in self.host_rotation_data.get("players", []):
+                    time.sleep(0.8)
+                    self.mp_referee_bot.invite_player(p)
+                self.mp_referee_bot.send_channel_message(f"Willkommen zur UHO Hub Host-Rotation! Host wechselt nach jedem Song automatisch.")
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def show_host_rotation_lobby_view(self):
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        master = ctk.CTkFrame(self, fg_color="#101015")
+        master.pack(fill="both", expand=True)
+        self.draw_lazer_background(master)
+
+        top_bar = ctk.CTkFrame(master, fg_color="#181822", height=60, corner_radius=12)
+        top_bar.pack(fill="x", padx=20, pady=(12, 8))
+        top_bar.pack_propagate(False)
+
+        def close_and_leave():
+            if getattr(self, "mp_referee_bot", None):
+                self.mp_referee_bot.close_lobby()
+            self.show_multiplayer_hub()
+
+        ctk.CTkButton(top_bar, text="✕ Lobby schließen", width=120, height=34, font=("Arial", 12, "bold"),
+                      fg_color="#c62828", hover_color="#b71c1c", command=close_and_leave).pack(side="left", padx=15, pady=12)
+
+        ctk.CTkLabel(top_bar, text=f"🔄 {self.host_rotation_data.get('lobby_name', 'Host-Rotation')}", font=("Arial", 18, "bold"), text_color="#BA68C8").pack(side="left", padx=10)
+
+        main_grid = ctk.CTkFrame(master, fg_color="transparent")
+        main_grid.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        main_grid.grid_columnconfigure(0, weight=1)
+        main_grid.grid_columnconfigure(1, weight=1)
+
+        # Left: Host Queue
+        q_frame = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2a3a")
+        q_frame.grid(row=0, column=0, padx=(0, 10), pady=5, sticky="nsew")
+
+        ctk.CTkLabel(q_frame, text="👑 Host-Reihenfolge (Queue)", font=("Arial", 16, "bold"), text_color="#BA68C8").pack(anchor="w", padx=18, pady=(15, 8))
+
+        def skip_host():
+            if getattr(self, "mp_referee_bot", None):
+                next_h = self.mp_referee_bot.rotate_next_host()
+                if next_h:
+                    self._host_rot_log_callback(f"👑 Host manuell übergeben an: {next_h}", "#00E5FF")
+
+        def invite_all():
+            if getattr(self, "mp_referee_bot", None):
+                for p in self.host_rotation_data.get("players", []):
+                    self.mp_referee_bot.invite_player(p)
+                self._host_rot_log_callback("✉️ Einladungen an alle Spieler erneut gesendet!", "#00E676")
+
+        btn_row = ctk.CTkFrame(q_frame, fg_color="transparent")
+        btn_row.pack(fill="x", padx=18, pady=(0, 10))
+        ctk.CTkButton(btn_row, text="👑 Nächster Host", font=("Arial", 11, "bold"), height=30,
+                      fg_color="#AB47BC", hover_color="#8E24AA", command=skip_host).pack(side="left")
+        ctk.CTkButton(btn_row, text="✉️ Spieler einladen", font=("Arial", 11, "bold"), height=30,
+                      fg_color="#2b2035", hover_color="#3e2a4f", text_color="#BA68C8", command=invite_all).pack(side="left", padx=(8, 0))
+
+        # Right: Feed
+        feed_frame = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2a3a")
+        feed_frame.grid(row=0, column=1, padx=(10, 0), pady=5, sticky="nsew")
+
+        ctk.CTkLabel(feed_frame, text="🤖 Ingame Bancho Live-Feed", font=("Arial", 16, "bold"), text_color="#00E5FF").pack(anchor="w", padx=18, pady=(15, 8))
+
+        self.host_rot_feed = ctk.CTkTextbox(feed_frame, wrap="word", font=("Arial", 11), fg_color="#101016", border_width=1, border_color="#222230")
+        self.host_rot_feed.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self.host_rot_feed.insert("1.0", "\n".join(self.host_rotation_data.get("logs", ["Warte auf Bot-Verbindung..."])))
+        self.host_rot_feed.configure(state="disabled")
+
+    # ---------------------------------------------------------------------------
+    # FREUNDE & ONLINE-COMMUNITY
+    # ---------------------------------------------------------------------------
+    def show_friends_and_community(self):
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        master = ctk.CTkFrame(self, fg_color="#121216")
+        master.pack(fill="both", expand=True)
+        self.draw_lazer_background(master)
+
+        top_bar = ctk.CTkFrame(master, fg_color="#181822", height=60, corner_radius=12)
+        top_bar.pack(fill="x", padx=20, pady=(12, 8))
+        top_bar.pack_propagate(False)
+
+        ctk.CTkButton(top_bar, text="⬅ Zurück", width=90, height=34, font=("Arial", 12, "bold"),
+                      fg_color="#25252e", hover_color="#353540", command=self.show_multiplayer_hub).pack(side="left", padx=15, pady=12)
+
+        ctk.CTkLabel(top_bar, text="👥 Freunde & Online-Community (Live Presence)", font=("Arial", 18, "bold"), text_color="#FF4081").pack(side="left", padx=10)
+
+        main_grid = ctk.CTkFrame(master, fg_color="transparent")
+        main_grid.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        main_grid.grid_columnconfigure(0, weight=1)
+        main_grid.grid_columnconfigure(1, weight=1)
+
+        # Left: Friends List
+        f_left = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#302028")
+        f_left.grid(row=0, column=0, padx=(0, 10), pady=5, sticky="nsew")
+
+        ctk.CTkLabel(f_left, text="👥 Meine Freundesliste", font=("Arial", 16, "bold"), text_color="#FF4081").pack(anchor="w", padx=18, pady=(15, 6))
+
+        # Add friend row
+        add_row = ctk.CTkFrame(f_left, fg_color="transparent")
+        add_row.pack(fill="x", padx=18, pady=(0, 10))
+        add_entry = ctk.CTkEntry(add_row, placeholder_text="osu! Username eingeben...", font=("Arial", 12), height=32)
+        add_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        friends_scroll = ctk.CTkScrollableFrame(f_left, fg_color="transparent")
+        friends_scroll.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        def render_friends():
+            for w in friends_scroll.winfo_children(): w.destroy()
+            fl = getattr(self, "uho_friends_list", [])
+            if not fl:
+                ctk.CTkLabel(friends_scroll, text="Noch keine Freunde hinzugefügt.\nFüge deine Freunde oben per Username hinzu!",
+                             font=("Arial", 12), text_color="#888899", justify="center").pack(pady=40)
+                return
+
+            for fr in fl:
+                c = ctk.CTkFrame(friends_scroll, fg_color="#20151c", corner_radius=10, border_width=1, border_color="#3b2432")
+                c.pack(fill="x", pady=4)
+                
+                c_top = ctk.CTkFrame(c, fg_color="transparent")
+                c_top.pack(fill="x", padx=10, pady=8)
+                
+                ctk.CTkLabel(c_top, text=f"👤 {fr}", font=("Arial", 13, "bold"), text_color="#ffffff").pack(side="left")
+                ctk.CTkLabel(c_top, text="🟢 ONLINE", font=("Arial", 9, "bold"), fg_color="#1b3820", text_color="#00E676", corner_radius=4).pack(side="left", padx=8)
+
+                def remove_f(u=fr):
+                    if u in self.uho_friends_list:
+                        self.uho_friends_list.remove(u)
+                        self.save_global_settings()
+                        render_friends()
+
+                def challenge_f(u=fr):
+                    self.show_multiplayer_match_setup()
+
+                ctk.CTkButton(c_top, text="⚔️ Herausfordern", width=110, height=26, font=("Arial", 10, "bold"),
+                              fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=challenge_f).pack(side="right", padx=2)
+                ctk.CTkButton(c_top, text="✕", width=26, height=26, font=("Arial", 10, "bold"),
+                              fg_color="#3a2028", hover_color="#502028", text_color="#ff8888", command=remove_f).pack(side="right", padx=2)
+
+        def add_f():
+            u = add_entry.get().strip()
+            if u:
+                if not hasattr(self, "uho_friends_list") or not isinstance(self.uho_friends_list, list):
+                    self.uho_friends_list = []
+                if u not in self.uho_friends_list:
+                    self.uho_friends_list.append(u)
+                    self.save_global_settings()
+                    add_entry.delete(0, "end")
+                    render_friends()
+
+        ctk.CTkButton(add_row, text="➕ Hinzufügen", width=100, height=32, font=("Arial", 11, "bold"),
+                      fg_color="#FF4081", hover_color="#E91E63", text_color="#ffffff", command=add_f).pack(side="right")
+
+        render_friends()
+
+        # Right: Server & Community Status
+        f_right = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#302028")
+        f_right.grid(row=0, column=1, padx=(10, 0), pady=5, sticky="nsew")
+
+        ctk.CTkLabel(f_right, text="🌐 UHO Hub Community & Live Presence", font=("Arial", 16, "bold"), text_color="#00E5FF").pack(anchor="w", padx=18, pady=(15, 6))
+        ctk.CTkLabel(f_right, text=f"Verbunden mit Render Server: {UHO_AUTH_SERVER_URL}", font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=18, pady=(0, 12))
+
+        srv_box = ctk.CTkFrame(f_right, fg_color="#121620", corner_radius=10, border_width=1, border_color="#203040")
+        srv_box.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        ctk.CTkLabel(srv_box, text="📡 Aktive Spieler im UHO Hub Netzwerk:", font=("Arial", 12, "bold"), text_color="#00E5FF").pack(anchor="w", padx=14, pady=(12, 6))
+
+        my_u = getattr(self, "osu_username", "Spieler") or "Spieler"
+        active_sample = [
+            (my_u, "🟢 Online (In der App)", "#00E676"),
+            ("BanchoBot", "🤖 IRC Schiedsrichter aktiv", "#00E5FF"),
+            ("Gemini AI", "✨ Trainings-Coach bereit", "#BA68C8")
+        ]
+        for name, st, col in active_sample:
+            row = ctk.CTkFrame(srv_box, fg_color="#181e2a", corner_radius=8)
+            row.pack(fill="x", padx=14, pady=4)
+            ctk.CTkLabel(row, text=f"• {name}", font=("Arial", 12, "bold"), text_color="#ffffff").pack(side="left", padx=10, pady=8)
+            ctk.CTkLabel(row, text=st, font=("Arial", 11), text_color=col).pack(side="right", padx=10, pady=8)
+
+        ctk.CTkLabel(srv_box, text="💡 Freunde können direkt über UHO Hub synchronisiert picken und bannen, oder die Chat-Befehle !pick und !ban im Spiel nutzen.",
+                     font=("Arial", 11), text_color="#8899aa", justify="left", wraplength=340).pack(anchor="w", padx=14, pady=(15, 12))
 
     def _mp_bot_log_callback(self, text, color="#aaaaaa"):
         if not hasattr(self, "mp_match") or not isinstance(self.mp_match, dict):
@@ -3595,7 +4106,7 @@ DEINE ANTWORT-RICHTLINIEN:
         self.mp_match["irc_channel"] = channel
         self._mp_bot_log_callback(f"🚀 Ingame-Lobby erstellt: {channel}", "#00E676")
         
-        # Configure team mode and invite all players asynchronously
+        # Configure team mode and invite all players asynchronously + broadcast pool
         def _bg_invite():
             time.sleep(1.0)
             if getattr(self, "mp_referee_bot", None):
@@ -3606,6 +4117,8 @@ DEINE ANTWORT-RICHTLINIEN:
                     self.mp_referee_bot.invite_player(p)
                 self.mp_referee_bot.send_channel_message(f"Willkommen zum UHO Hub Match! {self.mp_match['team1_name']} vs {self.mp_match['team2_name']}")
                 self._mp_bot_log_callback(f"✉️ Einladungen an {', '.join(all_pl)} gesendet!", "#00E676")
+                time.sleep(1.0)
+                self.mp_referee_bot.broadcast_mappool(self.mp_match.get("pool", {}), self.mp_match.get("stage", "Turnier"))
         threading.Thread(target=_bg_invite, daemon=True).start()
 
     def _mp_manual_invite_all(self):
@@ -3854,8 +4367,9 @@ DEINE ANTWORT-RICHTLINIEN:
         self.mp_match["rolls"][team] = roll_val
         t_name = self.mp_match[f"{team}_name"]
         self._mp_bot_log_callback(f"🎲 {t_name} würfelt eine {roll_val} (1-100)!", "#00E5FF")
-        if getattr(self, "mp_referee_bot", None):
-            self.mp_referee_bot.send_channel_message(f"UHO Referee: {t_name} rolled {roll_val}")
+        bot = getattr(self, "mp_referee_bot", None)
+        if bot:
+            bot.send_channel_message(f"🎲 {t_name} rolled {roll_val} (1-100)!")
 
         r1 = self.mp_match["rolls"]["team1"]
         r2 = self.mp_match["rolls"]["team2"]
@@ -3863,22 +4377,34 @@ DEINE ANTWORT-RICHTLINIEN:
             if r1 >= r2:
                 self.mp_match["first_picker"] = "team1"
                 self.mp_match["active_team"] = "team1"
+                winner_t = self.mp_match["team1_name"]
             else:
                 self.mp_match["first_picker"] = "team2"
                 self.mp_match["active_team"] = "team2"
+                winner_t = self.mp_match["team2_name"]
+
+            if bot:
+                bot.send_channel_message(f"🎯 Roll-Gewinner: {winner_t} wählt zuerst!")
         self._update_mp_lobby_status()
 
     def _advance_from_roll(self):
         m = self.mp_match
+        bot = getattr(self, "mp_referee_bot", None)
         if m["max_protects"] > 0:
             m["phase"] = "protect1"
             m["active_team"] = m["first_picker"]
+            act_n = m[f"{m['active_team']}_name"]
+            if bot: bot.send_channel_message(f"🛡️ Save-Phase: {act_n} bitte !save <slot> im Chat eingeben!")
         elif m["max_bans"] > 0:
             m["phase"] = "ban1"
             m["active_team"] = m["first_picker"]
+            act_n = m[f"{m['active_team']}_name"]
+            if bot: bot.send_channel_message(f"🚫 Ban-Phase: {act_n} bitte !ban <slot> im Chat eingeben!")
         else:
             m["phase"] = "pick"
             m["active_team"] = m["first_picker"]
+            act_n = m[f"{m['active_team']}_name"]
+            if bot: bot.send_channel_message(f"🎯 Pick-Phase: {act_n} bitte !pick <slot> im Chat eingeben!")
         self._render_mp_mappool_cards()
         self._update_mp_lobby_status()
 
@@ -3886,26 +4412,34 @@ DEINE ANTWORT-RICHTLINIEN:
         m = self.mp_match
         act_t = m["active_team"]
         t_name = m[f"{act_t}_name"]
+        item = m["pool"].get(slot, {})
 
         m["pool"][slot]["state"] = "protected"
         m[f"{act_t}_protects"].append(slot)
-        self._mp_bot_log_callback(f"🛡️ {t_name} schützt [{slot}] {m['pool'][slot]['name'][:35]}!", "#00E676")
-        if getattr(self, "mp_referee_bot", None):
-            self.mp_referee_bot.send_channel_message(f"UHO Referee: {t_name} PROTECTED slot {slot}")
+        self._mp_bot_log_callback(f"🛡️ {t_name} schützt [{slot}] {item.get('name', 'Map')[:35]}!", "#00E676")
+        bot = getattr(self, "mp_referee_bot", None)
+        if bot:
+            bot.send_channel_message(f"🛡️ {t_name} hat [{slot}] {item.get('name', 'Map')[:32]} geschützt!")
 
         # Advance protect phase
         total_p = len(m["team1_protects"]) + len(m["team2_protects"])
         if total_p < m["max_protects"] * 2:
             m["active_team"] = "team2" if act_t == "team1" else "team1"
             m["phase"] = "protect2" if m["phase"] == "protect1" else "protect1"
+            next_n = m[f"{m['active_team']}_name"]
+            if bot: bot.send_channel_message(f"🛡️ Nächster Save: {next_n}, bitte !save <slot> eingeben!")
         else:
             # Move to bans or picks
             if m["max_bans"] > 0:
                 m["phase"] = "ban1"
                 m["active_team"] = m["first_picker"]
+                next_n = m[f"{m['active_team']}_name"]
+                if bot: bot.send_channel_message(f"🚫 Ban-Phase gestartet! {next_n}, bitte !ban <slot> eingeben!")
             else:
                 m["phase"] = "pick"
                 m["active_team"] = m["first_picker"]
+                next_n = m[f"{m['active_team']}_name"]
+                if bot: bot.send_channel_message(f"🎯 Pick-Phase gestartet! {next_n}, bitte !pick <slot> eingeben!")
 
         self._render_mp_mappool_cards()
         self._update_mp_lobby_status()
@@ -3914,21 +4448,27 @@ DEINE ANTWORT-RICHTLINIEN:
         m = self.mp_match
         act_t = m["active_team"]
         t_name = m[f"{act_t}_name"]
+        item = m["pool"].get(slot, {})
 
         m["pool"][slot]["state"] = "banned"
         m[f"{act_t}_bans"].append(slot)
-        self._mp_bot_log_callback(f"🚫 {t_name} bannt [{slot}] {m['pool'][slot]['name'][:35]}!", "#FF5252")
-        if getattr(self, "mp_referee_bot", None):
-            self.mp_referee_bot.send_channel_message(f"UHO Referee: {t_name} BANNED slot {slot}")
+        self._mp_bot_log_callback(f"🚫 {t_name} bannt [{slot}] {item.get('name', 'Map')[:35]}!", "#FF5252")
+        bot = getattr(self, "mp_referee_bot", None)
+        if bot:
+            bot.send_channel_message(f"🚫 {t_name} hat [{slot}] {item.get('name', 'Map')[:32]} gebannt!")
 
         # Advance ban phase
         total_b = len(m["team1_bans"]) + len(m["team2_bans"])
         if total_b < m["max_bans"] * 2:
             m["active_team"] = "team2" if act_t == "team1" else "team1"
             m["phase"] = "ban2" if m["phase"] == "ban1" else "ban1"
+            next_n = m[f"{m['active_team']}_name"]
+            if bot: bot.send_channel_message(f"🚫 Nächster Ban: {next_n}, bitte !ban <slot> eingeben!")
         else:
             m["phase"] = "pick"
             m["active_team"] = m["first_picker"]
+            next_n = m[f"{m['active_team']}_name"]
+            if bot: bot.send_channel_message(f"🎯 Pick-Phase gestartet! {next_n}, bitte !pick <slot> eingeben!")
 
         self._render_mp_mappool_cards()
         self._update_mp_lobby_status()
@@ -3946,17 +4486,18 @@ DEINE ANTWORT-RICHTLINIEN:
         self._mp_bot_log_callback(f"🎯 {t_name} wählt Map [{slot}] {item['name'][:40]}!", "#00E5FF")
 
         # Ingame Bot map & mod selection
-        if getattr(self, "mp_referee_bot", None):
-            # Slot mod extraction (e.g. HD1 -> HD, HR2 -> HR, DT1 -> DT, FM1 -> Freemod, NM1 -> None)
+        bot = getattr(self, "mp_referee_bot", None)
+        if bot:
             slot_mod = "NM"
             for prefix in ["HD", "HR", "DT", "FM", "FL", "TB"]:
                 if slot.startswith(prefix):
                     slot_mod = prefix
                     break
-            self.mp_referee_bot.set_map(item.get("id", "0"), mods=slot_mod)
-            self.mp_referee_bot.send_channel_message(f"UHO Referee: Picked [{slot}] {item.get('name')}. Match starts in 10 seconds!")
+            bot.set_map(item.get("id", "0"), mods=slot_mod, enforce_nf=True)
+            bot.send_channel_message(f"🎯 [{slot}] {item.get('name')} (★ {item.get('sr', 5.0):.2f}) gewählt!")
+            bot.send_channel_message(f"⚡ Mods: {slot_mod} + NoFail (ScoreV2). Match startet in 10 Sekunden!")
             time.sleep(1.0)
-            self.mp_referee_bot.start_countdown(10)
+            bot.start_countdown(10)
 
         self._render_mp_mappool_cards()
         self._update_mp_lobby_status()
@@ -3988,7 +4529,6 @@ DEINE ANTWORT-RICHTLINIEN:
                         last_g = games[-1]
                         for sc in last_g.get("scores", []):
                             u_id = str(sc.get("user_id", ""))
-                            # Check team assignment
                             team_num = int(sc.get("team", 0)) # 1 = Blue, 2 = Red in Bancho
                             sc_val = int(sc.get("score", 0))
                             if team_num == 2:
@@ -4036,15 +4576,25 @@ DEINE ANTWORT-RICHTLINIEN:
         m["history"].append(summary)
         self._mp_bot_log_callback(f"🏆 {summary}", "#00E676")
 
-        if getattr(self, "mp_referee_bot", None):
-            self.mp_referee_bot.send_channel_message(f"UHO Referee: {w_name} won the round! Score: {m['team1_name']} {m['team1_score']} - {m['team2_score']} {m['team2_name']}")
+        bot = getattr(self, "mp_referee_bot", None)
+        if bot:
+            bot.send_channel_message(f"🔔 Runde beendet! Punkt an {w_name}! Spielstand: {m['team1_name']} [{m['team1_score']}] : [{m['team2_score']}] {m['team2_name']}")
 
         # Check for Match Point or Finished
         if m["team1_score"] >= m["target_wins"] or m["team2_score"] >= m["target_wins"]:
             m["phase"] = "finished"
+            champ_name = m["team1_name"] if m["team1_score"] >= m["target_wins"] else m["team2_name"]
+            if bot:
+                bot.send_channel_message(f"🏆 MATCH BEENDET! {champ_name} gewinnt das Match {m['team1_score']} : {m['team2_score']}!")
         else:
             m["phase"] = "pick"
             m["active_team"] = "team2" if m["active_team"] == "team1" else "team1"
+            next_p = m[f"{m['active_team']}_name"]
+            if bot:
+                bot.send_channel_message(f"🎯 Nächster Pick: {next_p}, bitte !pick <slot> im Chat eingeben!")
+
+        self._render_mp_mappool_cards()
+        self._update_mp_lobby_status()
 
         self._render_mp_mappool_cards()
         self._update_mp_lobby_status()
