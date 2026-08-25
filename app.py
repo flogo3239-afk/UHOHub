@@ -35,21 +35,17 @@ def get_resource_path(relative_path):
 DYNAMIC_RANKED_MAPS_DB = []
 OFFICIAL_TOURNAMENTS_DB = {}
 try:
-    db_path = get_resource_path("compact_ranked_maps.json")
-    if os.path.exists(db_path):
-        with open(db_path, "r", encoding="utf-8") as f:
-            DYNAMIC_RANKED_MAPS_DB = json.load(f)
-    elif os.path.exists("compact_ranked_maps.json"):
-        with open("compact_ranked_maps.json", "r", encoding="utf-8") as f:
-            DYNAMIC_RANKED_MAPS_DB = json.load(f)
-            
-    t_path = get_resource_path("official_tournament_pools.json")
-    if os.path.exists(t_path):
-        with open(t_path, "r", encoding="utf-8") as f:
-            OFFICIAL_TOURNAMENTS_DB = json.load(f)
-    elif os.path.exists("official_tournament_pools.json"):
-        with open("official_tournament_pools.json", "r", encoding="utf-8") as f:
-            OFFICIAL_TOURNAMENTS_DB = json.load(f)
+    for candidate_dir in [getattr(sys, "_MEIPASS", ""), os.path.dirname(os.path.abspath(__file__)), os.getcwd(), r"C:\Users\louis\.gemini\antigravity\scratch"]:
+        if not candidate_dir: continue
+        db_path = os.path.join(candidate_dir, "compact_ranked_maps.json")
+        if not DYNAMIC_RANKED_MAPS_DB and os.path.exists(db_path):
+            with open(db_path, "r", encoding="utf-8") as f:
+                DYNAMIC_RANKED_MAPS_DB = json.load(f)
+                
+        t_path = os.path.join(candidate_dir, "official_tournament_pools.json")
+        if not OFFICIAL_TOURNAMENTS_DB and os.path.exists(t_path):
+            with open(t_path, "r", encoding="utf-8") as f:
+                OFFICIAL_TOURNAMENTS_DB = json.load(f)
 except Exception as e:
     pass
 
@@ -4576,16 +4572,42 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 rank_metric = aff_score * 2.0 - sr_diff
                 scored_candidates.append((rank_metric, m))
 
+            DEFAULT_SLOT_DEFAULTS = {
+                "NM1": {"id": "1863269", "name": "Kano - Stella-rium [Celestial]", "sr": 6.2, "bpm": 178, "len": 195, "cs": 4.0, "ar": 9.3, "od": 9.0},
+                "NM2": {"id": "2245786", "name": "Camellia - GHOST [Extra]", "sr": 6.5, "bpm": 220, "len": 210, "cs": 4.2, "ar": 9.5, "od": 9.2},
+                "NM3": {"id": "154988", "name": "xi - FREEDOM DiVE [FOUR DIMENSIONS]", "sr": 7.5, "bpm": 222, "len": 255, "cs": 4.0, "ar": 9.0, "od": 8.0},
+                "NM4": {"id": "114635", "name": "LeaF - Evanescent [Another]", "sr": 5.8, "bpm": 185, "len": 130, "cs": 4.0, "ar": 9.0, "od": 8.5},
+                "HD1": {"id": "315552", "name": "Halozy - PLASMIC SPARK [Overdrive]", "sr": 6.0, "bpm": 180, "len": 180, "cs": 4.0, "ar": 9.0, "od": 8.5},
+                "HD2": {"id": "281843", "name": "DJ Fresh - Gold Dust [Insane]", "sr": 5.4, "bpm": 177, "len": 190, "cs": 4.0, "ar": 8.8, "od": 8.0},
+                "HR1": {"id": "1456839", "name": "Ayase Rie - Yuima-ru*World [Extra]", "sr": 6.1, "bpm": 180, "len": 110, "cs": 4.5, "ar": 9.5, "od": 9.5},
+                "HR2": {"id": "1655981", "name": "the peggies - Kimi no Sei [Expert]", "sr": 6.3, "bpm": 184, "len": 135, "cs": 4.2, "ar": 9.5, "od": 9.3},
+                "DT1": {"id": "129891", "name": "Nico Nico Douga - U.N. Owen Was Her? [Insane]", "sr": 6.4, "bpm": 240, "len": 115, "cs": 4.0, "ar": 9.6, "od": 9.0},
+                "DT2": {"id": "1695382", "name": "Chino - Shoushou no Yoru [Insane]", "sr": 6.2, "bpm": 255, "len": 125, "cs": 4.0, "ar": 9.4, "od": 8.8},
+                "FM1": {"id": "2060305", "name": "Reol - No title [Loli's Extra]", "sr": 6.1, "bpm": 200, "len": 165, "cs": 4.0, "ar": 9.2, "od": 9.0},
+                "FM2": {"id": "2118443", "name": "KASAI HARCORES - Cycle Hit [Home Run]", "sr": 6.6, "bpm": 175, "len": 240, "cs": 4.2, "ar": 9.4, "od": 9.0},
+                "TB": {"id": "100049", "name": "DragonForce - Through the Fire and Flames [Expert]", "sr": 7.0, "bpm": 200, "len": 440, "cs": 4.0, "ar": 9.0, "od": 8.5}
+            }
+
             scored_candidates.sort(key=lambda x: x[0], reverse=True)
             top_pool = [item[1] for item in scored_candidates[:4]] if scored_candidates else candidates
 
-            chosen = random.choice(top_pool)
-            used_ids.add(chosen['id'])
+            if top_pool:
+                chosen = random.choice(top_pool)
+            elif candidates:
+                chosen = random.choice(candidates)
+            else:
+                fallback_def = DEFAULT_SLOT_DEFAULTS.get(slot, {
+                    "id": "1863269", "name": f"Tournament Pick ({slot})", "sr": round((min_sr + max_sr) / 2.0, 2),
+                    "bpm": 180, "len": 120, "cs": 4.0, "ar": 9.0, "od": 8.0, "year": 2024
+                })
+                chosen = dict(fallback_def)
+
+            used_ids.add(chosen.get('id', '0'))
             pool[slot] = {
                 "slot": slot,
-                "id": chosen["id"],
-                "name": chosen["name"],
-                "sr": chosen["sr"],
+                "id": str(chosen.get("id", "0")),
+                "name": chosen.get("name", f"Turnier Map {slot}"),
+                "sr": float(chosen.get("sr", 5.5)),
                 "bpm": chosen.get("bpm", 180),
                 "len": chosen.get("len", 120),
                 "cs": chosen.get("cs", 4.0),
