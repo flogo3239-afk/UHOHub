@@ -22,7 +22,7 @@ try:
 except Exception:
     winreg = None
 
-CURRENT_APP_VERSION = "2.5.0"
+CURRENT_APP_VERSION = "2.5.1"
 GITHUB_REPO = "flogo3239-afk/UHOHub"
 
 def get_resource_path(relative_path):
@@ -58,16 +58,21 @@ TECH_ARTISTS = {'camellia', 'kobaryo', 'lapix', 'frums', 'silentroom', 'v0id', '
 
 TECH_KEYWORDS = {'tech', 'remix', 'gimmick', 'slider', 'velocity', 'polyrhythm', 'sv', 'awkward',
                  'glitch', 'experimental', 'complex', 'odd', 'chaos', 'overdose', 'expert????', 'level 2',
-                 'level 1', 'level 3', 'level 4', 'level 5', 'limbo', 'chayot'}
+                 'level 1', 'level 3', 'level 4', 'level 5', 'limbo', 'chayot', 'tag', 'tag4', 'tag2',
+                 'alt', 'alternate', 'alternating', 'slider-tech', 'sv gimmick', 'jump-tech'}
 
 STREAM_ARTISTS = {'dragonforce', 'xi', 'foreground eclipse', 'imperial circus dead decadence',
                   'undead corporation', 'memai siren', 'demetori', 'galneryus', 'tears of tragedy',
-                  'fellows', 'necrofantasia', 'icdd', 'aether realm', 'dragon eyes'}
+                  'fellows', 'necrofantasia', 'icdd', 'aether realm', 'dragon eyes', 'ryo-kun'}
+
+EXPLICIT_STREAM_KEYWORDS = {'ice angel', 'freedom dive', 'the empress', 'sidetracked', 'blue zenith',
+                            'ascension to heaven', 'uta', 'songs compilation', 'arcadia', 'stream', 'deathstream'}
 
 def compute_map_pattern_fingerprint(m):
     """
     Berechnet einen mathematischen HitObject- & Struktur-Fingerabdruck (0.0 bis 1.0)
     für alle 8 osu! Standard Skillsets zur millimetergenauen Vorfilterung & Auto-Skip.
+    Verhindert zuverlässig, dass Tag- und Tech-Maps in Streams, Aim oder Stamina rutschen.
     """
     sr = float(m.get('sr', 5.0))
     bpm = float(m.get('bpm', 180.0))
@@ -77,48 +82,53 @@ def compute_map_pattern_fingerprint(m):
     ar = float(m.get('ar', 9.0))
     name = str(m.get('name', '')).lower()
 
-    is_tech_artist = any(a in name for a in TECH_ARTISTS)
-    is_tech_kw = any(k in name for k in TECH_KEYWORDS)
+    is_explicit_stream = any(k in name for k in EXPLICIT_STREAM_KEYWORDS)
+    is_tech_artist = any(a in name for a in TECH_ARTISTS) and not is_explicit_stream
+    is_tech_kw = (any(k in name for k in TECH_KEYWORDS) or 'tag' in name or 'remix' in name) and not is_explicit_stream
     is_stream_artist = any(a in name for a in STREAM_ARTISTS)
 
-    # 1. Tech Score (Slider Velocity, Awkward Angles, Polyrhythms)
+    # 1. Tech Score (Slider Velocity, Tag Maps, Awkward Angles, Polyrhythms)
     tech_score = 0.05
     if is_tech_artist: tech_score += 0.50
-    if is_tech_kw: tech_score += 0.40
+    if is_tech_kw: tech_score += 0.45
     if 125 <= bpm <= 165 and sr >= 5.0: tech_score += 0.25
-    if 'slider' in name or 'sv' in name or 'gimmick' in name or 'velocity' in name: tech_score += 0.35
+    if 'slider' in name or 'sv' in name or 'gimmick' in name or 'velocity' in name or 'tag' in name: tech_score += 0.35
+    if is_explicit_stream: tech_score = 0.05
     tech_score = min(1.0, tech_score)
 
-    # 2. Streams Score (1/4 Note Chains, Deathstreams)
+    # 2. Streams Score (1/4 Note Chains, Deathstreams - Strikt ohne Tech/Tag Maps!)
     stream_score = 0.05
-    if is_stream_artist or 'stream' in name or 'deathstream' in name: stream_score += 0.55
-    if 170 <= bpm <= 230 and length >= 120: stream_score += 0.35
-    if not is_tech_artist and not is_tech_kw and 175 <= bpm <= 225: stream_score += 0.15
-    if tech_score > 0.60: stream_score -= 0.40
+    if is_explicit_stream:
+        stream_score = 0.85
+    elif not is_tech_artist and not is_tech_kw:
+        if is_stream_artist or 'stream' in name or 'deathstream' in name: stream_score += 0.60
+        if 170 <= bpm <= 230 and length >= 110: stream_score += 0.35
+        if 175 <= bpm <= 225: stream_score += 0.15
+    if tech_score > 0.40 and not is_explicit_stream: stream_score = max(0.0, stream_score - 0.50)
     stream_score = max(0.0, min(1.0, stream_score))
 
     # 3. Speed Score (High BPM Bursting & Raw Tapping Speed)
     speed_score = 0.05
-    if bpm >= 210: speed_score += 0.55
+    if bpm >= 215: speed_score += 0.55
     elif bpm >= 195: speed_score += 0.35
     if 'speed' in name or 'fast' in name or 'bpm' in name: speed_score += 0.30
-    if length <= 130 and bpm >= 190: speed_score += 0.20
-    if tech_score > 0.60: speed_score -= 0.45
+    if length <= 130 and bpm >= 195 and not is_tech_kw: speed_score += 0.20
+    if tech_score > 0.50: speed_score = max(0.0, speed_score - 0.45)
     speed_score = max(0.0, min(1.0, speed_score))
 
-    # 4. Jump Aim Score (Snapping Distance, Wide Spacing - Strictly non-tech!)
+    # 4. Jump Aim Score (Snapping Distance, Wide Spacing - Strictly non-tech/non-tag!)
     aim_score = 0.05
     if not is_tech_artist and not is_tech_kw:
-        if 'jump' in name or 'tv size' in name: aim_score += 0.50
+        if 'jump' in name or 'tv size' in name or 'killer' in name: aim_score += 0.50
         if 170 <= bpm <= 220 and length <= 160: aim_score += 0.35
-        if cs <= 4.4 and sr >= 4.5 and stream_score < 0.50: aim_score += 0.30
-    if tech_score > 0.45: aim_score -= 0.60
-    if stream_score > 0.70: aim_score -= 0.35
+        if cs <= 4.4 and sr >= 4.5 and stream_score < 0.40: aim_score += 0.30
+    if tech_score > 0.35: aim_score = max(0.0, aim_score - 0.60)
+    if stream_score > 0.60: aim_score = max(0.0, aim_score - 0.35)
     aim_score = max(0.0, min(1.0, aim_score))
 
     # 5. Precision Score (Small CS >= 4.5 & High OD Accuracy)
     prec_score = 0.05
-    if cs >= 5.0: prec_score += 0.55
+    if cs >= 5.0: prec_score += 0.60
     elif cs >= 4.5: prec_score += 0.35
     if od >= 9.0: prec_score += 0.30
     if 'precision' in name or 'small cs' in name or 'cs5' in name or 'cs6' in name: prec_score += 0.40
@@ -126,19 +136,20 @@ def compute_map_pattern_fingerprint(m):
 
     # 6. Reading Score (Low AR Density, Overlapping Notes)
     read_score = 0.05
-    if ar <= 8.5 and sr >= 4.5: read_score += 0.55
+    if ar <= 8.5 and sr >= 4.5: read_score += 0.60
     elif ar <= 8.8 and sr >= 4.0: read_score += 0.35
-    if 'reading' in name or 'hidden' in name or 'low ar' in name: read_score += 0.45
+    if 'reading' in name or 'hidden' in name or 'low ar' in name or 'wildflower' in name: read_score += 0.45
     read_score = max(0.0, min(1.0, read_score))
 
-    # 7. Stamina Score (Long Drain, Sustained Note Stream Density)
+    # 7. Stamina Score (Long Marathon Drain >= 3 Min, Sustained Note Density)
     stam_score = 0.05
-    if length >= 210: stam_score += 0.55
-    elif length >= 160: stam_score += 0.35
-    if (bpm >= 180 and length >= 150) or 'marathon' in name or 'stamina' in name: stam_score += 0.30
+    if length >= 210: stam_score += 0.60
+    elif length >= 170: stam_score += 0.35
+    else: stam_score = 0.0  # Kurze Maps sind niemals Stamina!
+    if (bpm >= 175 and length >= 180) or 'marathon' in name or 'stamina' in name: stam_score += 0.30
     stam_score = max(0.0, min(1.0, stam_score))
 
-    # 8. Consistency Score (Uniform Star Density, High OD, Marathon Pacing)
+    # 8. Consistency Score (Uniform Star Density, High OD, Tournament Pacing)
     cons_score = 0.05
     if length >= 120 and od >= 8.0 and not is_tech_artist and not is_tech_kw:
         cons_score += 0.45
@@ -1307,16 +1318,6 @@ AI_BENCHMARK_POOL = {
             "goal": "Schnelle Tapping-Bursts kontrolliert durchspielen."
         },
         {
-            "id": "5573472",
-            "name": "FLORE - SKELETON (NIGHTCORE & CUT VER.) [NEXT TO YOU]",
-            "sr": 5.4,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.7/10",
-            "type": "Speed",
-            "goal": "Halte die hohe Frequenz bei den schnellen Jumps."
-        },
-        {
             "id": "4379484",
             "name": "xi - Longinus [Insane]",
             "sr": 5.6,
@@ -1324,17 +1325,27 @@ AI_BENCHMARK_POOL = {
             "status": "Ranked",
             "rating": "9.2/10",
             "type": "Speed",
-            "goal": "Kontrolliere die schnellen Burst-Wechsel mit lockerer Handhaltung."
+            "goal": "Kontrolliere die schnellen Burst-Wechsel (212 BPM) mit lockerer Handhaltung."
         },
         {
-            "id": "5640347",
-            "name": "Laur - Sound Chimera (Nyankovsky & Kobaryo Remix) [Nachmark's Extra]",
-            "sr": 7.1,
-            "year": 2026,
+            "id": "4437059",
+            "name": "Camellia - Xeroa [PaRaDogi's INFINITE]",
+            "sr": 5.5,
+            "year": 2024,
             "status": "Ranked",
-            "rating": "9.3/10",
+            "rating": "9.8/10",
             "type": "Speed",
-            "goal": "Pushe dein Speed-Limit mit maximaler Tapping-Frequenz."
+            "goal": "220 BPM High-Speed Bursts mit sauberem Tapping-Release."
+        },
+        {
+            "id": "2116202",
+            "name": "Kurokotei - Galaxy Collapse [Cataclysmic Hypernova]",
+            "sr": 7.5,
+            "year": 2024,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Pushe dein Speed-Limit mit maximaler Tapping-Frequenz (230 BPM)."
         }
     ],
     "Aim": [
@@ -1349,16 +1360,6 @@ AI_BENCHMARK_POOL = {
             "goal": "Saubere Jump-Snaps und gleichmaessige Cursor-Bewegung."
         },
         {
-            "id": "5518498",
-            "name": "MORE MORE JUMP! x Kagamine Rin - KILLER [INSANE]",
-            "sr": 5.3,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.6/10",
-            "type": "Aim",
-            "goal": "Saubere Jump-Snaps auf weite Winkel mit >98.0% Acc."
-        },
-        {
             "id": "3741633",
             "name": "ATARASHII GAKKO! - Koi Geba [NcFix's Insane]",
             "sr": 4.8,
@@ -1367,6 +1368,16 @@ AI_BENCHMARK_POOL = {
             "rating": "9.8/10",
             "type": "Aim",
             "goal": "Praezises Treffen der schnellen Circle-Muster."
+        },
+        {
+            "id": "5518498",
+            "name": "MORE MORE JUMP! x Kagamine Rin - KILLER [INSANE]",
+            "sr": 5.3,
+            "year": 2026,
+            "status": "Ranked",
+            "rating": "9.6/10",
+            "type": "Aim",
+            "goal": "Saubere Jump-Snaps auf weite Winkel mit >98.0% Acc."
         },
         {
             "id": "3378159",
@@ -1379,16 +1390,6 @@ AI_BENCHMARK_POOL = {
             "goal": "Treffe die scharfen Ecken praezise im Takt."
         },
         {
-            "id": "5383289",
-            "name": "MORE MORE JUMP! x Kagamine Rin - KILLER [EXPERT]",
-            "sr": 6.5,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.4/10",
-            "type": "Aim",
-            "goal": "Praezises Cross-Screen Aim ohne Over- oder Undershooting."
-        },
-        {
             "id": "4268400",
             "name": "TUYU - Shuuten no Saki ga Aru to Suru naraba. [Extra]",
             "sr": 6.0,
@@ -1397,6 +1398,16 @@ AI_BENCHMARK_POOL = {
             "rating": "9.6/10",
             "type": "Aim",
             "goal": "Pushe deine Aim-Velocity auf High-Star Jumps."
+        },
+        {
+            "id": "5383289",
+            "name": "MORE MORE JUMP! x Kagamine Rin - KILLER [EXPERT]",
+            "sr": 6.5,
+            "year": 2026,
+            "status": "Ranked",
+            "rating": "9.4/10",
+            "type": "Aim",
+            "goal": "Praezises Cross-Screen Aim ohne Over- oder Undershooting."
         },
         {
             "id": "5188664",
@@ -1411,24 +1422,14 @@ AI_BENCHMARK_POOL = {
     ],
     "Stamina": [
         {
-            "id": "5637208",
-            "name": "Matduke - Rock The House (Cut Ver.) [Minion's Insane]",
-            "sr": 4.9,
-            "year": 2026,
+            "id": "3055652",
+            "name": "DRAGON EYES - Twilight Symphony [PaRaDogi's Extra]",
+            "sr": 5.5,
+            "year": 2023,
             "status": "Ranked",
-            "rating": "9.2/10",
+            "rating": "9.8/10",
             "type": "Stamina",
-            "goal": "Halte die Streams stabil ueber die Song-Dauer."
-        },
-        {
-            "id": "5122120",
-            "name": "Matduke - Rock The House (Cut Ver.) [Expert]",
-            "sr": 5.2,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.5/10",
-            "type": "Stamina",
-            "goal": "Kontrolliere die Stream-Ausdauer mit entspannter Hand."
+            "goal": "4:12 Minuten Dauer-Drain ohne Erschoepfung durchspielen (>97.0% Acc)."
         },
         {
             "id": "5591821",
@@ -1441,24 +1442,24 @@ AI_BENCHMARK_POOL = {
             "goal": "Lange Stream-Passagen mit minimaler Unterarm-Spannung durchspielen."
         },
         {
-            "id": "4437059",
-            "name": "Camellia - Xeroa [PaRaDogi's INFINITE]",
-            "sr": 5.5,
+            "id": "3829104",
+            "name": "UNDEAD CORPORATION - The Empress [Insane]",
+            "sr": 5.2,
             "year": 2024,
             "status": "Ranked",
-            "rating": "9.8/10",
+            "rating": "9.5/10",
             "type": "Stamina",
-            "goal": "3:45 Minuten Dauer-Drain ohne Erschoepfung durchspielen (>97.0% Acc)."
+            "goal": "Gleichmaessige Ausdauer bei 195 BPM Dauer-Streams."
         },
         {
-            "id": "3055652",
-            "name": "DRAGON EYES - Twilight Symphony [PaRaDogi's Extra]",
-            "sr": 5.5,
+            "id": "2415087",
+            "name": "DragonForce - Symphony of the Night [Legend]",
+            "sr": 6.3,
             "year": 2023,
             "status": "Ranked",
-            "rating": "9.8/10",
+            "rating": "9.6/10",
             "type": "Stamina",
-            "goal": "Hohe Konzentration ueber die gesamte Marathon-Laenge."
+            "goal": "5+ Minuten Marathon-Ausdauer mit gleichbleibendem Fingerdruck."
         }
     ],
     "Tech": [
@@ -1520,7 +1521,7 @@ AI_BENCHMARK_POOL = {
             "status": "Ranked",
             "rating": "9.3/10",
             "type": "Tech",
-            "goal": "Extreme Tech-Dynamik und Slider-Kontrolle auf Apex-Niveau."
+            "goal": "Extreme Tech-Dynamik, Tag-Patterns und Slider-Kontrolle auf Apex-Niveau."
         }
     ],
     "Reading": [
@@ -1532,7 +1533,7 @@ AI_BENCHMARK_POOL = {
             "status": "Ranked",
             "rating": "9.7/10",
             "type": "Reading",
-            "goal": "Lies die Approach Circles entspannt ohne Hektik."
+            "goal": "Lies die Low-AR (8.0) Approach Circles entspannt ohne Hektik."
         },
         {
             "id": "5697226",
@@ -1542,7 +1543,7 @@ AI_BENCHMARK_POOL = {
             "status": "Ranked",
             "rating": "9.7/10",
             "type": "Reading",
-            "goal": "Entspanntes Lesen von versetzten Noten."
+            "goal": "Entspanntes Lesen von versetzten Low-AR Noten."
         },
         {
             "id": "5311191",
@@ -1563,48 +1564,18 @@ AI_BENCHMARK_POOL = {
             "rating": "9.7/10",
             "type": "Reading",
             "goal": "Lies ueberlappende Noten ohne Hektik (Auge fuehrt, Hand folgt)."
-        },
-        {
-            "id": "5640346",
-            "name": "Laur - Sound Chimera (Nyankovsky & Kobaryo Remix) [Collab Expert]",
-            "sr": 6.1,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.7/10",
-            "type": "Reading",
-            "goal": "Lese dichte Rhythmen unabhaengig von Approach Circles."
         }
     ],
     "Streams": [
         {
-            "id": "5637208",
-            "name": "Matduke - Rock The House (Cut Ver.) [Minion's Insane]",
-            "sr": 4.9,
-            "year": 2026,
+            "id": "3829104",
+            "name": "UNDEAD CORPORATION - The Empress [Insane]",
+            "sr": 5.1,
+            "year": 2024,
             "status": "Ranked",
-            "rating": "9.2/10",
+            "rating": "9.4/10",
             "type": "Streams",
-            "goal": "Flieszende Handbewegung durch die Kurven-Streams mit >98.0% Acc."
-        },
-        {
-            "id": "5122120",
-            "name": "Matduke - Rock The House (Cut Ver.) [Expert]",
-            "sr": 5.2,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.5/10",
-            "type": "Streams",
-            "goal": "Passe den Cursor-Speed an die zunehmende Stream-Spreizung an."
-        },
-        {
-            "id": "5591821",
-            "name": "Yooh - Ice Angel [Divination Break]",
-            "sr": 5.7,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.3/10",
-            "type": "Streams",
-            "goal": "Halte die Deathstreams mit gleichmaessigem Fingerdruck."
+            "goal": "Saubere 195 BPM Finger-Control bei zusammenhaengenden Streams."
         },
         {
             "id": "4412935",
@@ -1614,17 +1585,37 @@ AI_BENCHMARK_POOL = {
             "status": "Ranked",
             "rating": "9.8/10",
             "type": "Streams",
-            "goal": "Saubere Finger-Control bei Cutstreams ohne Ueberhastung."
+            "goal": "Saubere Finger-Control bei Cutstreams und Spaced Flow mit >98.0% Acc."
         },
         {
-            "id": "5640347",
-            "name": "Laur - Sound Chimera (Nyankovsky & Kobaryo Remix) [Nachmark's Extra]",
-            "sr": 7.1,
+            "id": "5591821",
+            "name": "Yooh - Ice Angel [Divination Break]",
+            "sr": 5.7,
             "year": 2026,
             "status": "Ranked",
             "rating": "9.3/10",
             "type": "Streams",
-            "goal": "Kontrolliere High-BPM Streams ohne Ausreisser."
+            "goal": "Halte die Deathstreams mit gleichmaessigem Fingerdruck und sauberer Spur."
+        },
+        {
+            "id": "188814",
+            "name": "xi - FREEDOM DiVE [Another]",
+            "sr": 6.8,
+            "year": 2023,
+            "status": "Ranked",
+            "rating": "9.9/10",
+            "type": "Streams",
+            "goal": "222 BPM High-BPM Deathstream Kontrolle ohne UR-Spikes."
+        },
+        {
+            "id": "744305",
+            "name": "Imperial Circus Dead Decadence - Uta [Himei]",
+            "sr": 7.1,
+            "year": 2024,
+            "status": "Ranked",
+            "rating": "9.8/10",
+            "type": "Streams",
+            "goal": "Meistere lange 205 BPM Spaced Streams auf Turnier-Niveau."
         }
     ],
     "Precision": [
@@ -1636,7 +1627,7 @@ AI_BENCHMARK_POOL = {
             "status": "Ranked",
             "rating": "9.4/10",
             "type": "Precision",
-            "goal": "Exakte Treffer auf kleine CS Circles mit >98.5% Acc."
+            "goal": "Exakte Treffer auf kleine CS 5.5 Circles mit >98.5% Acc."
         },
         {
             "id": "5585617",
@@ -1646,7 +1637,7 @@ AI_BENCHMARK_POOL = {
             "status": "Ranked",
             "rating": "9.5/10",
             "type": "Precision",
-            "goal": "Beherrsche kleine Circles mit ruhiger Hand."
+            "goal": "Beherrsche kleine Circles (CS 5.0) mit ruhiger Hand."
         },
         {
             "id": "4922783",
@@ -1656,17 +1647,7 @@ AI_BENCHMARK_POOL = {
             "status": "Ranked",
             "rating": "9.3/10",
             "type": "Precision",
-            "goal": "Praezises Timing auf hoher OD mit maximaler Treffsicherheit."
-        },
-        {
-            "id": "5640346",
-            "name": "Laur - Sound Chimera (Nyankovsky & Kobaryo Remix) [Collab Expert]",
-            "sr": 6.1,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.7/10",
-            "type": "Precision",
-            "goal": "Extreme Praezision auf kleinen Trefferflaechen."
+            "goal": "Praezises Timing auf kleiner Trefferflaeche (CS 5.2) mit hoher OD."
         }
     ]
 }
@@ -2990,8 +2971,178 @@ del "%~f0" & exit
         _apply(root_widget)
 
     # ---------------------------------------------------------------------------
-    # GATHER CONTEXT & MASTER GEMINI PROMPT
+    # INTERAKTIVE MULTIPLE-CHOICE KI-FRAGEN (MATCHING DESIGN media_1787688868040.png)
     # ---------------------------------------------------------------------------
+    def show_ai_question_modal(self, title=None, subtitle=None, options=None, callback=None, default_idx=0):
+        """
+        Öffnet einen modernen, interaktiven Multiple-Choice Dialog im exakten Stil des Referenz-Screenshots.
+        Ermöglicht der KI, den Spieler gezielt nach Feedback, Tempo, Miss-Ursachen oder Skillset-Wünschen zu befragen.
+        """
+        cur_map = getattr(self, "current_ai_training_map", {}) or {}
+        map_name = cur_map.get("name", "Aktuelle Trainings-Map")
+        map_sr = cur_map.get("sr", 5.5)
+        map_mod = cur_map.get("mod", "NM")
+        target_sk = getattr(self, "ai_training_target_skill", "Streams")
+
+        if title is None:
+            title = "Wie hat sich das Tempo & die Schwierigkeit für dich angefühlt?"
+
+        if subtitle is None:
+            subtitle = f"Map: {map_name} (★ {map_sr:.1f}, +{map_mod}) • Skillset: {target_sk}"
+
+        if options is None or not options:
+            options = [
+                "Zu schnell / Meine Finger haben blockiert (Tempo -15 BPM drosseln)",
+                "Perfekte Herausforderung / Genau das richtige Limit zum Trainieren",
+                "Gutes Tempo, aber Misses durch Overaiming / Sliderbreaks",
+                "Ich möchte jetzt zu einem anderen Skillset wechseln (z. B. Jumps/Aim)",
+                "Andere Einstellung (Mod wechseln oder Schwierigkeit manuell wählen)"
+            ]
+
+        modal = ctk.CTkToplevel(self)
+        modal.title("KI-Coach Feedback")
+        modal.geometry("720x450")
+        modal.minsize(620, 380)
+        modal.configure(fg_color="#121216")
+        modal.attributes("-topmost", True)
+
+        # Center relative to parent window
+        try:
+            modal.update_idletasks()
+            w = 720
+            h = 450
+            x = self.winfo_x() + (self.winfo_width() // 2) - (w // 2)
+            y = self.winfo_y() + (self.winfo_height() // 2) - (h // 2)
+            modal.geometry(f"{w}x{h}+{max(30, x)}+{max(30, y)}")
+        except Exception:
+            pass
+
+        # Outer Container Frame (Exact dark card style with 1px border)
+        card = ctk.CTkFrame(modal, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2c2c3e")
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        # Top Title with Icon
+        title_row = ctk.CTkFrame(card, fg_color="transparent")
+        title_row.pack(fill="x", padx=22, pady=(18, 6))
+
+        ctk.CTkLabel(title_row, text="💬 " + str(title), font=("Arial", 15, "bold"), text_color="#ffffff", justify="left").pack(side="left")
+
+        # Subtitle / Code Badge (Matching the dark badge in media_1787688868040.png)
+        if subtitle:
+            badge_frame = ctk.CTkFrame(card, fg_color="#111118", corner_radius=8, border_width=1, border_color="#262638")
+            badge_frame.pack(fill="x", padx=22, pady=(0, 12))
+            ctk.CTkLabel(badge_frame, text=str(subtitle), font=("Consolas", 12), text_color="#00E5FF", justify="left").pack(anchor="w", padx=12, pady=7)
+
+        # Options Container Frame
+        options_frame = ctk.CTkFrame(card, fg_color="transparent")
+        options_frame.pack(fill="both", expand=True, padx=22, pady=(0, 10))
+
+        selected_var = ctk.IntVar(value=default_idx)
+        option_cards = []
+
+        def select_opt(idx):
+            selected_var.set(idx)
+            for i, (c_frame, num_badge, txt_lbl) in enumerate(option_cards):
+                if i == idx:
+                    c_frame.configure(fg_color="#1f2c3e", border_color="#0078D4", border_width=2)
+                    num_badge.configure(fg_color="#0078D4", text_color="#ffffff")
+                    txt_lbl.configure(text_color="#ffffff")
+                else:
+                    c_frame.configure(fg_color="#14141c", border_color="#242432", border_width=1)
+                    num_badge.configure(fg_color="#242432", text_color="#888899")
+                    txt_lbl.configure(text_color="#cccccc")
+
+        for idx, opt_text in enumerate(options):
+            c_opt = ctk.CTkFrame(options_frame, fg_color="#14141c", corner_radius=10, border_width=1, border_color="#242432", height=40)
+            c_opt.pack(fill="x", pady=3)
+            c_opt.pack_propagate(False)
+
+            # Left number badge (1, 2, 3, 4, 5)
+            num_b = ctk.CTkLabel(c_opt, text=str(idx + 1), font=("Arial", 11, "bold"), width=24, height=24, corner_radius=6,
+                                 fg_color="#242432", text_color="#888899")
+            num_b.pack(side="left", padx=(10, 10), pady=7)
+
+            # Option text
+            txt_l = ctk.CTkLabel(c_opt, text=str(opt_text), font=("Arial", 12), text_color="#cccccc", justify="left")
+            txt_l.pack(side="left", fill="x", expand=True, pady=7)
+
+            # Bind click on entire row
+            for widget in [c_opt, num_b, txt_l]:
+                widget.bind("<Button-1>", lambda e, i=idx: select_opt(i))
+
+            option_cards.append((c_opt, num_b, txt_l))
+
+        # Initialize selection
+        select_opt(default_idx)
+
+        # Bottom Action Bar (Skip on left of submit, blue Submit button on right)
+        bot_bar = ctk.CTkFrame(card, fg_color="transparent", height=44)
+        bot_bar.pack(fill="x", padx=22, pady=(6, 14), side="bottom")
+        bot_bar.pack_propagate(False)
+
+        def do_skip():
+            modal.destroy()
+            if callback:
+                callback(-1, None)
+
+        def do_submit():
+            chosen_idx = selected_var.get()
+            chosen_txt = options[chosen_idx] if 0 <= chosen_idx < len(options) else ""
+            modal.destroy()
+            if callback:
+                callback(chosen_idx, chosen_txt)
+            else:
+                self.handle_ai_question_response(chosen_idx, chosen_txt)
+
+        ctk.CTkButton(bot_bar, text="Submit ↵", font=("Arial", 13, "bold"), height=36, width=130,
+                      fg_color="#0078D4", hover_color="#0063B1", text_color="#ffffff", corner_radius=8,
+                      command=do_submit).pack(side="right")
+
+        ctk.CTkButton(bot_bar, text="Skip", font=("Arial", 12), height=36, width=80,
+                      fg_color="transparent", hover_color="#22222c", text_color="#888899",
+                      command=do_skip).pack(side="right", padx=(0, 10))
+
+    def handle_ai_question_response(self, chosen_idx, chosen_txt):
+        """
+        Verarbeitet die Benutzerauswahl aus dem KI-Fragebogen und passt das Live-Coaching in Echtzeit an.
+        """
+        if chosen_idx == -1 or not chosen_txt:
+            return
+
+        # Option 0: Zu schnell / Fingerlocking -> Tempo senken
+        if chosen_idx == 0:
+            resp_txt = "Verstanden! Ich drossle das Tempo um ca. -15 BPM und gebe dir eine Map mit mehr Flow-Control, damit deine Finger locker bleiben."
+            self.add_modern_chat_bubble("ai", f"🤖 **Coach-Anpassung:** {resp_txt}")
+            self.pick_next_ai_training_map(adaptive_delta=-0.30)
+
+        # Option 1: Perfekte Herausforderung -> Weiter auf diesem Level
+        elif chosen_idx == 1:
+            resp_txt = "Klasse! Wir bleiben genau in diesem Belastungsbereich, um deinen Skill Floor zu festigen."
+            self.add_modern_chat_bubble("ai", f"🤖 **Coach-Anpassung:** {resp_txt}")
+            self.pick_next_ai_training_map(adaptive_delta=+0.10)
+
+        # Option 2: Overaiming / Sliders -> Tech & Precision Fokus
+        elif chosen_idx == 2:
+            resp_txt = "Alles klar! Ich stelle dein Training auf **Tech & Precision** um, um dein Overaiming und Slider-Timing zu stabilisieren."
+            self.add_modern_chat_bubble("ai", f"🤖 **Coach-Anpassung:** {resp_txt}")
+            self.pick_next_ai_training_map(forced_skill="Tech", adaptive_delta=0.0)
+
+        # Option 3: Zu einem anderen Skillset wechseln
+        elif chosen_idx == 3:
+            # Rotate to next weakness
+            pa = getattr(self, "last_profile_analysis", None) or {}
+            scores = pa.get("scores", {})
+            cur_sk = getattr(self, "ai_training_target_skill", "Streams")
+            remaining_skills = [s for s in ["Aim", "Tech", "Speed", "Reading", "Precision", "Stamina", "Consistency"] if s != cur_sk]
+            next_sk = min(remaining_skills, key=lambda s: scores.get(s, 50)) if scores else "Aim"
+            resp_txt = f"Alles klar! Wir wechseln zum nächsten Problembereich: **{next_sk}**!"
+            self.add_modern_chat_bubble("ai", f"🤖 **Coach-Anpassung:** {resp_txt}")
+            self.pick_next_ai_training_map(forced_skill=next_sk)
+
+        # Option 4: Manuelle Auswahl / Fun
+        else:
+            resp_txt = "Alles klar! Schreib mir einfach kurz im Chat, welche Map, welchen Mod (+DT/+HR/+HD/+EZ) oder welches Star-Rating du jetzt spielen möchtest!"
+            self.add_modern_chat_bubble("ai", f"🤖 **Coach-Anpassung:** {resp_txt}")
     def gather_player_context(self):
         ctx = []
         ctx.append(f"Spieler: {getattr(self, 'osu_username', 'Unbekannt')}")
@@ -6796,6 +6947,9 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
         ctk.CTkLabel(bottom_train_row, text=f"✨ {getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}", font=("Arial", 10), text_color="#888899").pack(side="left")
 
+        ctk.CTkButton(bottom_train_row, text="💬 Feedback-Fragebogen", font=("Arial", 10, "bold"), height=22, corner_radius=6,
+                      fg_color="#222230", hover_color="#303042", text_color="#00E5FF", command=lambda: self.show_ai_question_modal()).pack(side="left", padx=10)
+
         def send_train_msg(event=None):
             import traceback
             try:
@@ -7460,19 +7614,42 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                     self._rounds_since_feedback_prompt = 0
                 self._rounds_since_feedback_prompt += 1
 
-                feedback_inquiry = ""
-                if self._rounds_since_feedback_prompt >= 3:
-                    self._rounds_since_feedback_prompt = 0
-                    feedback_inquiry = "\n\n💡 *Kurze Frage:* Wie hat dir das Pattern dieser Map gefallen und passte es zum Skillset? Klicke gerne auf 👍 oder 👎 unter dieser Nachricht, damit ich dein Training noch passender gestalte!"
+                feedback = f"✅ Runde automatisch erfasst ({played_mods_str})!\nAcc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | Misses: {miss}\n\n🤖 Coach-Analyse:\n{ai_coaching_text}\n\n{mod_warning + chr(10) + chr(10) if mod_warning else ''}{adapt_msg}"
 
-                feedback = f"✅ Runde automatisch erfasst ({played_mods_str})!\nAcc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | Misses: {miss}\n\n🤖 Coach-Analyse:\n{ai_coaching_text}\n\n{mod_warning + chr(10) + chr(10) if mod_warning else ''}{adapt_msg}{feedback_inquiry}"
+                should_ask_question = (self._rounds_since_feedback_prompt >= 2 or miss >= 3)
+                if should_ask_question:
+                    self._rounds_since_feedback_prompt = 0
 
                 def update_feed():
                     if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
                         self.ai_train_sync_lbl.configure(text=f"⚡ Live-Sync: Runde erfasst ({acc:.1f}% / {miss} Miss) ➔ Wähle nächste Map...", text_color="#00E676")
                         self.add_modern_chat_bubble("ai", feedback)
-                        # Automatically select next adjusted map with dynamic skillset rotation & mods!
-                        self.after(1200, lambda: self.pick_next_ai_training_map(adaptive_delta=delta) if hasattr(self, 'ai_train_map_title') and self.ai_train_map_title.winfo_exists() else None)
+                        
+                        if should_ask_question:
+                            if miss >= 3:
+                                q_title = "Worauf möchtest du dich bei der nächsten Map fokussieren?"
+                                q_sub = f"Letzte Map: {map_name[:40]} • {miss} Misses ({acc:.1f}% Acc)"
+                                q_opts = [
+                                    "Tempo drosseln (-15 BPM), um Fingerlocking zu verhindern",
+                                    "Schwierigkeit (-0.3★) senken, um wieder saubere Passes zu spielen",
+                                    "Fokus auf Tech & Slider-Control legen",
+                                    "Zu einem anderen Skillset wechseln (z. B. Jumps/Aim)",
+                                    "Keine Anpassung, aktuelle Map nochmal versuchen"
+                                ]
+                            else:
+                                q_title = "Wie hat sich diese Map für dich angefühlt?"
+                                q_sub = f"Letzte Map: {map_name[:40]} • {acc:.1f}% Acc (Guter Run!)"
+                                q_opts = [
+                                    "Schwierigkeit erhöhen (+0.2★ / mehr Challenge)",
+                                    "Auf diesem Level bleiben und Konstanz festigen",
+                                    "Tempo erhöhen (+DT / +15 BPM Speed)",
+                                    "Zum nächsten Schwachstellen-Skillset weitergehen",
+                                    "Alles perfekt, einfach weiter mit normaler Rotation!"
+                                ]
+                            self.after(1000, lambda: self.show_ai_question_modal(title=q_title, subtitle=q_sub, options=q_opts))
+                        else:
+                            # Automatically select next adjusted map with dynamic skillset rotation & mods!
+                            self.after(1200, lambda: self.pick_next_ai_training_map(adaptive_delta=delta) if hasattr(self, 'ai_train_map_title') and self.ai_train_map_title.winfo_exists() else None)
 
                 self.after(0, update_feed)
             except Exception as e:
@@ -8465,7 +8642,33 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                 except Exception as e:
                     feedback_text = f"Analyse basierend auf Spieler-Statistiken ({username}).\n\nStärken in Aim & Speed. Schwächen in Tech & Stamina.\nEmpfehlung: Trainiere 2020+ Tech-Maps und 3+ Minuten Marathons!"
             else:
-                feedback_text = f"Offline-Analyse für {username}:\n\nTrage deinen Gemini API-Key in den Einstellungen ein für eine 100% präzise KI-Auswertung deiner Top-Plays!"
+                # Dynamic mathematical scoring based on actual top plays distribution
+                dt_count = sum(1 for p in enriched_top_plays if "DT" in p.get("mods", "") or "NC" in p.get("mods", ""))
+                hr_count = sum(1 for p in enriched_top_plays if "HR" in p.get("mods", ""))
+                hd_count = sum(1 for p in enriched_top_plays if "HD" in p.get("mods", ""))
+                fc_count = sum(1 for p in enriched_top_plays if p.get("misses", 0) == 0)
+                tot_p = max(1, len(enriched_top_plays))
+
+                base_lvl = min(90, max(45, int(u_pp ** 0.45 * 2.1))) if u_pp > 0 else 60
+
+                user_scores["Consistency"] = min(98, max(30, int(base_lvl + (fc_count / tot_p * 30) - 10)))
+                user_scores["Speed"] = min(98, max(30, int(base_lvl + (dt_count / tot_p * 35) - 10)))
+                user_scores["Aim"] = min(98, max(30, int(base_lvl + 8)))
+                user_scores["Precision"] = min(98, max(30, int(base_lvl + (hr_count / tot_p * 40) - 12)))
+                user_scores["Reading"] = min(98, max(30, int(base_lvl + (hd_count / tot_p * 30) - 10)))
+                user_scores["Streams"] = min(98, max(30, int(base_lvl - 5)))
+                user_scores["Tech"] = min(98, max(30, int(base_lvl - 10)))
+                user_scores["Stamina"] = min(98, max(30, int(base_lvl - 8)))
+
+                best_sk = max(user_scores, key=user_scores.get)
+                worst_sk = min(user_scores, key=user_scores.get)
+                feedback_text = (
+                    f"📊 **Statistische Profil-Auswertung für {username}:**\n\n"
+                    f"• **Rang:** #{u_rank:,} • **PP:** {u_pp:.1f} pp • **Profil-Acc:** {u_acc:.2f}%\n"
+                    f"• **Stärkstes Skillset:** {best_sk} ({user_scores[best_sk]} Pkt)\n"
+                    f"• **Größter Trainingshebel:** {worst_sk} ({user_scores[worst_sk]} Pkt)\n\n"
+                    f"💡 **Coach-Empfehlung:** Dein Fokus sollte auf {worst_sk} liegen, um deinen Skill Floor spürbar zu erhöhen und Chokes auf schwierigen Rhythmen zu verhindern!"
+                )
 
             # Check if this was the user's own profile
             is_self = (username.lower() == getattr(self, "osu_username", "").lower())
