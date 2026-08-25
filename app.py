@@ -955,6 +955,82 @@ def compute_deep_metrics(parsed):
         'choke_reasons': chokes
     }
 
+def compute_aggregate_deep_telemetry(replays_list):
+    """
+    Computes holistic, cumulative telemetric analysis across ALL plays in the history.
+    """
+    if not replays_list:
+        return None
+
+    total_plays = len(replays_list)
+    total_score = sum(r.get('score', 0) for r in replays_list)
+    avg_acc = sum(r.get('accuracy', 0.0) for r in replays_list) / total_plays
+    total_misses = sum(r.get('misses', 0) for r in replays_list)
+    total_100s = sum(r.get('100s', 0) for r in replays_list)
+    total_50s = sum(r.get('50s', 0) for r in replays_list)
+    total_300s = sum(r.get('300s', 0) for r in replays_list)
+    max_combo = max((r.get('combo', 0) for r in replays_list), default=0)
+
+    # Telemetry metrics aggregation
+    metrics_list = [r.get('metrics', {}) for r in replays_list if r.get('metrics')]
+    if not metrics_list:
+        return None
+
+    avg_overaim = sum(m.get('overaim_pct', 50.0) for m in metrics_list) / len(metrics_list)
+    avg_underaim = sum(m.get('underaim_pct', 50.0) for m in metrics_list) / len(metrics_list)
+    avg_peak_spd = sum(m.get('peak_speed', 0.0) for m in metrics_list) / len(metrics_list)
+    avg_cursor_spd = sum(m.get('avg_speed', 0.0) for m in metrics_list) / len(metrics_list)
+
+    avg_k1_hold = sum(m.get('k1_avg_hold', 50.0) for m in metrics_list) / len(metrics_list)
+    avg_k2_hold = sum(m.get('k2_avg_hold', 50.0) for m in metrics_list) / len(metrics_list)
+    avg_alt_ratio = sum(m.get('alt_ratio', 50.0) for m in metrics_list) / len(metrics_list)
+    avg_ur = sum(m.get('ur', 80.0) for m in metrics_list) / len(metrics_list)
+    avg_early = sum(m.get('early_bias_pct', 50.0) for m in metrics_list) / len(metrics_list)
+
+    # Quadrant heatmaps
+    quad_tl = sum(m.get('quadrants', {}).get('TL', 25.0) for m in metrics_list) / len(metrics_list)
+    quad_tr = sum(m.get('quadrants', {}).get('TR', 25.0) for m in metrics_list) / len(metrics_list)
+    quad_bl = sum(m.get('quadrants', {}).get('BL', 25.0) for m in metrics_list) / len(metrics_list)
+    quad_br = sum(m.get('quadrants', {}).get('BR', 25.0) for m in metrics_list) / len(metrics_list)
+
+    # Collect and rank all systemic choke reasons
+    choke_counter = {}
+    for m in metrics_list:
+        for reason in m.get('choke_reasons', []):
+            if "Keine Frame-Daten" in reason or "Perfekte Cleanliness" in reason:
+                continue
+            choke_counter[reason] = choke_counter.get(reason, 0) + 1
+
+    top_systemic_issues = sorted(choke_counter.items(), key=lambda x: x[1], reverse=True)
+
+    return {
+        'total_plays': total_plays,
+        'total_score': total_score,
+        'avg_acc': round(avg_acc, 2),
+        'total_misses': total_misses,
+        'avg_misses_per_play': round(total_misses / max(1, total_plays), 1),
+        'total_300s': total_300s,
+        'total_100s': total_100s,
+        'total_50s': total_50s,
+        'max_combo': max_combo,
+        'avg_overaim': round(avg_overaim, 1),
+        'avg_underaim': round(avg_underaim, 1),
+        'avg_peak_spd': round(avg_peak_spd, 1),
+        'avg_cursor_spd': round(avg_cursor_spd, 1),
+        'avg_k1_hold': round(avg_k1_hold, 1),
+        'avg_k2_hold': round(avg_k2_hold, 1),
+        'avg_alt_ratio': round(avg_alt_ratio, 1),
+        'avg_ur': round(avg_ur, 1),
+        'avg_early': round(avg_early, 1),
+        'quadrants': {
+            'TL': round(quad_tl, 1),
+            'TR': round(quad_tr, 1),
+            'BL': round(quad_bl, 1),
+            'BR': round(quad_br, 1)
+        },
+        'top_systemic_issues': top_systemic_issues
+    }
+
 def set_windows_autostart(enable=True):
     """Configures UHO Hub to auto-start with Windows in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run."""
     if not winreg:
@@ -1489,8 +1565,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.tester_results = {}
         self.ai_training_history = []
         self.current_ai_training_map = None
-        self.ai_training_target_skill = "Aim"
-        
         # Load save data to restore settings early
         for f in os.listdir('.'):
             if f.startswith("save_data_") and f.endswith(".json"):
@@ -1504,6 +1578,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.delete_replays_var = ctk.BooleanVar(value=is_del)
         self.processed_replays = set()
         self.last_deep_replay_telemetry = None
+        self.deep_replay_history = []
         self._dir_mtimes = {}
 
         # Scan existing replays to initialize baseline
@@ -1521,6 +1596,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.after(1500, self.auto_import_loop)
         
         self.load_global_settings()
+        self.scan_all_local_osu_replays(max_replays=25)
         self.start_cloud_keep_alive()
         self.start_global_play_monitor()
         self.after(3500, self.start_auto_update_checker)
@@ -1531,111 +1607,60 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         else:
             self.show_main_menu()
 
-
-    def start_global_play_monitor(self):
-        """Universal Background Auto-Sync: Monitors osu! plays every 2.5s and automatically updates EVERY feature in the app."""
-        if getattr(self, "_global_play_monitor_running", False):
+    def record_deep_replay_play(self, parsed):
+        """Records a parsed replay into the holistic session history and last telemetry slot."""
+        if not parsed or not isinstance(parsed, dict):
             return
-        self._global_play_monitor_running = True
+        self.last_deep_replay_telemetry = parsed
+        if not hasattr(self, 'deep_replay_history') or not isinstance(self.deep_replay_history, list):
+            self.deep_replay_history = []
+        
+        # Save a clean copy without massive frames array to keep memory and settings small
+        clean = {k: v for k, v in parsed.items() if k != 'frames'}
+        
+        # Check duplicate by timestamp, hash or file path
+        ts = clean.get('timestamp')
+        fpath = clean.get('file_path')
+        score = clean.get('score')
+        exists = False
+        for item in self.deep_replay_history:
+            if ts and item.get('timestamp') == ts:
+                exists = True; break
+            if fpath and item.get('file_path') == fpath:
+                exists = True; break
+            if score and item.get('score') == score and item.get('accuracy') == clean.get('accuracy') and item.get('combo') == clean.get('combo'):
+                exists = True; break
+        
+        if not exists:
+            self.deep_replay_history.insert(0, clean)
+            if len(self.deep_replay_history) > 100:
+                self.deep_replay_history = self.deep_replay_history[:100]
+            self.save_global_settings()
 
-        import time as _time
-        def _monitor_loop():
-            while True:
-                _time.sleep(2.5)
+    def scan_all_local_osu_replays(self, max_replays=35):
+        """Scans osu! Data/r and Replays folders to ingest historical replays for complete multi-play analysis."""
+        import glob
+        try:
+            osu_dirs = find_osu_directories()
+            all_files = []
+            for osu_dir in osu_dirs:
+                targets = [os.path.join(osu_dir, 'Data', 'r'), os.path.join(osu_dir, 'Replays')]
+                for t_dir in targets:
+                    if os.path.exists(t_dir):
+                        files = glob.glob(os.path.join(t_dir, "*.osr"))
+                        for f in files:
+                            all_files.append(f)
+            
+            all_files.sort(key=os.path.getmtime, reverse=True)
+            for fpath in all_files[:max_replays]:
                 try:
-                    user = getattr(self, "osu_username", "")
-                    key = getattr(self, "api_key", "")
-                    if not user or not key:
-                        continue
-
-                    url = f"https://osu.ppy.sh/api/get_user_recent?k={key}&u={user}&m=0&limit=10"
-                    r = requests.get(url, timeout=7)
-                    if r.status_code == 200 and r.json():
-                        plays = r.json()
-                        if isinstance(plays, list) and plays:
-                            last_p = plays[0]
-                            play_id = str(last_p.get("date", "")) + "_" + str(last_p.get("score", ""))
-                            if getattr(self, "_last_global_monitored_play_id", None) != play_id:
-                                self._last_global_monitored_play_id = play_id
-
-                                # 1. Dispatch to Tournament Match if playing
-                                if getattr(self, "tourney_match", {}).get("phase") == "playing":
-                                    try: self.fetch_tourney_recent_plays(silent=True)
-                                    except: pass
-
-                                # 2. Dispatch to Skill-Analyse / Skill-Tester if active
-                                if getattr(self, "current_ai_skill_test", None):
-                                    try: self.fetch_tester_api_plays(silent=True)
-                                    except: pass
-
-                                # 3. Dispatch to KI-Live-Training if active
-                                if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
-                                    try: self.fetch_ai_training_recent_plays(silent=True)
-                                    except: pass
-
-                                # 4. Dispatch to 8-Skill Live Radar
-                                try: self.ai_process_play_for_radar(last_p)
-                                except: pass
+                    p = parse_osr_deep_telemetry(fpath)
+                    if p and p.get('mode', 0) == 0:
+                        self.record_deep_replay_play(p)
                 except Exception:
                     pass
-
-        threading.Thread(target=_monitor_loop, daemon=True).start()
-
-    def start_cloud_keep_alive(self):
-        """Sendet alle 8 Minuten einen schnellen Ping an den Server, damit Render aktiv bleibt."""
-        def _ping_loop():
-            import time
-            time.sleep(5)
-            while True:
-                try:
-                    requests.get(f"{UHO_AUTH_SERVER_URL}/", timeout=15)
-                except:
-                    pass
-                time.sleep(480)
-        threading.Thread(target=_ping_loop, daemon=True).start()
-
-    # ---------------------------------------------------------------------------
-    # OSU! LAZER STYLE GEOMETRIC BACKGROUND
-    # ---------------------------------------------------------------------------
-    def draw_lazer_background(self, parent_frame, width=950, height=720):
-        """Zeichnet dezente, rotierte geometrische Formen im osu! Lazer Stil."""
-        canvas = ctk.CTkCanvas(parent_frame, width=width, height=height, bg="#121216", highlightthickness=0)
-        canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        
-        rng = random.Random(1337)
-        outline_colors = ["#421834", "#521e40", "#3a1630", "#5c2048", "#6e2554"]
-
-        for _ in range(36):
-            x = rng.randint(25, width - 25)
-            y = rng.randint(25, height - 25)
-            size = rng.randint(14, 30)
-            shape_type = rng.choice(["square", "circle", "star", "diamond"])
-            outline = rng.choice(outline_colors)
-            line_w = rng.choice([1.2, 1.6, 2.0])
-            rot = rng.uniform(0, 2 * math.pi)
-
-            if shape_type == "circle":
-                r = size / 2
-                canvas.create_oval(x - r, y - r, x + r, y + r, outline=outline, width=line_w)
-            elif shape_type in ["square", "diamond"]:
-                pts = []
-                half = size / 2
-                for dx, dy in [(-half, -half), (half, -half), (half, half), (-half, half)]:
-                    rx = dx * math.cos(rot) - dy * math.sin(rot)
-                    ry = dx * math.sin(rot) + dy * math.cos(rot)
-                    pts.extend([x + rx, y + ry])
-                canvas.create_polygon(pts, fill="", outline=outline, width=line_w)
-            elif shape_type == "star":
-                pts = []
-                r_outer = size / 2
-                r_inner = r_outer * 0.45
-                for i in range(10):
-                    r = r_outer if i % 2 == 0 else r_inner
-                    ang = rot + i * (math.pi / 5)
-                    pts.extend([x + r * math.cos(ang), y + r * math.sin(ang)])
-                canvas.create_polygon(pts, fill="", outline=outline, width=line_w)
-                
-        return canvas
+        except Exception:
+            pass
 
     def load_global_settings(self):
         appdata = os.environ.get('APPDATA', '')
@@ -1662,6 +1687,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     if 'has_osu_supporter' in data: self.has_osu_supporter = data.get('has_osu_supporter')
                     if data.get('user_setup_profile'): self.user_setup_profile = data.get('user_setup_profile')
                     if data.get('last_deep_replay_telemetry'): self.last_deep_replay_telemetry = data.get('last_deep_replay_telemetry')
+                    if data.get('deep_replay_history'): self.deep_replay_history = data.get('deep_replay_history')
             except: pass
 
     def save_global_settings(self):
@@ -1685,7 +1711,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             'has_analyzed_self': getattr(self, 'has_analyzed_self', False),
             'has_osu_supporter': getattr(self, 'has_osu_supporter', False),
             'user_setup_profile': getattr(self, 'user_setup_profile', {}),
-            'last_deep_replay_telemetry': getattr(self, 'last_deep_replay_telemetry', None)
+            'last_deep_replay_telemetry': getattr(self, 'last_deep_replay_telemetry', None),
+            'deep_replay_history': getattr(self, 'deep_replay_history', [])
         }
         try:
             with open(self.settings_file, 'w', encoding='utf-8') as f:
@@ -2903,30 +2930,26 @@ DEINE ANTWORT-RICHTLINIEN:
         master.pack(fill="both", expand=True)
         self.draw_lazer_background(master)
 
-        frame = ctk.CTkFrame(master, fg_color="#181822", corner_radius=20, border_width=1, border_color="#2e2e3f", width=420, height=590)
+        frame = ctk.CTkFrame(master, fg_color="#181822", corner_radius=20, border_width=1, border_color="#2e2e3f", width=420, height=520)
         frame.place(relx=0.5, rely=0.5, anchor="center")
         frame.pack_propagate(False)
 
-        ctk.CTkLabel(frame, text="UHO Hub", font=("Arial", 32, "bold"), text_color="#3b8ed0").pack(pady=(22, 4))
-        ctk.CTkLabel(frame, text="Dein All-in-One osu! Trainings-Hub", font=("Arial", 12), text_color="#888899").pack(pady=(0, 14))
+        ctk.CTkLabel(frame, text="UHO Hub", font=("Arial", 32, "bold"), text_color="#3b8ed0").pack(pady=(24, 4))
+        ctk.CTkLabel(frame, text="Dein All-in-One osu! Trainings-Hub", font=("Arial", 12), text_color="#888899").pack(pady=(0, 18))
 
-        ctk.CTkButton(frame, text="📈 Training", font=("Arial", 16, "bold"), width=320, height=46, corner_radius=10,
+        ctk.CTkButton(frame, text="📈 Training", font=("Arial", 16, "bold"), width=320, height=48, corner_radius=10,
                       fg_color="#1f538d", hover_color="#14375e",
-                      command=self.show_training_mode_selection).pack(pady=5)
+                      command=self.show_training_mode_selection).pack(pady=7)
 
-        ctk.CTkButton(frame, text="🎯 Skill-Analyse", font=("Arial", 16, "bold"), width=320, height=46, corner_radius=10,
-                      fg_color="#E91E63", hover_color="#C2185B", command=self.show_skill_analyse).pack(pady=5)
+        ctk.CTkButton(frame, text="🎯 Skill-Analyse", font=("Arial", 16, "bold"), width=320, height=48, corner_radius=10,
+                      fg_color="#E91E63", hover_color="#C2185B", command=self.show_skill_analyse).pack(pady=7)
 
-        ctk.CTkButton(frame, text="🌐 Multiplayer", font=("Arial", 16, "bold"), width=320, height=46, corner_radius=10,
+        ctk.CTkButton(frame, text="🌐 Multiplayer", font=("Arial", 16, "bold"), width=320, height=48, corner_radius=10,
                       fg_color="#00BFA5", hover_color="#00897B", text_color="#ffffff",
-                      command=self.show_multiplayer_hub).pack(pady=5)
+                      command=self.show_multiplayer_hub).pack(pady=7)
 
-        ctk.CTkButton(frame, text="🔬 Deep Replay Analyse", font=("Arial", 16, "bold"), width=320, height=46, corner_radius=10,
-                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000",
-                      command=self.show_deep_replay_analyzer).pack(pady=5)
-
-        ctk.CTkButton(frame, text="⚙️ Einstellungen", font=("Arial", 14, "bold"), width=320, height=42, corner_radius=10,
-                      fg_color="#2b2b36", hover_color="#3a3a48", command=self.show_settings).pack(pady=5)
+        ctk.CTkButton(frame, text="⚙️ Einstellungen", font=("Arial", 14, "bold"), width=320, height=44, corner_radius=10,
+                      fg_color="#2b2b36", hover_color="#3a3a48", command=self.show_settings).pack(pady=7)
 
         help_btn = ctk.CTkButton(master, text="?", width=32, height=32, font=("Arial", 16, "bold"),
                                  fg_color="#22222a", hover_color="#333340", text_color="#aaaaaa",
@@ -6479,9 +6502,9 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
     # ---------------------------------------------------------------------------
 
     # ---------------------------------------------------------------------------
-    # DEEP DIVE REPLAY TELEMETRY ANALYZER (ZERO-CLICK • AIM & TAPPING TELEMETRY)
+    # DEEP DIVE REPLAY TELEMETRY ANALYZER (MULTI-PLAY SESSION & HOLISTIC AI COACH)
     # ---------------------------------------------------------------------------
-    def show_deep_replay_analyzer(self, replay_data=None, from_training=False):
+    def show_deep_replay_analyzer(self, selected_replay=None, view_mode="aggregate", from_training=True):
         for widget in self.winfo_children():
             widget.destroy()
 
@@ -6497,216 +6520,396 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
         top_bar.pack(fill="x", padx=20, pady=(15, 10))
         top_bar.pack_propagate(False)
 
-        back_target = self.show_training_mode_selection if from_training else self.show_main_menu
-        back_txt = "⬅ Training" if from_training else "⬅ Hauptmenü"
-        ctk.CTkButton(top_bar, text=back_txt, width=100, height=36, font=("Arial", 13, "bold"),
+        back_target = self.show_training_mode_selection
+        ctk.CTkButton(top_bar, text="⬅ Training", width=100, height=36, font=("Arial", 13, "bold"),
                       fg_color="#25252e", hover_color="#353540", command=back_target).pack(side="left", padx=15, pady=12)
 
-        ctk.CTkLabel(top_bar, text="🔬 Deep Replay Telemetrie & KI-Analyse", font=("Arial", 18, "bold"), text_color="#00E5FF").pack(side="left", padx=10)
-        ctk.CTkLabel(top_bar, text=" ZERO-CLICK • 0% CPU ", font=("Arial", 10, "bold"), fg_color="#00BFA5", text_color="#000000", corner_radius=4).pack(side="left", padx=8)
+        ctk.CTkLabel(top_bar, text="🔬 Deep Replay Telemetrie & KI-Gesamtanalyse", font=("Arial", 18, "bold"), text_color="#00E5FF").pack(side="left", padx=10)
+        ctk.CTkLabel(top_bar, text=" ✨ MULTI-PLAY ANALYSE ", font=("Arial", 10, "bold"), fg_color="#00BFA5", text_color="#000000", corner_radius=4).pack(side="left", padx=8)
 
-        rd = replay_data or getattr(self, "last_deep_replay_telemetry", None)
+        def trigger_re_scan():
+            self.scan_all_local_osu_replays(max_replays=40)
+            self.show_deep_replay_analyzer(view_mode=view_mode)
+
+        def clear_history():
+            self.deep_replay_history = []
+            self.last_deep_replay_telemetry = None
+            self.save_global_settings()
+            self.show_deep_replay_analyzer()
+
+        ctk.CTkButton(top_bar, text="🗑️ Verlauf leeren", width=110, height=32, font=("Arial", 11),
+                      fg_color="#3a1e22", hover_color="#5a222a", text_color="#ff8888", command=clear_history).pack(side="right", padx=(4, 15))
+
+        ctk.CTkButton(top_bar, text="🔄 Replays scannen", width=125, height=32, font=("Arial", 11, "bold"),
+                      fg_color="#1f538d", hover_color="#2b78c9", command=trigger_re_scan).pack(side="right", padx=4)
+
+        history = getattr(self, "deep_replay_history", [])
+        if not history and getattr(self, "last_deep_replay_telemetry", None):
+            self.record_deep_replay_play(self.last_deep_replay_telemetry)
+            history = getattr(self, "deep_replay_history", [])
 
         scroll_container = ctk.CTkScrollableFrame(master, fg_color="transparent")
         scroll_container.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
-        if not rd:
+        if not history:
             empty_box = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2e3f")
             empty_box.pack(fill="both", expand=True, pady=20, padx=10)
 
             ctk.CTkLabel(empty_box, text="⚡ Zero-Click Replay-Scanner ist aktiv!", font=("Arial", 20, "bold"), text_color="#00E5FF").pack(pady=(40, 10))
-            ctk.CTkLabel(empty_box, text="Spiele einfach eine beliebige Runde in osu! Stable (egal welcher Modus).\nDu musst KEIN F2 drücken! UHO Hub erfasst deine Cursor- und Tapping-Daten in Echtzeit.",
+            ctk.CTkLabel(empty_box, text="Spiele einfach eine oder mehrere Runden in osu! Stable (egal welche Map).\nDu musst KEIN F2 drücken! UHO Hub erfasst ALLE deine Plays automatisch und analysiert deine Schwächen ganzheitlich.",
                          font=("Arial", 13), text_color="#cccccc", justify="center").pack(pady=10)
 
-            drop_f = ctk.CTkFrame(empty_box, fg_color="#13131c", corner_radius=12, border_width=2, border_color="#00BFA5", width=420, height=120)
+            drop_f = ctk.CTkFrame(empty_box, fg_color="#13131c", corner_radius=12, border_width=2, border_color="#00BFA5", width=440, height=120)
             drop_f.pack(pady=30)
             drop_f.pack_propagate(False)
 
-            ctk.CTkLabel(drop_f, text="📂 Oder ziehe eine .osr Datei direkt hier hinein", font=("Arial", 13, "bold"), text_color="#00BFA5").pack(expand=True)
+            ctk.CTkLabel(drop_f, text="📂 Oder ziehe eine oder mehrere .osr Dateien hier hinein", font=("Arial", 13, "bold"), text_color="#00BFA5").pack(expand=True)
 
             try:
                 drop_f.drop_target_register(DND_FILES)
                 def on_manual_drop(event):
                     files = self.tk.splitlist(event.data)
-                    if files and files[0].endswith(".osr"):
-                        p = parse_osr_deep_telemetry(files[0])
-                        if p:
-                            self.last_deep_replay_telemetry = p
-                            self.show_deep_replay_analyzer(p)
+                    for f in files:
+                        if f.endswith(".osr"):
+                            p = parse_osr_deep_telemetry(f)
+                            if p:
+                                self.record_deep_replay_play(p)
+                    self.show_deep_replay_analyzer()
                 drop_f.dnd_bind('<<Drop>>', on_manual_drop)
             except Exception:
                 pass
             return
 
-        metrics = rd.get("metrics", {})
+        # Multi-play aggregate calculation
+        agg = compute_aggregate_deep_telemetry(history)
+        p_name = getattr(self, "osu_username", "Spieler")
 
-        # Header Overview Card
-        h_card = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=12, border_width=1, border_color="#2e2e3f")
-        h_card.pack(fill="x", pady=(0, 12))
+        # View Mode Switcher / Banner Bar
+        v_bar = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=12, border_width=1, border_color="#2b2b3c")
+        v_bar.pack(fill="x", pady=(0, 12))
 
-        h_row = ctk.CTkFrame(h_card, fg_color="transparent")
-        h_row.pack(fill="x", padx=18, pady=12)
+        v_inner = ctk.CTkFrame(v_bar, fg_color="transparent")
+        v_inner.pack(fill="x", padx=16, pady=10)
 
-        p_name = rd.get("player", getattr(self, "osu_username", "Spieler"))
-        mods_str = rd.get("mods_str", "None (NM)")
-        acc = rd.get("accuracy", 0.0)
-        score = rd.get("score", 0)
-        combo = rd.get("combo", 0)
-        h300 = rd.get("300s", 0)
-        h100 = rd.get("100s", 0)
-        h50 = rd.get("50s", 0)
-        miss = rd.get("misses", 0)
+        ctk.CTkLabel(v_inner, text=f"📊 Session-Speicher: {len(history)} Plays erfasst", font=("Arial", 13, "bold"), text_color="#00E5FF").pack(side="left")
 
-        left_info = ctk.CTkFrame(h_row, fg_color="transparent")
-        left_info.pack(side="left")
-        ctk.CTkLabel(left_info, text=f"👤 {p_name}", font=("Arial", 16, "bold"), text_color="#ffffff").pack(anchor="w")
-        ctk.CTkLabel(left_info, text=f"🎮 Mods: {mods_str}  •  Frames: {rd.get('total_frames', 0):,}", font=("Arial", 11), text_color="#888899").pack(anchor="w")
+        def set_mode(mode):
+            self.show_deep_replay_analyzer(view_mode=mode)
 
-        right_stats = ctk.CTkFrame(h_row, fg_color="transparent")
-        right_stats.pack(side="right")
-        acc_col = "#00E676" if acc >= 98.0 else ("#FFD700" if acc >= 95.0 else "#FF9800")
-        ctk.CTkLabel(right_stats, text=f"{acc:.2f}% ACC  •  {combo}x Max Combo", font=("Arial", 15, "bold"), text_color=acc_col).pack(anchor="e")
-        ctk.CTkLabel(right_stats, text=f"Score: {score:,}  |  300s: {h300} • 100s: {h100} • 50s: {h50} • Misses: {miss}", font=("Arial", 11), text_color="#aaaaaa").pack(anchor="e")
+        btn_agg_col = "#00E5FF" if view_mode == "aggregate" else "#252530"
+        btn_agg_tcol = "#000000" if view_mode == "aggregate" else "#ffffff"
+        ctk.CTkButton(v_inner, text=f"🔥 Gesamte Session (Alle {len(history)} Plays)", font=("Arial", 12, "bold"), height=30,
+                      fg_color=btn_agg_col, text_color=btn_agg_tcol, hover_color="#00B4D8", command=lambda: set_mode("aggregate")).pack(side="right", padx=4)
 
-        # 2-Column Telemetry Grid (Aim vs Tapping)
-        grid_2col = ctk.CTkFrame(scroll_container, fg_color="transparent")
-        grid_2col.pack(fill="x", pady=(0, 12))
-        grid_2col.grid_columnconfigure(0, weight=1)
-        grid_2col.grid_columnconfigure(1, weight=1)
+        btn_single_col = "#00E5FF" if view_mode == "single" else "#252530"
+        btn_single_tcol = "#000000" if view_mode == "single" else "#ffffff"
+        ctk.CTkButton(v_inner, text="📋 Einzel-Replay Inspector", font=("Arial", 12, "bold"), height=30,
+                      fg_color=btn_single_col, text_color=btn_single_tcol, hover_color="#00B4D8", command=lambda: set_mode("single")).pack(side="right", padx=4)
 
-        # LEFT CARD: AIM & CURSOR DYNAMICS
-        aim_card = ctk.CTkFrame(grid_2col, fg_color="#181822", corner_radius=12, border_width=1, border_color="#E91E63")
-        aim_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        # -------------------------------------------------------------
+        # VIEW 1: AGGREGATE MULTI-PLAY OVERVIEW (Default & Holistic)
+        # -------------------------------------------------------------
+        if view_mode == "aggregate":
+            # Master KPI Card
+            h_card = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=12, border_width=1, border_color="#2e2e3f")
+            h_card.pack(fill="x", pady=(0, 12))
 
-        ctk.CTkLabel(aim_card, text="🎯 Aim- & Cursor-Telemetrie", font=("Arial", 15, "bold"), text_color="#FF4081").pack(anchor="w", padx=16, pady=(14, 8))
+            h_row = ctk.CTkFrame(h_card, fg_color="transparent")
+            h_row.pack(fill="x", padx=18, pady=14)
 
-        over_pct = metrics.get("overaim_pct", 50.0)
-        under_pct = metrics.get("underaim_pct", 50.0)
-        peak_spd = metrics.get("peak_speed", 0.0)
-        avg_spd = metrics.get("avg_speed", 0.0)
-        quads = metrics.get("quadrants", {"TL": 25, "TR": 25, "BL": 25, "BR": 25})
+            left_info = ctk.CTkFrame(h_row, fg_color="transparent")
+            left_info.pack(side="left")
+            ctk.CTkLabel(left_info, text=f"👤 {p_name} • Gesamt-Session Profil", font=("Arial", 17, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(left_info, text=f"🎮 {agg['total_plays']} Plays über alle gespielten Maps zusammengefasst", font=("Arial", 12), text_color="#00E5FF").pack(anchor="w", pady=(2, 0))
 
-        aim_bias_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
-        aim_bias_box.pack(fill="x", padx=16, pady=4)
-        ctk.CTkLabel(aim_bias_box, text=f"Overaim: {over_pct:.1f}%  |  Underaim: {under_pct:.1f}%", font=("Arial", 13, "bold"), text_color="#ffffff").pack(anchor="w", padx=12, pady=(8, 2))
-        
-        aim_desc = "Du überaimst deine Jumps (Cursor fliegt über die Circle-Edge hinaus)." if over_pct > 55.0 else ("Du neigst zu Underaim (Cursor stoppt vor der Circle-Edge)." if over_pct < 45.0 else "Perfekt balancierte Jump-Snaps (50/50 Aim Balance).")
-        ctk.CTkLabel(aim_bias_box, text=aim_desc, font=("Arial", 11), text_color="#00E5FF", justify="left").pack(anchor="w", padx=12, pady=(0, 8))
+            right_stats = ctk.CTkFrame(h_row, fg_color="transparent")
+            right_stats.pack(side="right")
+            acc_col = "#00E676" if agg['avg_acc'] >= 98.0 else ("#FFD700" if agg['avg_acc'] >= 95.0 else "#FF9800")
+            ctk.CTkLabel(right_stats, text=f"Ø {agg['avg_acc']:.2f}% ACC  •  {agg['total_misses']} Misses Gesamt ({agg['avg_misses_per_play']:.1f}/Map)",
+                         font=("Arial", 15, "bold"), text_color=acc_col).pack(anchor="e")
+            ctk.CTkLabel(right_stats, text=f"Max Combo: {agg['max_combo']}x  |  Gesamt-Score: {agg['total_score']:,}  |  300s: {agg['total_300s']} • 100s: {agg['total_100s']} • 50s: {agg['total_50s']}",
+                         font=("Arial", 11), text_color="#aaaaaa").pack(anchor="e", pady=(2, 0))
 
-        spd_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
-        spd_box.pack(fill="x", padx=16, pady=4)
-        ctk.CTkLabel(spd_box, text=f"⚡ Peak Snapping Speed: {peak_spd:,.0f} px/s\n📊 Avg Cursor-Speed: {avg_spd:,.0f} px/s",
-                     font=("Arial", 11, "bold"), text_color="#cccccc", justify="left").pack(anchor="w", padx=12, pady=8)
+            # 2-Column Telemetry Grid (Aim Dynamics vs Tapping Dynamics)
+            grid_2col = ctk.CTkFrame(scroll_container, fg_color="transparent")
+            grid_2col.pack(fill="x", pady=(0, 12))
+            grid_2col.grid_columnconfigure(0, weight=1)
+            grid_2col.grid_columnconfigure(1, weight=1)
 
-        quad_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
-        quad_box.pack(fill="x", padx=16, pady=(4, 14))
-        ctk.CTkLabel(quad_box, text=f"Bildschirm-Verteilung (Heatmap):\n↖ TL: {quads.get('TL', 25)}%  |  ↗ TR: {quads.get('TR', 25)}%\n↙ BL: {quads.get('BL', 25)}%  |  ↘ BR: {quads.get('BR', 25)}%",
-                     font=("Arial", 11), text_color="#888899", justify="left").pack(anchor="w", padx=12, pady=8)
+            # LEFT CARD: AIM & CURSOR DYNAMICS (AGGREGATE)
+            aim_card = ctk.CTkFrame(grid_2col, fg_color="#181822", corner_radius=12, border_width=1, border_color="#E91E63")
+            aim_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        # RIGHT CARD: TAPPING & FINGER CONTROL
-        tap_card = ctk.CTkFrame(grid_2col, fg_color="#181822", corner_radius=12, border_width=1, border_color="#00BFA5")
-        tap_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+            ctk.CTkLabel(aim_card, text="🎯 Systemische Aim- & Cursor-Muster", font=("Arial", 15, "bold"), text_color="#FF4081").pack(anchor="w", padx=16, pady=(14, 8))
 
-        ctk.CTkLabel(tap_card, text="⚡ Tapping & Finger Control", font=("Arial", 15, "bold"), text_color="#00BFA5").pack(anchor="w", padx=16, pady=(14, 8))
-
-        k1_hold = metrics.get("k1_avg_hold", 50.0)
-        k2_hold = metrics.get("k2_avg_hold", 50.0)
-        k1_cnt = metrics.get("k1_count", 0)
-        k2_cnt = metrics.get("k2_count", 0)
-        alt_r = metrics.get("alt_ratio", 50.0)
-        ur_val = metrics.get("ur", 80.0)
-        early_b = metrics.get("early_bias_pct", 50.0)
-
-        ur_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
-        ur_box.pack(fill="x", padx=16, pady=4)
-        ctk.CTkLabel(ur_box, text=f"Unstable Rate (UR): ~{ur_val:.1f} UR  •  Hit Error: {early_b:.0f}% Early", font=("Arial", 13, "bold"), text_color="#00E676").pack(anchor="w", padx=12, pady=(8, 2))
-        ctk.CTkLabel(ur_box, text="Gleichmäßiges Rhythmusgefühl ohne vorzeitiges Rushing.", font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=12, pady=(0, 8))
-
-        hold_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
-        hold_box.pack(fill="x", padx=16, pady=4)
-        ctk.CTkLabel(hold_box, text=f"Tasten-Haltezeit (Hold Time):\n• Taste 1 (K1): {k1_hold:.1f} ms ({k1_cnt} Taps)\n• Taste 2 (K2): {k2_hold:.1f} ms ({k2_cnt} Taps)",
-                     font=("Arial", 11, "bold"), text_color="#cccccc", justify="left").pack(anchor="w", padx=12, pady=8)
-
-        alt_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
-        alt_box.pack(fill="x", padx=16, pady=(4, 14))
-        alt_desc = "Gleichmäßiges Full-Alternating" if alt_r >= 70.0 else ("Hybrid-Singletapping" if alt_r >= 25.0 else "Reines Singletapping")
-        ctk.CTkLabel(alt_box, text=f"Alternating Balance: {alt_r:.1f}%\nStil: {alt_desc}",
-                     font=("Arial", 11), text_color="#888899", justify="left").pack(anchor="w", padx=12, pady=8)
-
-        # Bottom Card: Miss & Choke Root-Cause Analysis
-        choke_card = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=12, border_width=1, border_color="#FF9800")
-        choke_card.pack(fill="x", pady=(0, 12))
-
-        ctk.CTkLabel(choke_card, text="🩸 Miss- & Choke-Ursachenanalyse (Root Cause)", font=("Arial", 15, "bold"), text_color="#FF9800").pack(anchor="w", padx=16, pady=(14, 6))
-
-        choke_reasons = metrics.get("choke_reasons", [])
-        for r in choke_reasons:
-            r_box = ctk.CTkFrame(choke_card, fg_color="#14141c", corner_radius=6)
-            r_box.pack(fill="x", padx=16, pady=3)
-            ctk.CTkLabel(r_box, text=r, font=("Arial", 12), text_color="#ffffff", justify="left").pack(anchor="w", padx=10, pady=6)
-
-        # Bottom AI Deep Diagnosis Box
-        ai_card = ctk.CTkFrame(scroll_container, fg_color="#221826", corner_radius=12, border_width=2, border_color="#9C27B0")
-        ai_card.pack(fill="x", pady=(0, 16))
-
-        ai_header = ctk.CTkFrame(ai_card, fg_color="transparent")
-        ai_header.pack(fill="x", padx=16, pady=(14, 6))
-
-        ctk.CTkLabel(ai_header, text="🤖 Google Gemini KI-Tiefendiagnose & Hardware-Tipps", font=("Arial", 15, "bold"), text_color="#BA68C8").pack(side="left")
-
-        ai_res_box = ctk.CTkTextbox(ai_card, wrap="word", font=("Arial", 12), fg_color="#14141a", border_width=1, border_color="#33243a", corner_radius=8, height=130)
-        ai_res_box.pack(fill="x", padx=16, pady=(4, 10))
-        ai_res_box.insert("1.0", "Klicke auf den Button unten, um deine Cursor- und Tapping-Telemetrie von Google Gemini analysieren zu lassen.")
-        ai_res_box.configure(state="disabled")
-
-        def run_deep_ai():
-            ai_btn.configure(state="disabled", text="⏳ Analysiere Telemetrie...")
+            over_pct = agg["avg_overaim"]
+            under_pct = agg["avg_underaim"]
+            aim_bias_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
+            aim_bias_box.pack(fill="x", padx=16, pady=4)
+            ctk.CTkLabel(aim_bias_box, text=f"Overaim: {over_pct:.1f}%  |  Underaim: {under_pct:.1f}% (Ø über alle Plays)", font=("Arial", 13, "bold"), text_color="#ffffff").pack(anchor="w", padx=12, pady=(8, 2))
             
-            prompt = f"""Du bist der offizielle osu! Pro-Coach für osu! Standard (Mode 0).
-WICHTIG: Antworte ZU 100% AUF DEUTSCH! Verwende osu!-Fachbegriffe präzise.
+            if over_pct > 55.0:
+                aim_desc = f"Du neigst in {over_pct:.0f}% der Jumps zu Overaim (Cursor überschießt das Ziel). Das führt bei schnellen Sprüngen zu Edge-Misses."
+            elif over_pct < 45.0:
+                aim_desc = f"Du neigst in {under_pct:.0f}% der Jumps zu Underaim (Cursor bremst vor dem Zielkreis ab). Mehr Snap-Confidence erforderlich."
+            else:
+                aim_desc = "Exzellent ausbalanciertes Cursor-Snapping über alle gespielten Maps hinweg (50/50 Aim Balance)!"
+            ctk.CTkLabel(aim_bias_box, text=aim_desc, font=("Arial", 11), text_color="#00E5FF", justify="left", wraplength=380).pack(anchor="w", padx=12, pady=(0, 8))
 
-Analysiere diese Deep-Replay Telemetrie des Spielers '{p_name}':
-- Score: {score:,} | Acc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | 50s: {h50} | Misses: {miss}
-- Mods: {mods_str}
-- Aim-Telemetrie: Overaim {over_pct:.1f}% vs Underaim {under_pct:.1f}%, Peak Snapping Speed: {peak_spd:,.0f} px/s
-- Tapping-Telemetrie: K1 Hold: {k1_hold:.1f}ms, K2 Hold: {k2_hold:.1f}ms, Alternating: {alt_r:.1f}%, UR: {ur_val:.1f}
-- Miss-Diagnose: {', '.join(choke_reasons)}
+            spd_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
+            spd_box.pack(fill="x", padx=16, pady=4)
+            ctk.CTkLabel(spd_box, text=f"⚡ Peak Snapping Speed: {agg['avg_peak_spd']:,.0f} px/s\n📊 Durchschnittliche Cursor-Geschwindigkeit: {agg['avg_cursor_spd']:,.0f} px/s",
+                         font=("Arial", 11, "bold"), text_color="#cccccc", justify="left").pack(anchor="w", padx=12, pady=8)
 
-Erstelle eine 4-Punkte Diagnose:
-1. 🎯 Aim & Snapping (Overaim/Underaim Ursache & Korrektur)
-2. ⚡ Tapping-Technik & Finger-Entlastung (Key Hold Time, Finger-Locking, Actuation)
-3. 🛠️ Hardware- & Grip-Empfehlung (Tablet Area Feintuning oder Maus-DPI / Key-Druck)
-4. 🔥 Konkrete Trainingsübung für die nächsten Sessions."""
+            quads = agg["quadrants"]
+            quad_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
+            quad_box.pack(fill="x", padx=16, pady=(4, 14))
+            ctk.CTkLabel(quad_box, text=f"Bildschirm-Aktivität (Heatmap über alle Maps):\n↖ Oben-Links (TL): {quads.get('TL', 25)}%   |   ↗ Oben-Rechts (TR): {quads.get('TR', 25)}%\n↙ Unten-Links (BL): {quads.get('BL', 25)}%   |   ↘ Unten-Rechts (BR): {quads.get('BR', 25)}%",
+                         font=("Arial", 11), text_color="#888899", justify="left").pack(anchor="w", padx=12, pady=8)
 
-            def _req():
-                rep = ""
-                if getattr(self, "gemini_key", ""):
-                    try:
-                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}:generateContent?key={self.gemini_key}"
-                        payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024}}
-                        res = requests.post(url, json=payload, timeout=20).json()
-                        rep = res["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    except Exception:
-                        pass
+            # RIGHT CARD: TAPPING & FINGER CONTROL (AGGREGATE)
+            tap_card = ctk.CTkFrame(grid_2col, fg_color="#181822", corner_radius=12, border_width=1, border_color="#00BFA5")
+            tap_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+            ctk.CTkLabel(tap_card, text="⚡ Systemische Tapping- & Finger-Kontrolle", font=("Arial", 15, "bold"), text_color="#00BFA5").pack(anchor="w", padx=16, pady=(14, 8))
+
+            ur_val = agg["avg_ur"]
+            early_b = agg["avg_early"]
+            ur_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
+            ur_box.pack(fill="x", padx=16, pady=4)
+            ctk.CTkLabel(ur_box, text=f"Unstable Rate (UR): ~{ur_val:.1f} UR  •  Hit-Offset: {early_b:.0f}% Early / {100-early_b:.0f}% Late", font=("Arial", 13, "bold"), text_color="#00E676").pack(anchor="w", padx=12, pady=(8, 2))
+            ur_desc = "Stabiles Rhythmusgefühl ohne systematisches Vorauseilen (Rushing)." if 40 <= early_b <= 60 else ("Du rushst Noten leicht verfrüht (Early Hit Bias)." if early_b > 60 else "Du triffst Noten leicht verzögert (Late Hit Bias).")
+            ctk.CTkLabel(ur_box, text=ur_desc, font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=12, pady=(0, 8))
+
+            k1_hold = agg["avg_k1_hold"]
+            k2_hold = agg["avg_k2_hold"]
+            hold_gap = abs(k1_hold - k2_hold)
+            hold_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
+            hold_box.pack(fill="x", padx=16, pady=4)
+            gap_txt = f" (⚠️ {hold_gap:.1f}ms Asymmetrie!)" if hold_gap > 15.0 else " (Ausbalanciert)"
+            ctk.CTkLabel(hold_box, text=f"Tasten-Haltezeiten (Hold Time):\n• Taste 1 (K1): {k1_hold:.1f} ms\n• Taste 2 (K2): {k2_hold:.1f} ms{gap_txt}",
+                         font=("Arial", 11, "bold"), text_color="#cccccc", justify="left").pack(anchor="w", padx=12, pady=8)
+
+            alt_r = agg["avg_alt_ratio"]
+            alt_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
+            alt_box.pack(fill="x", padx=16, pady=(4, 14))
+            alt_desc = "Gleichmäßiges Full-Alternating" if alt_r >= 70.0 else ("Hybrid-Singletapping" if alt_r >= 25.0 else "Reines Singletapping")
+            ctk.CTkLabel(alt_box, text=f"Alternating Balance: {alt_r:.1f}%\nStil: {alt_desc}",
+                         font=("Arial", 11), text_color="#888899", justify="left").pack(anchor="w", padx=12, pady=8)
+
+            # Bottom Card: Systemic Choke & Miss Breakdown across all plays
+            choke_card = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=12, border_width=1, border_color="#FF9800")
+            choke_card.pack(fill="x", pady=(0, 12))
+
+            choke_hdr = ctk.CTkFrame(choke_card, fg_color="transparent")
+            choke_hdr.pack(fill="x", padx=16, pady=(14, 6))
+            ctk.CTkLabel(choke_hdr, text="🩸 Systemische Fehlerquellen (Über alle Maps gehäuft)", font=("Arial", 15, "bold"), text_color="#FF9800").pack(side="left")
+
+            issues = agg["top_systemic_issues"]
+            if not issues:
+                ctk.CTkLabel(choke_card, text="✨ Keine wiederkehrenden kritischen Choke-Muster festgestellt. Sehr saubere Spielweise!", font=("Arial", 12), text_color="#00E676").pack(padx=16, pady=10)
+            else:
+                for issue_txt, count in issues:
+                    pct = round((count / max(1, agg['total_plays'])) * 100)
+                    r_box = ctk.CTkFrame(choke_card, fg_color="#14141c", corner_radius=6)
+                    r_box.pack(fill="x", padx=16, pady=3)
+                    ctk.CTkLabel(r_box, text=f"[{count}x in {agg['total_plays']} Maps • {pct}%]", font=("Arial", 10, "bold"), fg_color="#331c1c", text_color="#FF5252", corner_radius=4).pack(side="left", padx=8, pady=6)
+                    ctk.CTkLabel(r_box, text=issue_txt, font=("Arial", 12), text_color="#ffffff", justify="left").pack(side="left", padx=4, pady=6)
+
+            # Bottom AI Deep Diagnosis Box (Holistic AI Coaching across all plays)
+            ai_card = ctk.CTkFrame(scroll_container, fg_color="#221826", corner_radius=12, border_width=2, border_color="#9C27B0")
+            ai_card.pack(fill="x", pady=(0, 16))
+
+            ai_header = ctk.CTkFrame(ai_card, fg_color="transparent")
+            ai_header.pack(fill="x", padx=16, pady=(14, 6))
+            ctk.CTkLabel(ai_header, text=f"🤖 Google Gemini KI-Gesamtdiagnose ({agg['total_plays']} Plays ausgewertet)", font=("Arial", 15, "bold"), text_color="#BA68C8").pack(side="left")
+
+            ai_res_box = ctk.CTkTextbox(ai_card, wrap="word", font=("Arial", 12), fg_color="#14141a", border_width=1, border_color="#33243a", corner_radius=8, height=160)
+            ai_res_box.pack(fill="x", padx=16, pady=(4, 10))
+            ai_res_box.insert("1.0", "Klicke auf den Button unten, um eine umfassende KI-Gesamtdiagnose deiner Spielweise über ALLE gespeicherten Replays zu erhalten.")
+            ai_res_box.configure(state="disabled")
+
+            def run_aggregate_ai():
+                ai_btn.configure(state="disabled", text="⏳ Analysiere alle Plays mit Google Gemini...")
                 
-                if not rep:
-                    rep = f"🎯 **Aim:** Mit {over_pct:.1f}% Overaim ziehst du bei schnellen Jumps minimal über das Ziel hinaus. Reduziere deine Tablet-Area um ca. 2-3mm in der Breite oder halte den Stift etwas tiefer.\n\n⚡ **Tapping:** Deine Hold-Times (K1: {k1_hold:.1f}ms / K2: {k2_hold:.1f}ms) sind solide. Vermeide zu starken Fingerdruck auf den Tasten.\n\n🔥 **Trainings-Fokus:** Übe Jump-Maps mit hohem CS (CS 4.8+) bei moderatem BPM, um das Center-Snapping zu perfektionieren."
+                prompt = f"""Du bist der offizielle Cheftrainer und Pro-Coach für osu! Standard (Mode 0).
+WICHTIG: Antworte ZU 100% AUF DEUTSCH! Verwende präzise osu!-Terminologie.
 
-                def _done():
-                    if ai_res_box.winfo_exists():
-                        ai_res_box.configure(state="normal")
-                        ai_res_box.delete("1.0", "end")
-                        ai_res_box.insert("1.0", rep)
-                        ai_res_box.configure(state="disabled")
-                    if ai_btn.winfo_exists():
-                        ai_btn.configure(state="normal", text="🔄 Diagnose aktualisieren")
-                self.after(0, _done)
+Du analysierst die GESAMTE SESSION / HISTORIE des Spielers '{p_name}' über ALLE {agg['total_plays']} gespielten Replays zusammengefasst:
+- Gesamt-Statistik: {agg['total_plays']} Maps gespielt | Ø Accuracy: {agg['avg_acc']:.2f}% | Gesamt-Misses: {agg['total_misses']} (Ø {agg['avg_misses_per_play']:.1f} Miss/Map) | Max Combo: {agg['max_combo']}x
+- Aim-Telemetrie über alle Maps: Overaim {over_pct:.1f}% vs Underaim {under_pct:.1f}% | Peak Snapping Speed: {agg['avg_peak_spd']:,.0f} px/s | Avg Cursor Speed: {agg['avg_cursor_spd']:,.0f} px/s
+- Tapping-Telemetrie über alle Maps: K1 Hold: {k1_hold:.1f}ms | K2 Hold: {k2_hold:.1f}ms (Asymmetrie-Gap: {hold_gap:.1f}ms) | Alternating Balance: {alt_r:.1f}% | Unstable Rate: ~{ur_val:.1f} UR
+- Häufigste Choke-Muster über alle Maps: {', '.join([f'{txt} ({c}x)' for txt, c in issues]) if issues else 'Keine akuten Chokes'}
 
-            threading.Thread(target=_req, daemon=True).start()
+Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
+1. 🎯 Ganzheitliche Aim-Muster (Systematische Overaim/Underaim Tendenzen & Cursor-Snapping über alle Maps)
+2. ⚡ Tapping-Technik & Finger-Stamina (K1/K2 Asymmetrie, Tastatur-Druck, Notelock-Gefahr)
+3. 🩸 Hauptursachen für Misses im Schnitt (Woran scheitert der Spieler am häufigsten?)
+4. 🛠️ Hardware-, Grip- & Setup-Empfehlung (Tablet-Area Feintuning, Maus-DPI / Polling Rate, Tastatur-Settings)
+5. 🔥 Konkreter 3-Tage Trainings- und Ausbesserungsplan."""
 
-        ai_btn = ctk.CTkButton(ai_card, text="✨ KI-Tiefendiagnose generieren ➔", font=("Arial", 13, "bold"), height=38,
-                               fg_color="#9C27B0", hover_color="#7B1FA2", command=run_deep_ai)
-        ai_btn.pack(padx=16, pady=(0, 14), fill="x")
+                def _req():
+                    rep = ""
+                    if getattr(self, "gemini_key", ""):
+                        try:
+                            g_model = getattr(self, "selected_ai_model", "gemini-3.6-flash")
+                            url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self.gemini_key}"
+                            payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1200}}
+                            res = requests.post(url, json=payload, timeout=25).json()
+                            rep = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        except Exception:
+                            pass
+                    
+                    if not rep:
+                        rep = f"🎯 **Aim:** Über alle {agg['total_plays']} Maps zeigt sich ein systematischer Overaim von {over_pct:.1f}%. Reduziere deine Tablet-Area um ca. 2mm in der Breite, um die Jump-Stabilität zu erhöhen.\n\n⚡ **Tapping:** Deine Hold-Times (K1: {k1_hold:.1f}ms / K2: {k2_hold:.1f}ms) weisen einen Versatz von {hold_gap:.1f}ms auf. Achte auf gleichmäßigen Fingerdruck bei Streams.\n\n🩸 **Miss-Ursachen:** Die meisten Fehler entstehen durch Dekompensation bei schnellen Jump-Winkeln.\n\n🔥 **Trainings-Fokus:** Absolviere täglich 15 Minuten gezieltes CS 4.8+ Jump-Training und 180-200 BPM Finger-Control Maps."
+
+                    def _done():
+                        if ai_res_box.winfo_exists():
+                            ai_res_box.configure(state="normal")
+                            ai_res_box.delete("1.0", "end")
+                            ai_res_box.insert("1.0", rep)
+                            ai_res_box.configure(state="disabled")
+                        if ai_btn.winfo_exists():
+                            ai_btn.configure(state="normal", text="🔄 Gesamt-Diagnose aktualisieren")
+                    self.after(0, _done)
+
+                threading.Thread(target=_req, daemon=True).start()
+
+            ai_btn = ctk.CTkButton(ai_card, text="✨ Ganzheitliche KI-Gesamtdiagnose generieren ➔", font=("Arial", 13, "bold"), height=38,
+                                   fg_color="#9C27B0", hover_color="#7B1FA2", command=run_aggregate_ai)
+            ai_btn.pack(padx=16, pady=(0, 14), fill="x")
+
+        # -------------------------------------------------------------
+        # VIEW 2: SINGLE REPLAY INSPECTOR
+        # -------------------------------------------------------------
+        else:
+            cur_rd = selected_replay or history[0]
+            metrics = cur_rd.get("metrics", {})
+
+            # Play selection listbox / selector
+            sel_card = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=12, border_width=1, border_color="#2e2e3f")
+            sel_card.pack(fill="x", pady=(0, 12))
+
+            sel_hdr = ctk.CTkFrame(sel_card, fg_color="transparent")
+            sel_hdr.pack(fill="x", padx=16, pady=10)
+            ctk.CTkLabel(sel_hdr, text="📋 Wähle ein Replay aus dem Verlauf:", font=("Arial", 13, "bold"), text_color="#ffffff").pack(side="left")
+
+            replay_labels = []
+            for i, r in enumerate(history[:20]):
+                m_str = r.get("mods_str", "NM")
+                replay_labels.append(f"Play #{i+1}: {r.get('accuracy', 0):.1f}% ACC • {r.get('score', 0):,} Score • {r.get('misses', 0)} Miss ({m_str})")
+
+            def on_sel_change(val):
+                idx = replay_labels.index(val) if val in replay_labels else 0
+                self.show_deep_replay_analyzer(selected_replay=history[idx], view_mode="single")
+
+            cur_lbl = replay_labels[0]
+            if selected_replay in history:
+                cur_lbl = replay_labels[history.index(selected_replay)]
+
+            combo_sel = ctk.CTkComboBox(sel_hdr, values=replay_labels, width=420, height=32, font=("Arial", 11), command=on_sel_change)
+            combo_sel.set(cur_lbl)
+            combo_sel.pack(side="right")
+
+            # Single Play Card
+            h_card = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=12, border_width=1, border_color="#2e2e3f")
+            h_card.pack(fill="x", pady=(0, 12))
+
+            h_row = ctk.CTkFrame(h_card, fg_color="transparent")
+            h_row.pack(fill="x", padx=18, pady=12)
+
+            acc = cur_rd.get("accuracy", 0.0)
+            score = cur_rd.get("score", 0)
+            combo = cur_rd.get("combo", 0)
+            h300 = cur_rd.get("300s", 0)
+            h100 = cur_rd.get("100s", 0)
+            h50 = cur_rd.get("50s", 0)
+            miss = cur_rd.get("misses", 0)
+            mods_str = cur_rd.get("mods_str", "None (NM)")
+
+            left_info = ctk.CTkFrame(h_row, fg_color="transparent")
+            left_info.pack(side="left")
+            ctk.CTkLabel(left_info, text=f"👤 {cur_rd.get('player', p_name)} (Einzel-Play)", font=("Arial", 16, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(left_info, text=f"🎮 Mods: {mods_str}  •  Frames: {cur_rd.get('total_frames', 0):,}", font=("Arial", 11), text_color="#888899").pack(anchor="w")
+
+            right_stats = ctk.CTkFrame(h_row, fg_color="transparent")
+            right_stats.pack(side="right")
+            acc_col = "#00E676" if acc >= 98.0 else ("#FFD700" if acc >= 95.0 else "#FF9800")
+            ctk.CTkLabel(right_stats, text=f"{acc:.2f}% ACC  •  {combo}x Max Combo", font=("Arial", 15, "bold"), text_color=acc_col).pack(anchor="e")
+            ctk.CTkLabel(right_stats, text=f"Score: {score:,}  |  300s: {h300} • 100s: {h100} • 50s: {h50} • Misses: {miss}", font=("Arial", 11), text_color="#aaaaaa").pack(anchor="e")
+
+            # Single Play 2-Column Telemetry Grid
+            grid_2col = ctk.CTkFrame(scroll_container, fg_color="transparent")
+            grid_2col.pack(fill="x", pady=(0, 12))
+            grid_2col.grid_columnconfigure(0, weight=1)
+            grid_2col.grid_columnconfigure(1, weight=1)
+
+            # LEFT CARD: AIM & CURSOR DYNAMICS
+            aim_card = ctk.CTkFrame(grid_2col, fg_color="#181822", corner_radius=12, border_width=1, border_color="#E91E63")
+            aim_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            ctk.CTkLabel(aim_card, text="🎯 Aim- & Cursor-Telemetrie", font=("Arial", 15, "bold"), text_color="#FF4081").pack(anchor="w", padx=16, pady=(14, 8))
+
+            over_pct = metrics.get("overaim_pct", 50.0)
+            under_pct = metrics.get("underaim_pct", 50.0)
+            peak_spd = metrics.get("peak_speed", 0.0)
+            avg_spd = metrics.get("avg_speed", 0.0)
+            quads = metrics.get("quadrants", {"TL": 25, "TR": 25, "BL": 25, "BR": 25})
+
+            aim_bias_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
+            aim_bias_box.pack(fill="x", padx=16, pady=4)
+            ctk.CTkLabel(aim_bias_box, text=f"Overaim: {over_pct:.1f}%  |  Underaim: {under_pct:.1f}%", font=("Arial", 13, "bold"), text_color="#ffffff").pack(anchor="w", padx=12, pady=(8, 2))
+            aim_desc = "Du überaimst deine Jumps (Cursor fliegt über die Circle-Edge hinaus)." if over_pct > 55.0 else ("Du neigst zu Underaim (Cursor stoppt vor der Circle-Edge)." if over_pct < 45.0 else "Perfekt balancierte Jump-Snaps (50/50 Aim Balance).")
+            ctk.CTkLabel(aim_bias_box, text=aim_desc, font=("Arial", 11), text_color="#00E5FF", justify="left").pack(anchor="w", padx=12, pady=(0, 8))
+
+            spd_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
+            spd_box.pack(fill="x", padx=16, pady=4)
+            ctk.CTkLabel(spd_box, text=f"⚡ Peak Snapping Speed: {peak_spd:,.0f} px/s\n📊 Avg Cursor-Speed: {avg_spd:,.0f} px/s",
+                         font=("Arial", 11, "bold"), text_color="#cccccc", justify="left").pack(anchor="w", padx=12, pady=8)
+
+            quad_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
+            quad_box.pack(fill="x", padx=16, pady=(4, 14))
+            ctk.CTkLabel(quad_box, text=f"Bildschirm-Verteilung (Heatmap):\n↖ TL: {quads.get('TL', 25)}%  |  ↗ TR: {quads.get('TR', 25)}%\n↙ BL: {quads.get('BL', 25)}%  |  ↘ BR: {quads.get('BR', 25)}%",
+                         font=("Arial", 11), text_color="#888899", justify="left").pack(anchor="w", padx=12, pady=8)
+
+            # RIGHT CARD: TAPPING & FINGER CONTROL
+            tap_card = ctk.CTkFrame(grid_2col, fg_color="#181822", corner_radius=12, border_width=1, border_color="#00BFA5")
+            tap_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+            ctk.CTkLabel(tap_card, text="⚡ Tapping & Finger Control", font=("Arial", 15, "bold"), text_color="#00BFA5").pack(anchor="w", padx=16, pady=(14, 8))
+
+            k1_hold = metrics.get("k1_avg_hold", 50.0)
+            k2_hold = metrics.get("k2_avg_hold", 50.0)
+            k1_cnt = metrics.get("k1_count", 0)
+            k2_cnt = metrics.get("k2_count", 0)
+            alt_r = metrics.get("alt_ratio", 50.0)
+            ur_val = metrics.get("ur", 80.0)
+            early_b = metrics.get("early_bias_pct", 50.0)
+
+            ur_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
+            ur_box.pack(fill="x", padx=16, pady=4)
+            ctk.CTkLabel(ur_box, text=f"Unstable Rate (UR): ~{ur_val:.1f} UR  •  Hit Error: {early_b:.0f}% Early", font=("Arial", 13, "bold"), text_color="#00E676").pack(anchor="w", padx=12, pady=(8, 2))
+            ctk.CTkLabel(ur_box, text="Gleichmäßiges Rhythmusgefühl ohne vorzeitiges Rushing.", font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=12, pady=(0, 8))
+
+            hold_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
+            hold_box.pack(fill="x", padx=16, pady=4)
+            ctk.CTkLabel(hold_box, text=f"Tasten-Haltezeit (Hold Time):\n• Taste 1 (K1): {k1_hold:.1f} ms ({k1_cnt} Taps)\n• Taste 2 (K2): {k2_hold:.1f} ms ({k2_cnt} Taps)",
+                         font=("Arial", 11, "bold"), text_color="#cccccc", justify="left").pack(anchor="w", padx=12, pady=8)
+
+            alt_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
+            alt_box.pack(fill="x", padx=16, pady=(4, 14))
+            alt_desc = "Gleichmäßiges Full-Alternating" if alt_r >= 70.0 else ("Hybrid-Singletapping" if alt_r >= 25.0 else "Reines Singletapping")
+            ctk.CTkLabel(alt_box, text=f"Alternating Balance: {alt_r:.1f}%\nStil: {alt_desc}",
+                         font=("Arial", 11), text_color="#888899", justify="left").pack(anchor="w", padx=12, pady=8)
+
+            # Bottom Card: Miss & Choke Root-Cause Analysis for this single play
+            choke_card = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=12, border_width=1, border_color="#FF9800")
+            choke_card.pack(fill="x", pady=(0, 12))
+            ctk.CTkLabel(choke_card, text="🩸 Miss- & Choke-Ursachenanalyse (Dieses Replay)", font=("Arial", 15, "bold"), text_color="#FF9800").pack(anchor="w", padx=16, pady=(14, 6))
+
+            choke_reasons = metrics.get("choke_reasons", [])
+            for r in choke_reasons:
+                r_box = ctk.CTkFrame(choke_card, fg_color="#14141c", corner_radius=6)
+                r_box.pack(fill="x", padx=16, pady=3)
+                ctk.CTkLabel(r_box, text=r, font=("Arial", 12), text_color="#ffffff", justify="left").pack(anchor="w", padx=10, pady=6)
 
     # ---------------------------------------------------------------------------
     # MASTER SKILL-ANALYSE (SCHRITT 1: PROFIL -> SCHRITT 2: TEST -> PERMANENT RADAR)
@@ -8029,7 +8232,7 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
             if not parsed or parsed.get('mode', 0) != 0:
                 return
 
-            self.last_deep_replay_telemetry = parsed
+            self.record_deep_replay_play(parsed)
 
             # 1. Level-Training Replay
             if hasattr(self, 'current_level_idx') and getattr(self, "save_file", ""):
