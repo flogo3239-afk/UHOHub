@@ -4564,8 +4564,8 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                           fg_color="#3b8ed0", hover_color="#1f538d", command=self.show_tourney_post_match_modal).pack(side="right", padx=10, pady=6)
 
     def render_mappool_cards(self):
-        for w in self.tourney_pool_scroll.winfo_children():
-            w.destroy()
+        if not hasattr(self, "tourney_pool_scroll") or not self.tourney_pool_scroll.winfo_exists():
+            return
 
         m = self.tourney_match
         pool = m["pool"]
@@ -4583,6 +4583,89 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             'FL': ('Flashlight (FL)', '#FFEB3B'),
             'Other': ('Spezial / Custom', '#AAAAAA')
         }
+
+        # Check if widgets already built
+        if not hasattr(self, "_tourney_card_widgets"):
+            self._tourney_card_widgets = {}
+
+        # If already built and pool length matches, update in-place without destroying frames (ZERO FLICKER!)
+        if len(self._tourney_card_widgets) == len(pool):
+            for slot, map_data in pool.items():
+                w_info = self._tourney_card_widgets.get(slot)
+                if not w_info or not w_info.get("card") or not w_info["card"].winfo_exists():
+                    continue
+
+                st = map_data.get("state", "available")
+                card = w_info["card"]
+                action_frame = w_info["action_frame"]
+                col = w_info["col"]
+
+                card_bg = "#1a1a24"
+                b_border = "#262638"
+                if "won_player" in st:
+                    card_bg = "#122a1e"
+                    b_border = "#00E676"
+                elif "won_bot" in st:
+                    card_bg = "#2a141e"
+                    b_border = "#FF4081"
+                elif "banned" in st:
+                    card_bg = "#221616"
+                    b_border = "#772222"
+                elif "protected_player" in st:
+                    card_bg = "#102830"
+                    b_border = "#00E5FF"
+                elif "protected_bot" in st:
+                    card_bg = "#25182e"
+                    b_border = "#BA68C8"
+                elif slot == m.get("current_pick"):
+                    card_bg = "#262214"
+                    b_border = "#FFD700"
+
+                card.configure(fg_color=card_bg, border_color=b_border)
+
+                # Clear only action buttons in action_frame
+                for child in action_frame.winfo_children():
+                    child.destroy()
+
+                if st == "available":
+                    if phase == "protect" and m["turn"] == "player" and slot != "TB":
+                        def make_prot(s=slot): return lambda: self.tourney_player_do_protect(s)
+                        ctk.CTkButton(action_frame, text="🛡️ Save", width=54, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=2)
+                    elif phase == "ban" and m["turn"] == "player" and slot != "TB":
+                        def make_ban(s=slot): return lambda: self.tourney_player_do_ban(s)
+                        ctk.CTkButton(action_frame, text="🚫 Ban", width=48, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=2)
+                    elif phase == "pick" and m["turn"] == "player" and slot != "TB":
+                        def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
+                elif st == "protected_player":
+                    if phase == "pick" and m["turn"] == "player" and slot != "TB":
+                        def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
+                    ctk.CTkLabel(action_frame, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 10, "bold"), text_color="#00E5FF").pack(side="right", padx=4)
+                elif st == "protected_bot":
+                    if phase == "pick" and m["turn"] == "player" and slot != "TB":
+                        def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
+                    ctk.CTkLabel(action_frame, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#BA68C8").pack(side="right", padx=4)
+                elif st == "banned_player":
+                    ctk.CTkLabel(action_frame, text="🚫 BANNED (Du)", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
+                elif st == "banned_bot":
+                    ctk.CTkLabel(action_frame, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
+                elif st == "won_player":
+                    ctk.CTkLabel(action_frame, text="✅ GEWONNEN", font=("Arial", 10, "bold"), text_color="#00E676").pack(side="right", padx=4)
+                elif st == "won_bot":
+                    ctk.CTkLabel(action_frame, text=f"❌ VERLOREN", font=("Arial", 10, "bold"), text_color="#FF4081").pack(side="right", padx=4)
+            return
+
+        # Initial build
+        for w in self.tourney_pool_scroll.winfo_children():
+            w.destroy()
+        self._tourney_card_widgets = {}
 
         def get_slot_sort_key(s):
             for p in mod_order:
@@ -4664,39 +4747,48 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 ctk.CTkButton(c_row, text="🌐 web", width=44, height=22, font=("Arial", 9, "bold"),
                               fg_color="#2b2b38", hover_color="#3a3a4c", command=make_web).pack(side="right", padx=(2, 0))
 
+                action_frame = ctk.CTkFrame(c_row, fg_color="transparent")
+                action_frame.pack(side="right")
+
+                self._tourney_card_widgets[slot] = {
+                    "card": card,
+                    "action_frame": action_frame,
+                    "col": col
+                }
+
                 if st == "available":
                     if phase == "protect" and m["turn"] == "player" and slot != "TB":
                         def make_prot(s=slot): return lambda: self.tourney_player_do_protect(s)
-                        ctk.CTkButton(c_row, text="🛡️ Save", width=54, height=22, font=("Arial", 10, "bold"),
+                        ctk.CTkButton(action_frame, text="🛡️ Save", width=54, height=22, font=("Arial", 10, "bold"),
                                       fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=2)
                     elif phase == "ban" and m["turn"] == "player" and slot != "TB":
                         def make_ban(s=slot): return lambda: self.tourney_player_do_ban(s)
-                        ctk.CTkButton(c_row, text="🚫 Ban", width=48, height=22, font=("Arial", 10, "bold"),
+                        ctk.CTkButton(action_frame, text="🚫 Ban", width=48, height=22, font=("Arial", 10, "bold"),
                                       fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=2)
                     elif phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(c_row, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
                                       fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
                 elif st == "protected_player":
                     if phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(c_row, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
                                       fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
-                    ctk.CTkLabel(c_row, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 10, "bold"), text_color="#00E5FF").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 10, "bold"), text_color="#00E5FF").pack(side="right", padx=4)
                 elif st == "protected_bot":
                     if phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(c_row, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
+                        ctk.CTkButton(action_frame, text="🎯 Pick", width=48, height=22, font=("Arial", 10, "bold"),
                                       fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=2)
-                    ctk.CTkLabel(c_row, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#BA68C8").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#BA68C8").pack(side="right", padx=4)
                 elif st == "banned_player":
-                    ctk.CTkLabel(c_row, text="🚫 BANNED (Du)", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text="🚫 BANNED (Du)", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
                 elif st == "banned_bot":
-                    ctk.CTkLabel(c_row, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 10, "bold"), text_color="#FF5252").pack(side="right", padx=4)
                 elif st == "won_player":
-                    ctk.CTkLabel(c_row, text="✅ GEWONNEN", font=("Arial", 10, "bold"), text_color="#00E676").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text="✅ GEWONNEN", font=("Arial", 10, "bold"), text_color="#00E676").pack(side="right", padx=4)
                 elif st == "won_bot":
-                    ctk.CTkLabel(c_row, text=f"❌ VERLOREN", font=("Arial", 10, "bold"), text_color="#FF4081").pack(side="right", padx=4)
+                    ctk.CTkLabel(action_frame, text=f"❌ VERLOREN", font=("Arial", 10, "bold"), text_color="#FF4081").pack(side="right", padx=4)
 
     def tourney_do_roll(self):
         m = self.tourney_match
@@ -7452,11 +7544,36 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
     def render_ai_test_maps(self):
         if not hasattr(self, 'tester_maps_scroll') or not self.tester_maps_scroll.winfo_exists():
             return
-        for w in self.tester_maps_scroll.winfo_children():
-            w.destroy()
 
         if not getattr(self, "current_ai_skill_test", None):
             return
+
+        # Check if cards are already built
+        if not hasattr(self, "_tester_card_widgets"):
+            self._tester_card_widgets = {}
+
+        # If already built and matches test maps count, update in-place without destroying frames (ZERO FLICKER!)
+        if len(self._tester_card_widgets) == len(self.current_ai_skill_test):
+            for category, m_info in self.current_ai_skill_test.items():
+                w_dict = self._tester_card_widgets.get(category)
+                if w_dict and w_dict.get("status_frame") and w_dict["status_frame"].winfo_exists():
+                    sub = self.skill_tester_submissions.get(category)
+                    s_frame = w_dict["status_frame"]
+                    for child in s_frame.winfo_children():
+                        child.destroy()
+                    if sub:
+                        sc = sub.get('skill_score', calculate_skill_test_score(sub.get('acc', 0), sub.get('misses', 0)))
+                        sub_col = "#00E676" if sc >= 80 else ("#00E5FF" if sc >= 65 else ("#FFA726" if sc >= 50 else "#FF5252"))
+                        ctk.CTkLabel(s_frame, text=f"🎯 Score: {sc:.0f}/100\n({sub.get('acc', 0):.1f}% • {sub.get('misses', 0)} Miss)",
+                                     font=("Arial", 10, "bold"), text_color=sub_col, justify="center").pack(side="right")
+                    else:
+                        ctk.CTkLabel(s_frame, text="⏳ Offen", font=("Arial", 10), text_color="#777788").pack(side="right")
+            return
+
+        # Initial build
+        for w in self.tester_maps_scroll.winfo_children():
+            w.destroy()
+        self._tester_card_widgets = {}
 
         for category, m_info in self.current_ai_skill_test.items():
             card = ctk.CTkFrame(self.tester_maps_scroll, fg_color="#1c1c26", corner_radius=10, border_width=1, border_color="#2e2e3f")
@@ -7473,14 +7590,19 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
             ctk.CTkButton(right_side, text="osu!direct", width=80, height=28, font=("Arial", 11, "bold"),
                           fg_color="#FF66AA", hover_color="#C2185B", command=open_direct).pack(side="right")
 
+            status_frame = ctk.CTkFrame(right_side, fg_color="transparent")
+            status_frame.pack(side="right", padx=6)
+
             sub = self.skill_tester_submissions.get(category)
             if sub:
                 sc = sub.get('skill_score', calculate_skill_test_score(sub.get('acc', 0), sub.get('misses', 0)))
                 sub_col = "#00E676" if sc >= 80 else ("#00E5FF" if sc >= 65 else ("#FFA726" if sc >= 50 else "#FF5252"))
-                ctk.CTkLabel(right_side, text=f"🎯 Score: {sc:.0f}/100\n({sub.get('acc', 0):.1f}% • {sub.get('misses', 0)} Miss)",
-                             font=("Arial", 10, "bold"), text_color=sub_col, justify="center").pack(side="right", padx=6)
+                ctk.CTkLabel(status_frame, text=f"🎯 Score: {sc:.0f}/100\n({sub.get('acc', 0):.1f}% • {sub.get('misses', 0)} Miss)",
+                             font=("Arial", 10, "bold"), text_color=sub_col, justify="center").pack(side="right")
             else:
-                ctk.CTkLabel(right_side, text="⏳ Offen", font=("Arial", 10), text_color="#777788").pack(side="right", padx=6)
+                ctk.CTkLabel(status_frame, text="⏳ Offen", font=("Arial", 10), text_color="#777788").pack(side="right")
+
+            self._tester_card_widgets[category] = {"card": card, "status_frame": status_frame}
 
             # LEFT SIDE: Pack SECOND with side="left", fill="x", expand=True
             left = ctk.CTkFrame(card, fg_color="transparent")
@@ -7668,7 +7790,7 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                 return
             
             self.fetch_tester_api_plays(silent=True)
-            self.after(3500, _loop)
+            self.after(4500, _loop)
 
         self.after(1000, _loop)
 
