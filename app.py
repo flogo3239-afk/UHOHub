@@ -673,18 +673,18 @@ class BanchoRefereeBot:
                             self._send_raw(f"PRIVMSG BanchoBot :!mp make {self.pending_lobby_name}")
 
                         # Check for Match Created
-                        if "Created the tournament match" in line or "Joined channel #mp_" in line or "#mp_" in line:
-                            match_m = re.search(r'#mp_(\d+)', line)
-                            if match_m:
+                        if "Created the tournament match" in line or "Joined channel #mp_" in line or "#mp_" in line or "/mp/" in line:
+                            match_m = re.search(r'(?:#mp_|/mp/)(\d+)', line)
+                            if match_m and not self.match_id:
                                 self.match_id = match_m.group(1)
                                 self.channel = f"#mp_{self.match_id}"
                                 self.log(f"🏆 Ingame-Lobby erfolgreich erstellt: {self.channel} (ID: {self.match_id})", "#00E676")
                                 self._send_raw(f"JOIN {self.channel}")
                                 if self.pending_password:
-                                    time.sleep(0.5)
+                                    time.sleep(0.3)
                                     self.send_mp(f"mp password {self.pending_password}")
                                 if self.on_match_created:
-                                    self.on_match_created(self.match_id, self.channel)
+                                    threading.Thread(target=lambda m_id=self.match_id, ch=self.channel: self.on_match_created(m_id, ch), daemon=True).start()
 
                         # Match Chat & events
                         if "PRIVMSG" in line:
@@ -3437,35 +3437,58 @@ DEINE ANTWORT-RICHTLINIEN:
         ban_opt = ctk.CTkOptionMenu(f_b, values=["Auto (Standard)", "1 Ban pro Team", "2 Bans pro Team", "0 Bans"], font=("Arial", 11), fg_color="#262635", button_color="#353548", height=32)
         ban_opt.pack(fill="x", pady=(2, 0))
 
-        # Launch Button
+        # Bottom Action Bar (Fixed at bottom so it's always accessible and visible)
+        bottom_bar = ctk.CTkFrame(master, fg_color="#181822", height=64, corner_radius=12)
+        bottom_bar.pack(fill="x", padx=20, pady=(6, 12), side="bottom")
+        bottom_bar.pack_propagate(False)
+
         def on_launch():
-            mode_str = mode_opt.get()
-            t_size = 1 if "1v1" in mode_str else (2 if "2v2" in mode_str else (3 if "3v3" in mode_str else 4))
-            t1_n = t1_name_entry.get().strip() or "Team Rot"
-            t1_pl = [p.strip() for p in t1_players_entry.get().split(",") if p.strip()] or [getattr(self, "osu_username", "Spieler1")]
-            t2_n = t2_name_entry.get().strip() or "Team Blau"
-            t2_pl = [p.strip() for p in t2_players_entry.get().split(",") if p.strip()] or ["Gegner1"]
+            try:
+                mode_str = mode_opt.get()
+                t_size = 1 if "1v1" in mode_str else (2 if "2v2" in mode_str else (3 if "3v3" in mode_str else 4))
+                t1_n = t1_name_entry.get().strip() or "Team Rot"
+                t1_pl = [p.strip() for p in t1_players_entry.get().split(",") if p.strip()] or [getattr(self, "osu_username", "Spieler1")]
+                t2_n = t2_name_entry.get().strip() or "Team Blau"
+                t2_pl = [p.strip() for p in t2_players_entry.get().split(",") if p.strip()] or ["Gegner1"]
 
-            t_val = tourney_opt.get().split(" ")[0]
-            d_val = div_opt.get().split(" ")[0]
-            y_val = year_opt.get()
-            st_val = stage_opt.get()
-            f_val = fmt_opt.get()
-            pr_val = prot_opt.get()
-            ba_val = ban_opt.get()
-            use_bot = use_bot_var.get()
+                # Automatically save username
+                if not getattr(self, "osu_username", "") and t1_pl:
+                    self.osu_username = t1_pl[0]
+                    self.save_global_settings()
 
-            self.start_multiplayer_match(
-                mode_str=mode_str, team_size=t_size,
-                t1_name=t1_n, t1_players=t1_pl,
-                t2_name=t2_n, t2_players=t2_pl,
-                tourney=t_val, division=d_val, year=y_val, stage=st_val,
-                fmt_name=f_val, prot_setting=pr_val, ban_setting=ba_val,
-                use_bot=use_bot
-            )
+                t_val = tourney_opt.get().split(" ")[0]
+                d_val = div_opt.get()
+                if "(" in d_val:
+                    d_val = d_val.split("(")[0].strip()
+                y_val = year_opt.get()
+                st_val = stage_opt.get()
+                f_val = fmt_opt.get()
+                pr_val = prot_opt.get()
+                ba_val = ban_opt.get()
+                use_bot = use_bot_var.get()
 
-        ctk.CTkButton(main_scroll, text="🚀 Ingame-Lobby erstellen & Multiplayer-Match starten ➔", font=("Arial", 14, "bold"), height=46,
-                      fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=on_launch).pack(fill="x", pady=(15, 10))
+                # If bot requested but no IRC password, prompt user
+                if use_bot and not getattr(self, "osu_irc_password", ""):
+                    dialog = ctk.CTkInputDialog(text="Gib dein Server-Passwort von https://osu.ppy.sh/p/irc ein:\n(Wird für automatische Ingame-Lobbies & Einladungen benötigt)", title="osu! IRC-Server-Passwort")
+                    val = dialog.get_input()
+                    if val is not None and val.strip():
+                        self.osu_irc_password = val.strip()
+                        self.save_global_settings()
+
+                self.start_multiplayer_match(
+                    mode_str=mode_str, team_size=t_size,
+                    t1_name=t1_n, t1_players=t1_pl,
+                    t2_name=t2_n, t2_players=t2_pl,
+                    tourney=t_val, division=d_val, year=y_val, stage=st_val,
+                    fmt_name=f_val, prot_setting=pr_val, ban_setting=ba_val,
+                    use_bot=use_bot
+                )
+            except Exception as e:
+                import traceback
+                self.show_message("Match-Start Fehler", f"Match konnte nicht gestartet werden:\n{e}\n\n{traceback.format_exc()[:300]}")
+
+        ctk.CTkButton(bottom_bar, text="🚀 Ingame-Lobby erstellen & Multiplayer-Match starten ➔", font=("Arial", 14, "bold"), height=46,
+                      fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=on_launch).pack(fill="both", expand=True, padx=12, pady=9)
 
     def start_multiplayer_match(self, mode_str, team_size, t1_name, t1_players, t2_name, t2_players, tourney, division, year, stage, fmt_name, prot_setting, ban_setting, use_bot):
         # Target Wins parsing
@@ -3536,7 +3559,7 @@ DEINE ANTWORT-RICHTLINIEN:
 
         # If Bot enabled, connect and host
         if use_bot:
-            u_name = getattr(self, "osu_username", "")
+            u_name = getattr(self, "osu_username", "") or (t1_players[0] if t1_players else "Spieler")
             u_irc = getattr(self, "osu_irc_password", "")
             if u_name and u_irc:
                 lobby_name = f"UHO Hub: {t1_name} vs {t2_name}"
@@ -3576,15 +3599,32 @@ DEINE ANTWORT-RICHTLINIEN:
         self.mp_match["irc_channel"] = channel
         self._mp_bot_log_callback(f"🚀 Ingame-Lobby erstellt: {channel}", "#00E676")
         
-        # Configure team mode and invite all players
-        time.sleep(1.0)
-        if self.mp_referee_bot:
-            self.mp_referee_bot.set_team_mode(self.mp_match.get("team_size", 1))
-            all_pl = self.mp_match.get("team1_players", []) + self.mp_match.get("team2_players", [])
-            for p in all_pl:
-                time.sleep(0.6)
-                self.mp_referee_bot.invite_player(p)
-            self.mp_referee_bot.send_channel_message(f"Willkommen zum UHO Hub Match! {self.mp_match['team1_name']} vs {self.mp_match['team2_name']}")
+        # Configure team mode and invite all players asynchronously
+        def _bg_invite():
+            time.sleep(1.0)
+            if getattr(self, "mp_referee_bot", None):
+                self.mp_referee_bot.set_team_mode(self.mp_match.get("team_size", 1))
+                all_pl = self.mp_match.get("team1_players", []) + self.mp_match.get("team2_players", [])
+                for p in all_pl:
+                    time.sleep(0.8)
+                    self.mp_referee_bot.invite_player(p)
+                self.mp_referee_bot.send_channel_message(f"Willkommen zum UHO Hub Match! {self.mp_match['team1_name']} vs {self.mp_match['team2_name']}")
+                self._mp_bot_log_callback(f"✉️ Einladungen an {', '.join(all_pl)} gesendet!", "#00E676")
+        threading.Thread(target=_bg_invite, daemon=True).start()
+
+    def _mp_manual_invite_all(self):
+        if not hasattr(self, "mp_match") or not self.mp_match:
+            return
+        all_pl = self.mp_match.get("team1_players", []) + self.mp_match.get("team2_players", [])
+        if getattr(self, "mp_referee_bot", None) and self.mp_referee_bot.channel:
+            def _bg():
+                for p in all_pl:
+                    time.sleep(0.5)
+                    self.mp_referee_bot.invite_player(p)
+                self._mp_bot_log_callback("✉️ Einladungen an alle Spieler erneut gesendet!", "#00E676")
+            threading.Thread(target=_bg, daemon=True).start()
+        else:
+            self._mp_bot_log_callback("⚠️ Bot ist noch nicht mit einer Ingame-Lobby verbunden.", "#FFA726")
 
     def _mp_on_round_ended(self):
         self.after(1000, self.fetch_mp_match_results)
@@ -3675,8 +3715,10 @@ DEINE ANTWORT-RICHTLINIEN:
 
         def force_sync():
             self.fetch_mp_match_results()
-        ctk.CTkButton(f_head, text="⚡ Score-Sync", width=95, height=26, font=("Arial", 11, "bold"),
+        ctk.CTkButton(f_head, text="⚡ Score-Sync", width=90, height=26, font=("Arial", 11, "bold"),
                       fg_color="#262635", hover_color="#363648", command=force_sync).pack(side="right")
+        ctk.CTkButton(f_head, text="✉️ Spieler einladen", width=120, height=26, font=("Arial", 11, "bold"),
+                      fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=self._mp_manual_invite_all).pack(side="right", padx=(0, 6))
 
         self.mp_feed_box = ctk.CTkTextbox(feed_frame, wrap="word", font=("Arial", 11), fg_color="#101016", border_width=1, border_color="#222230")
         self.mp_feed_box.pack(fill="both", expand=True, padx=12, pady=(0, 10))
