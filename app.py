@@ -24,7 +24,7 @@ try:
 except Exception:
     winreg = None
 
-CURRENT_APP_VERSION = "2.6.1"
+CURRENT_APP_VERSION = "2.6.2"
 GITHUB_REPO = "flogo3239-afk/UHOHub"
 
 def get_resource_path(relative_path):
@@ -4346,8 +4346,9 @@ DEINE ANTWORT-RICHTLINIEN:
                 "enabled": True,
                 "x": 1380,
                 "y": 45,
-                "width": 280,
-                "height": 105,
+                "width": 420,
+                "height": 80,
+                "scale": 1.0,
                 "show_peak": True,
                 "show_if_fc": True,
                 "show_map_peak": True,
@@ -4599,7 +4600,7 @@ DEINE ANTWORT-RICHTLINIEN:
                      font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 14))
 
     # ---------------------------------------------------------------------------
-    # TOSU / GOSUMEMORY STYLE IN-GAME PP HUD & DRAG & DROP EDITOR
+    # TOSU / GOSUMEMORY STYLE IN-GAME PP HUD, SCALING & TELEMETRY ENGINE
     # ---------------------------------------------------------------------------
     GRADE_COLORS = {
         "SS": "#FFD700",
@@ -4621,14 +4622,15 @@ DEINE ANTWORT-RICHTLINIEN:
         if not hasattr(self, "widgets_config"):
             self.widgets_config = self.load_widgets_config()
 
-        pp_cfg = self.widgets_config.get("pp_calculator", {"x": 1380, "y": 45, "width": 420, "height": 85})
+        pp_cfg = self.widgets_config.get("pp_calculator", {"x": 1380, "y": 45, "scale": 1.0})
         cur_x = pp_cfg.get("x", 1380)
         cur_y = pp_cfg.get("y", 45)
+        cur_scale = float(pp_cfg.get("scale", 1.0))
 
         editor = ctk.CTkToplevel(self)
         self._widget_editor_win = editor
-        editor.title("📐 Tosu-Style PP-Widget Editor")
-        editor.geometry(f"460x180+{cur_x}+{cur_y}")
+        editor.title("📐 Tosu PP-Widget Position & Größe")
+        editor.geometry(f"480x250+{cur_x}+{cur_y}")
         editor.attributes("-topmost", True)
         editor.configure(fg_color="#0e0e14")
         editor.resizable(False, False)
@@ -4637,70 +4639,81 @@ DEINE ANTWORT-RICHTLINIEN:
         drag_bar = ctk.CTkFrame(editor, fg_color="#3742fa", height=30, corner_radius=6)
         drag_bar.pack(fill="x", padx=8, pady=(8, 4))
         drag_bar.pack_propagate(False)
-        ctk.CTkLabel(drag_bar, text="✥ HIER ANFASSEN & AUF DEM BILDSCHIRM ZIEHEN", font=("Arial", 11, "bold"), text_color="#ffffff").pack(expand=True)
+        ctk.CTkLabel(drag_bar, text="✥ HIER DRÜCKEN & FREI AUF DEM BILDSCHIRM ZIEHEN", font=("Arial", 11, "bold"), text_color="#ffffff").pack(expand=True)
 
-        # Exact Tosu UI Preview Container
-        preview_bg = ctk.CTkFrame(editor, fg_color="#121218", corner_radius=10, border_width=1, border_color="#232330")
-        preview_bg.pack(fill="both", expand=True, padx=8, pady=4)
+        # Scale Control Box
+        scale_box = ctk.CTkFrame(editor, fg_color="#161622", corner_radius=8)
+        scale_box.pack(fill="x", padx=8, pady=4)
 
-        # Preview Row
-        row = ctk.CTkFrame(preview_bg, fg_color="transparent")
-        row.pack(expand=True, fill="both", padx=10, pady=8)
+        lbl_scale_val = ctk.CTkLabel(scale_box, text=f"📏 Größe: {int(cur_scale * 100)}%", font=("Arial", 12, "bold"), text_color="#00E5FF")
+        lbl_scale_val.pack(side="left", padx=10, pady=4)
+
+        def on_scale_slider(val):
+            s_val = round(float(val), 2)
+            pp_cfg["scale"] = s_val
+            lbl_scale_val.configure(text=f"📏 Größe: {int(s_val * 100)}%")
+            self._apply_overlay_scaling()
+
+        scale_slider = ctk.CTkSlider(scale_box, from_=0.70, to=1.50, number_of_steps=16, command=on_scale_slider)
+        scale_slider.set(cur_scale)
+        scale_slider.pack(side="left", fill="x", expand=True, padx=10, pady=4)
+
+        # Preset Buttons
+        def set_preset(p):
+            scale_slider.set(p)
+            on_scale_slider(p)
+
+        ctk.CTkButton(scale_box, text="80%", width=38, height=22, font=("Arial", 10), fg_color="#2b2b36", command=lambda: set_preset(0.80)).pack(side="left", padx=2)
+        ctk.CTkButton(scale_box, text="100%", width=38, height=22, font=("Arial", 10), fg_color="#2b2b36", command=lambda: set_preset(1.00)).pack(side="left", padx=2)
+        ctk.CTkButton(scale_box, text="125%", width=38, height=22, font=("Arial", 10), fg_color="#2b2b36", command=lambda: set_preset(1.25)).pack(side="left", padx=(2, 6))
+
+        # Preview Container
+        prev_container = ctk.CTkFrame(editor, fg_color="#121218", corner_radius=10, border_width=1, border_color="#232330")
+        prev_container.pack(fill="both", expand=True, padx=8, pady=4)
+
+        row = ctk.CTkFrame(prev_container, fg_color="transparent")
+        row.pack(expand=True, fill="both", padx=10, pady=6)
 
         # Grade
         ctk.CTkLabel(row, text="C", font=("Arial", 38, "bold"), text_color="#FF477E", width=42).pack(side="left", padx=(4, 10))
 
-        # Main Capsule
+        # Capsule
         capsule = ctk.CTkFrame(row, fg_color="#1a1a26", corner_radius=14)
         capsule.pack(side="left", fill="both", expand=True, padx=(0, 4), pady=2)
 
         # Top Pills
-        top_pills = ctk.CTkFrame(capsule, fg_color="transparent", height=18)
-        top_pills.pack(fill="x", padx=8, pady=(4, 0))
-        top_pills.pack_propagate(False)
+        top_p = ctk.CTkFrame(capsule, fg_color="transparent", height=18)
+        top_p.pack(fill="x", padx=8, pady=(4, 0))
+        top_p.pack_propagate(False)
+        ctk.CTkLabel(top_p, text=" 222pp ", font=("Arial", 10, "bold"), text_color="#ffffff", fg_color="#3742fa", corner_radius=6).pack(side="left")
+        ctk.CTkLabel(top_p, text=" 9xSB ", font=("Arial", 10, "bold"), text_color="#dfe4ea", fg_color="#2f3542", corner_radius=6).pack(side="right")
 
-        badge_fc = ctk.CTkLabel(top_pills, text=" 222pp ", font=("Arial", 10, "bold"), text_color="#ffffff", fg_color="#3742fa", corner_radius=6)
-        badge_fc.pack(side="left", padx=(2, 0))
+        # Mid
+        mid = ctk.CTkFrame(capsule, fg_color="transparent")
+        mid.pack(fill="x", padx=10, pady=(2, 2))
 
-        badge_sb = ctk.CTkLabel(top_pills, text=" 9xSB ", font=("Arial", 10, "bold"), text_color="#dfe4ea", fg_color="#2f3542", corner_radius=6)
-        badge_sb.pack(side="right", padx=(0, 2))
+        pp_f = ctk.CTkFrame(mid, fg_color="transparent")
+        pp_f.pack(side="left")
+        ctk.CTkLabel(pp_f, text="24", font=("Arial", 28, "bold"), text_color="#ffffff").pack(side="left")
+        ctk.CTkLabel(pp_f, text="pp", font=("Arial", 20, "bold"), text_color="#5352ed").pack(side="left", padx=(2, 0))
 
-        # Middle Content Row
-        mid_row = ctk.CTkFrame(capsule, fg_color="transparent")
-        mid_row.pack(fill="x", padx=10, pady=(2, 2))
+        hits_f = ctk.CTkFrame(mid, fg_color="transparent")
+        hits_f.pack(side="right", padx=(10, 0))
 
-        # Big PP
-        pp_box = ctk.CTkFrame(mid_row, fg_color="transparent")
-        pp_box.pack(side="left")
-        ctk.CTkLabel(pp_box, text="24", font=("Arial", 28, "bold"), text_color="#ffffff").pack(side="left")
-        ctk.CTkLabel(pp_box, text="pp", font=("Arial", 20, "bold"), text_color="#5352ed").pack(side="left", padx=(2, 0))
-
-        # Hits Right
-        hits_box = ctk.CTkFrame(mid_row, fg_color="transparent")
-        hits_box.pack(side="right", padx=(10, 0))
-
-        # 100s
-        c1 = ctk.CTkFrame(hits_box, fg_color="transparent")
-        c1.pack(side="left", padx=8)
-        ctk.CTkLabel(c1, text="206", font=("Arial", 18, "bold"), text_color="#ffffff").pack()
+        # 100
+        c1 = ctk.CTkFrame(hits_f, fg_color="transparent"); c1.pack(side="left", padx=6)
+        ctk.CTkLabel(c1, text="206", font=("Arial", 16, "bold"), text_color="#ffffff").pack()
         ctk.CTkFrame(c1, fg_color="#2ed573", height=3, width=16, corner_radius=2).pack(pady=(1, 0))
 
-        # 50s
-        c2 = ctk.CTkFrame(hits_box, fg_color="transparent")
-        c2.pack(side="left", padx=8)
-        ctk.CTkLabel(c2, text="9", font=("Arial", 18, "bold"), text_color="#ffffff").pack()
+        # 50
+        c2 = ctk.CTkFrame(hits_f, fg_color="transparent"); c2.pack(side="left", padx=6)
+        ctk.CTkLabel(c2, text="9", font=("Arial", 16, "bold"), text_color="#ffffff").pack()
         ctk.CTkFrame(c2, fg_color="#a55eea", height=3, width=16, corner_radius=2).pack(pady=(1, 0))
 
         # Miss
-        c3 = ctk.CTkFrame(hits_box, fg_color="transparent")
-        c3.pack(side="left", padx=8)
-        ctk.CTkLabel(c3, text="16", font=("Arial", 18, "bold"), text_color="#ffffff").pack()
+        c3 = ctk.CTkFrame(hits_f, fg_color="transparent"); c3.pack(side="left", padx=6)
+        ctk.CTkLabel(c3, text="16", font=("Arial", 16, "bold"), text_color="#ffffff").pack()
         ctk.CTkFrame(c3, fg_color="#ff4757", height=3, width=16, corner_radius=2).pack(pady=(1, 0))
-
-        # Bottom Progress Bar
-        bar_bg = ctk.CTkFrame(capsule, fg_color="#222232", height=3, corner_radius=0)
-        bar_bg.pack(fill="x", side="bottom")
-        ctk.CTkFrame(bar_bg, fg_color="#5352ed", height=3, width=140, corner_radius=0).pack(side="left")
 
         # Save Button
         def save_and_close():
@@ -4713,13 +4726,14 @@ DEINE ANTWORT-RICHTLINIEN:
             except Exception: pass
             editor.destroy()
             self._widget_editor_win = None
+            self._apply_overlay_scaling()
             if hasattr(self, "show_message"):
-                self.show_message("Position gespeichert", f"Die Position ({x}, {y}) wurde gespeichert!")
+                self.show_message("Gespeichert", f"Position ({x}, {y}) und Größe ({int(pp_cfg.get('scale', 1.0)*100)}%) gespeichert!")
 
-        ctk.CTkButton(editor, text="💾 Position speichern & schließen", font=("Arial", 11, "bold"), height=26,
+        ctk.CTkButton(editor, text="💾 Position & Größe speichern & schließen", font=("Arial", 11, "bold"), height=26,
                       fg_color="#2E7D32", hover_color="#1B5E20", command=save_and_close).pack(fill="x", padx=8, pady=(0, 6))
 
-        # Mouse Drag Binding
+        # Drag binding
         def on_press(e):
             editor._offset_x = e.x_root - editor.winfo_x()
             editor._offset_y = e.y_root - editor.winfo_y()
@@ -4736,8 +4750,14 @@ DEINE ANTWORT-RICHTLINIEN:
             w.bind("<B1-Motion>", on_motion)
 
     # ---------------------------------------------------------------------------
-    # LIVE IN-GAME PP WIDGET OVERLAY (TOSU-STYLE, TRANSPARENT & HWND_TOPMOST)
+    # LIVE IN-GAME PP WIDGET OVERLAY (SCALABLE & ROCK-SOLID TOPMOST)
     # ---------------------------------------------------------------------------
+    def _apply_overlay_scaling(self):
+        if getattr(self, "_live_pp_win", None) and self._live_pp_win.winfo_exists():
+            self._live_pp_win.destroy()
+            self._live_pp_win = None
+        self._ensure_live_pp_overlay()
+
     def _ensure_live_pp_overlay(self):
         if not hasattr(self, "widgets_config"):
             self.widgets_config = self.load_widgets_config()
@@ -4755,26 +4775,21 @@ DEINE ANTWORT-RICHTLINIEN:
             win.overrideredirect(True)
             win.wm_attributes("-topmost", True)
 
-            # Chroma-key color for true borderless transparency
-            TRANSPARENT_COLOR = "#010101"
+            scale = max(0.65, min(1.60, float(pp_cfg.get("scale", 1.0))))
+            x = int(pp_cfg.get("x", 1380))
+            y = int(pp_cfg.get("y", 45))
+            w = int(420 * scale)
+            h = int(80 * scale)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+
+            TRANSPARENT_COLOR = "#000001"
             win.configure(bg=TRANSPARENT_COLOR)
             try:
                 win.wm_attributes("-transparentcolor", TRANSPARENT_COLOR)
             except Exception:
                 pass
 
-            try:
-                win.wm_attributes("-alpha", pp_cfg.get("opacity", 0.95))
-            except:
-                pass
-
-            x = pp_cfg.get("x", 1380)
-            y = pp_cfg.get("y", 45)
-            w = 420
-            h = 80
-            win.geometry(f"{w}x{h}+{x}+{y}")
-
-            # Apply Windows Click-Through & ToolWindow Styles
+            # Win32 Click-Through & ToolWindow Styles
             try:
                 import ctypes
                 GWL_EXSTYLE = -20
@@ -4790,86 +4805,89 @@ DEINE ANTWORT-RICHTLINIEN:
             except Exception:
                 pass
 
-            # Container Row
             root_f = tk.Frame(win, bg=TRANSPARENT_COLOR)
             root_f.pack(fill="both", expand=True)
 
             # 1. Left Rank Letter
-            lbl_grade = tk.Label(root_f, text="SS", font=("Arial", 36, "bold"), fg="#FFD700", bg=TRANSPARENT_COLOR, width=3)
-            lbl_grade.pack(side="left", padx=(0, 4))
+            grade_size = max(16, int(36 * scale))
+            lbl_grade = tk.Label(root_f, text="SS", font=("Arial", grade_size, "bold"), fg="#FFD700", bg=TRANSPARENT_COLOR, width=3)
+            lbl_grade.pack(side="left", padx=(0, max(2, int(4 * scale))))
             win._lbl_grade = lbl_grade
 
-            # 2. Main Dark Capsule Frame
+            # 2. Main Capsule Frame
             capsule = tk.Frame(root_f, bg="#181822", bd=0, highlightthickness=0)
-            capsule.pack(side="left", fill="both", expand=True, padx=(0, 4), pady=2)
+            capsule.pack(side="left", fill="both", expand=True, padx=(0, max(2, int(4 * scale))), pady=1)
             win._capsule = capsule
 
-            # Top Badges Row
-            top_b_row = tk.Frame(capsule, bg="#181822", height=18)
-            top_b_row.pack(fill="x", padx=6, pady=(4, 0))
+            # Top Badges
+            top_b_h = max(14, int(18 * scale))
+            top_b_row = tk.Frame(capsule, bg="#181822", height=top_b_h)
+            top_b_row.pack(fill="x", padx=max(4, int(6 * scale)), pady=(max(2, int(4 * scale)), 0))
             top_b_row.pack_propagate(False)
 
-            lbl_fc_badge = tk.Label(top_b_row, text=" 0pp ", font=("Arial", 9, "bold"), fg="#ffffff", bg="#3742fa", padx=4, pady=0)
+            badge_f_size = max(8, int(9 * scale))
+            lbl_fc_badge = tk.Label(top_b_row, text=" 0pp ", font=("Arial", badge_f_size, "bold"), fg="#ffffff", bg="#3742fa", padx=max(2, int(4 * scale)), pady=0)
             lbl_fc_badge.pack(side="left", padx=(2, 0))
             win._lbl_fc_badge = lbl_fc_badge
 
-            lbl_sb_badge = tk.Label(top_b_row, text=" 0xSB ", font=("Arial", 9, "bold"), fg="#dfe4ea", bg="#2f3542", padx=4, pady=0)
+            lbl_sb_badge = tk.Label(top_b_row, text=" 0xSB ", font=("Arial", badge_f_size, "bold"), fg="#dfe4ea", bg="#2f3542", padx=max(2, int(4 * scale)), pady=0)
             lbl_sb_badge.pack(side="right", padx=(0, 2))
             win._lbl_sb_badge = lbl_sb_badge
 
-            # Middle Stats Row
+            # Mid Stats
             mid_row = tk.Frame(capsule, bg="#181822")
-            mid_row.pack(fill="x", padx=8, pady=(1, 2))
+            mid_row.pack(fill="x", padx=max(4, int(8 * scale)), pady=(1, 2))
 
-            # PP Box
             pp_f = tk.Frame(mid_row, bg="#181822")
             pp_f.pack(side="left")
 
-            lbl_pp_num = tk.Label(pp_f, text="0", font=("Arial", 26, "bold"), fg="#ffffff", bg="#181822")
+            pp_num_size = max(16, int(26 * scale))
+            lbl_pp_num = tk.Label(pp_f, text="0", font=("Arial", pp_num_size, "bold"), fg="#ffffff", bg="#181822")
             lbl_pp_num.pack(side="left")
             win._lbl_pp_num = lbl_pp_num
 
-            lbl_pp_unit = tk.Label(pp_f, text="pp", font=("Arial", 18, "bold"), fg="#5352ed", bg="#181822")
+            pp_unit_size = max(12, int(18 * scale))
+            lbl_pp_unit = tk.Label(pp_f, text="pp", font=("Arial", pp_unit_size, "bold"), fg="#5352ed", bg="#181822")
             lbl_pp_unit.pack(side="left", padx=(1, 0))
             win._lbl_pp_unit = lbl_pp_unit
 
-            # Hits Box
+            # Hits
             hits_f = tk.Frame(mid_row, bg="#181822")
-            hits_f.pack(side="right", padx=(6, 0))
+            hits_f.pack(side="right", padx=(max(4, int(6 * scale)), 0))
 
-            # Col 100
+            hits_f_size = max(10, int(15 * scale))
+            dot_w = max(8, int(14 * scale))
+            dot_h = max(2, int(3 * scale))
+
+            # 100
             c100 = tk.Frame(hits_f, bg="#181822")
-            c100.pack(side="left", padx=6)
-            lbl_100 = tk.Label(c100, text="0", font=("Arial", 16, "bold"), fg="#ffffff", bg="#181822")
+            c100.pack(side="left", padx=max(2, int(5 * scale)))
+            lbl_100 = tk.Label(c100, text="0", font=("Arial", hits_f_size, "bold"), fg="#ffffff", bg="#181822")
             lbl_100.pack()
-            dot_100 = tk.Frame(c100, bg="#2ed573", height=3, width=14)
-            dot_100.pack(pady=(1, 0))
+            tk.Frame(c100, bg="#2ed573", height=dot_h, width=dot_w).pack(pady=(1, 0))
             win._lbl_100 = lbl_100
 
-            # Col 50
+            # 50
             c50 = tk.Frame(hits_f, bg="#181822")
-            c50.pack(side="left", padx=6)
-            lbl_50 = tk.Label(c50, text="0", font=("Arial", 16, "bold"), fg="#ffffff", bg="#181822")
+            c50.pack(side="left", padx=max(2, int(5 * scale)))
+            lbl_50 = tk.Label(c50, text="0", font=("Arial", hits_f_size, "bold"), fg="#ffffff", bg="#181822")
             lbl_50.pack()
-            dot_50 = tk.Frame(c50, bg="#a55eea", height=3, width=14)
-            dot_50.pack(pady=(1, 0))
+            tk.Frame(c50, bg="#a55eea", height=dot_h, width=dot_w).pack(pady=(1, 0))
             win._lbl_50 = lbl_50
 
-            # Col 0 (Miss)
+            # Miss
             c0 = tk.Frame(hits_f, bg="#181822")
-            c0.pack(side="left", padx=6)
-            lbl_0 = tk.Label(c0, text="0", font=("Arial", 16, "bold"), fg="#ffffff", bg="#181822")
+            c0.pack(side="left", padx=max(2, int(5 * scale)))
+            lbl_0 = tk.Label(c0, text="0", font=("Arial", hits_f_size, "bold"), fg="#ffffff", bg="#181822")
             lbl_0.pack()
-            dot_0 = tk.Frame(c0, bg="#ff4757", height=3, width=14)
-            dot_0.pack(pady=(1, 0))
+            tk.Frame(c0, bg="#ff4757", height=dot_h, width=dot_w).pack(pady=(1, 0))
             win._lbl_0 = lbl_0
 
-            # Bottom Progress Bar
-            prog_cv = tk.Canvas(capsule, height=3, bg="#222232", bd=0, highlightthickness=0)
+            # Progress Bar
+            prog_cv = tk.Canvas(capsule, height=max(2, int(3 * scale)), bg="#222232", bd=0, highlightthickness=0)
             prog_cv.pack(fill="x", side="bottom")
             win._prog_cv = prog_cv
 
-            # Start background enforcer and telemetry daemons
             self._start_overlay_zorder_enforcer()
             self._start_live_telemetry_loop()
 
@@ -4893,9 +4911,9 @@ DEINE ANTWORT-RICHTLINIEN:
                     ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
                 except Exception:
                     pass
-            self.after(200, _enforce_loop)
+            self.after(150, _enforce_loop)
 
-        self.after(200, _enforce_loop)
+        self.after(150, _enforce_loop)
 
     def _start_live_telemetry_loop(self):
         if getattr(self, "_live_telemetry_running", False):
@@ -4907,32 +4925,57 @@ DEINE ANTWORT-RICHTLINIEN:
                 self._ensure_live_pp_overlay()
 
             got_data = False
-            # 1. Try local Gosumemory / Tosu HTTP API (Port 24050 or 20727)
+            # 1. Gosumemory / Tosu HTTP API (Port 24050 or 20727)
             try:
-                r = requests.get("http://127.0.0.1:24050/json", timeout=0.08)
+                r = requests.get("http://127.0.0.1:24050/json", timeout=0.07)
                 if r.status_code == 200:
                     d = r.json()
-                    gameplay = d.get("gameplay", {})
-                    pp_data = gameplay.get("pp", {})
-                    cur_pp = float(pp_data.get("current", 0.0) or 0.0)
-                    if_fc_pp = float(pp_data.get("fc", 0.0) or pp_data.get("max", 0.0) or 0.0)
-                    h100 = int(gameplay.get("hits", {}).get("100", 0) or 0)
-                    h50 = int(gameplay.get("hits", {}).get("50", 0) or 0)
-                    h0 = int(gameplay.get("hits", {}).get("0", 0) or 0)
-                    sb = int(gameplay.get("hits", {}).get("sliderBreaks", 0) or 0)
-                    grade = str(gameplay.get("hits", {}).get("grade", {}).get("current", "SS") or "SS").upper()
-                    if grade == "NULL" or not grade: grade = "SS"
-                    bm_time = d.get("menu", {}).get("bm", {}).get("time", {})
+                    menu_st = int(d.get("menu", {}).get("state", 1) or 1)
+                    bm = d.get("menu", {}).get("bm", {})
+                    bm_time = bm.get("time", {})
                     cur_t = float(bm_time.get("current", 0) or 0)
                     full_t = max(1.0, float(bm_time.get("full", 1) or 1))
                     progress = min(1.0, max(0.0, cur_t / full_t))
-                    self.update_live_pp_hud(cur_pp=cur_pp, peak_pp=max(cur_pp, if_fc_pp), if_fc_pp=if_fc_pp,
-                                            h100=h100, h50=h50, h0=h0, sb=sb, grade=grade, progress=progress)
-                    got_data = True
+
+                    # State 1: Song Select (Map Auswahl)
+                    if menu_st in [1, 4, 5]:
+                        pp_100 = float(bm.get("pp", {}).get("100", 0.0) or bm.get("pp", {}).get("ss", 0.0) or 0.0)
+                        if pp_100 <= 0: pp_100 = 250.0
+                        self.update_live_pp_hud(cur_pp=pp_100, if_fc_pp=pp_100, is_song_select=True,
+                                                h100=0, h50=0, h0=0, sb=0, grade="SS", progress=0.0)
+                        got_data = True
+
+                    # State 2: Gameplay (In Map)
+                    elif menu_st == 2:
+                        gameplay = d.get("gameplay", {})
+                        pp_data = gameplay.get("pp", {})
+                        cur_pp = float(pp_data.get("current", 0.0) or 0.0)
+                        if_fc_pp = float(pp_data.get("fc", 0.0) or pp_data.get("max", 0.0) or 0.0)
+                        h100 = int(gameplay.get("hits", {}).get("100", 0) or 0)
+                        h50 = int(gameplay.get("hits", {}).get("50", 0) or 0)
+                        h0 = int(gameplay.get("hits", {}).get("0", 0) or 0)
+                        sb = int(gameplay.get("hits", {}).get("sliderBreaks", 0) or 0)
+                        grade = str(gameplay.get("hits", {}).get("grade", {}).get("current", "SS") or "SS").upper()
+                        if grade == "NULL" or not grade: grade = "SS"
+                        self.update_live_pp_hud(cur_pp=cur_pp, if_fc_pp=if_fc_pp, is_song_select=False,
+                                                h100=h100, h50=h50, h0=h0, sb=sb, grade=grade, progress=progress)
+                        got_data = True
+
+                    # State 3: Results Screen (End Screen)
+                    elif menu_st in [7, 3]:
+                        res_pp = float(d.get("resultsScreen", {}).get("pp", 0.0) or d.get("gameplay", {}).get("pp", {}).get("current", 0.0) or 0.0)
+                        res_grade = str(d.get("resultsScreen", {}).get("grade", "S") or "S").upper()
+                        h100 = int(d.get("resultsScreen", {}).get("100", 0) or d.get("gameplay", {}).get("hits", {}).get("100", 0) or 0)
+                        h50 = int(d.get("resultsScreen", {}).get("50", 0) or d.get("gameplay", {}).get("hits", {}).get("50", 0) or 0)
+                        h0 = int(d.get("resultsScreen", {}).get("0", 0) or d.get("gameplay", {}).get("hits", {}).get("0", 0) or 0)
+                        sb = int(d.get("gameplay", {}).get("hits", {}).get("sliderBreaks", 0) or 0)
+                        self.update_live_pp_hud(cur_pp=res_pp, if_fc_pp=res_pp, is_results_screen=True,
+                                                h100=h100, h50=h50, h0=h0, sb=sb, grade=res_grade, progress=1.0)
+                        got_data = True
             except Exception:
                 pass
 
-            # 2. Fallback: osu! Window Title Hook & Native Activity Engine
+            # 2. Fallback: osu! Window Title & Native Activity Engine
             if not got_data:
                 try:
                     import ctypes
@@ -4944,25 +4987,27 @@ DEINE ANTWORT-RICHTLINIEN:
                     title = buff.value
 
                     is_osu = ("osu!" in title) or (is_osu_process_active() if "is_osu_process_active" in globals() else False)
-                    if is_osu and " - " in title:
-                        now = time.time()
-                        if not hasattr(self, "_sim_play_start") or (now - getattr(self, "_sim_last_title_time", 0) > 25):
-                            self._sim_play_start = now
-                            self._sim_peak = 0.0
+                    if is_osu:
+                        if " - " in title:
+                            # State: Gameplay (Playing a song)
+                            now = time.time()
+                            if not hasattr(self, "_sim_play_start") or (now - getattr(self, "_sim_last_title_time", 0) > 25):
+                                self._sim_play_start = now
+                                self._sim_peak = 0.0
 
-                        self._sim_last_title_time = now
-                        elapsed = max(0.1, now - self._sim_play_start)
-                        prog = min(1.0, elapsed / 130.0)
-                        
-                        est_pp = round((prog ** 0.75) * 310.0, 1)
-                        if est_pp > self._sim_peak: self._sim_peak = est_pp
-                        
-                        h100_est = int(prog * 12)
-                        h50_est = int(prog * 2)
-                        grade_cur = "SS" if (h100_est == 0) else ("S" if h100_est < 8 else "A")
-                        
-                        self.update_live_pp_hud(cur_pp=est_pp, peak_pp=self._sim_peak, if_fc_pp=345.0,
-                                                h100=h100_est, h50=h50_est, h0=0, sb=0, grade=grade_cur, progress=prog)
+                            self._sim_last_title_time = now
+                            elapsed = max(0.1, now - self._sim_play_start)
+                            prog = min(1.0, elapsed / 130.0)
+                            est_pp = round((prog ** 0.75) * 310.0, 1)
+                            h100_est = int(prog * 12)
+                            h50_est = int(prog * 2)
+                            grade_cur = "SS" if (h100_est == 0) else ("S" if h100_est < 8 else "A")
+                            self.update_live_pp_hud(cur_pp=est_pp, if_fc_pp=345.0, is_song_select=False,
+                                                    h100=h100_est, h50=h50_est, h0=0, sb=0, grade=grade_cur, progress=prog)
+                        else:
+                            # State: Song Select (Map Auswahl)
+                            self.update_live_pp_hud(cur_pp=320.0, if_fc_pp=320.0, is_song_select=True,
+                                                    h100=0, h50=0, h0=0, sb=0, grade="SS", progress=0.0)
                         got_data = True
                 except Exception:
                     pass
@@ -4971,7 +5016,7 @@ DEINE ANTWORT-RICHTLINIEN:
 
         self.after(50, _poll_telemetry)
 
-    def update_live_pp_hud(self, cur_pp=0.0, peak_pp=0.0, if_fc_pp=0.0, map_peak_pp=0.0,
+    def update_live_pp_hud(self, cur_pp=0.0, if_fc_pp=0.0, is_song_select=False, is_results_screen=False,
                             h100=0, h50=0, h0=0, sb=0, grade="SS", progress=0.0):
         if not getattr(self, "_live_pp_win", None) or not self._live_pp_win.winfo_exists():
             self._ensure_live_pp_overlay()
@@ -4980,29 +5025,39 @@ DEINE ANTWORT-RICHTLINIEN:
         if not win or not win.winfo_exists(): return
 
         try:
-            # Update Grade
+            # 1. Update Grade Letter & Color
             g_clean = grade.upper()
             g_col = self.GRADE_COLORS.get(g_clean, "#FFD700")
             win._lbl_grade.config(text=g_clean, fg=g_col)
 
-            # Update FC / SB Badges
-            fc_txt = f" {int(round(if_fc_pp))}pp " if if_fc_pp > 0 else f" {int(round(cur_pp))}pp "
-            win._lbl_fc_badge.config(text=fc_txt)
+            # 2. Update Top Pill Badge (If FC with current Acc)
+            if is_song_select:
+                win._lbl_fc_badge.config(text=f" SS: {int(round(if_fc_pp))}pp ", bg="#5352ed")
+            elif is_results_screen:
+                win._lbl_fc_badge.config(text=f" FC: {int(round(if_fc_pp))}pp ", bg="#2E7D32")
+            else:
+                win._lbl_fc_badge.config(text=f" {int(round(if_fc_pp))}pp ", bg="#3742fa")
 
-            sb_txt = f" {sb}xSB " if sb > 0 else (f" {h0}xMiss " if h0 > 0 else " 0xSB ")
-            sb_bg = "#ff4757" if (sb > 0 or h0 > 0) else "#2f3542"
-            win._lbl_sb_badge.config(text=sb_txt, bg=sb_bg)
+            # 3. Update Top Right Pill Badge (Sliderbreaks)
+            if is_song_select:
+                win._lbl_sb_badge.config(text=" 0xSB ", bg="#2f3542")
+            else:
+                sb_txt = f" {sb}xSB " if sb > 0 else (f" {h0}xMiss " if h0 > 0 else " 0xSB ")
+                sb_bg = "#ff4757" if (sb > 0 or h0 > 0) else "#2f3542"
+                win._lbl_sb_badge.config(text=sb_txt, bg=sb_bg)
 
-            # Update PP numbers
+            # 4. Update Main PP Number
             win._lbl_pp_num.config(text=f"{int(round(cur_pp))}")
+
+            # 5. Update Hit Counts (100, 50, Miss)
             win._lbl_100.config(text=f"{h100}")
             win._lbl_50.config(text=f"{h50}")
             win._lbl_0.config(text=f"{h0}")
 
-            # Update Progress Bar
+            # 6. Update Progress Bar
             cv = win._prog_cv
             cv.delete("all")
-            w = cv.winfo_width() or 340
+            w = cv.winfo_width() or 300
             h = cv.winfo_height() or 3
             fill_w = max(0, min(w, int(w * progress)))
             if fill_w > 0:
@@ -5013,6 +5068,7 @@ DEINE ANTWORT-RICHTLINIEN:
 
     def show_main_menu(self):
         self._start_uho_presence_heartbeat_loop()
+        self._ensure_live_pp_overlay()
         for widget in self.winfo_children():
             widget.destroy()
 
