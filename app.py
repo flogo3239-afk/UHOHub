@@ -25,7 +25,7 @@ try:
 except Exception:
     winreg = None
 
-CURRENT_APP_VERSION = "2.7.2"
+CURRENT_APP_VERSION = "2.7.3"
 GITHUB_REPO = "flogo3239-afk/UHOHub"
 
 def get_resource_path(relative_path):
@@ -77,7 +77,7 @@ def _get_sqlite_conn():
     except:
         return None
 
-def sqlite_query_maps(skill=None, sr_min=None, sr_max=None, exclude_ids=None, limit=200, order_by="playcount DESC"):
+def sqlite_query_maps(skill=None, sr_min=None, sr_max=None, bpm_min=None, bpm_max=None, ar_min=None, ar_max=None, cs_max=None, exclude_ids=None, limit=200, order_by="playcount DESC"):
     """Query maps from SQLite with filters. Returns list of dicts."""
     conn = _get_sqlite_conn()
     if not conn:
@@ -94,6 +94,21 @@ def sqlite_query_maps(skill=None, sr_min=None, sr_max=None, exclude_ids=None, li
         if sr_max is not None:
             conditions.append("sr <= ?")
             params.append(sr_max)
+        if bpm_min is not None:
+            conditions.append("bpm >= ?")
+            params.append(bpm_min)
+        if bpm_max is not None:
+            conditions.append("bpm <= ?")
+            params.append(bpm_max)
+        if ar_min is not None:
+            conditions.append("ar >= ?")
+            params.append(ar_min)
+        if ar_max is not None:
+            conditions.append("ar <= ?")
+            params.append(ar_max)
+        if cs_max is not None:
+            conditions.append("cs <= ?")
+            params.append(cs_max)
         if exclude_ids:
             placeholders = ",".join("?" for _ in exclude_ids)
             conditions.append(f"id NOT IN ({placeholders})")
@@ -347,10 +362,21 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
         req_mod = "NM"
 
     query_sr = target_sr
+    mod_bpm_min, mod_bpm_max = None, None
+    mod_ar_min, mod_ar_max = None, None
+    mod_cs_max = None
+
     if req_mod in ["DT", "NC"]:
         query_sr = max(2.8, target_sr / 1.40)
+        # Echte DT-Maps: Basis-BPM 115-168 (wird 172-252 BPM), Basis-AR 6.8-9.1 (wird AR 9.0-10.3), CS <= 4.4
+        mod_bpm_min = 115
+        mod_bpm_max = 168
+        mod_ar_min = 6.8
+        mod_ar_max = 9.1
+        mod_cs_max = 4.4
     elif req_mod == "HR":
         query_sr = max(3.0, target_sr / 1.06)
+        mod_cs_max = 4.6
     elif req_mod == "EZ":
         query_sr = min(9.5, target_sr / 0.72)
 
@@ -361,6 +387,11 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
             skill=category,
             sr_min=round(query_sr - sr_range, 2),
             sr_max=round(query_sr + sr_range, 2),
+            bpm_min=mod_bpm_min,
+            bpm_max=mod_bpm_max,
+            ar_min=mod_ar_min,
+            ar_max=mod_ar_max,
+            cs_max=mod_cs_max,
             exclude_ids=exclude_ids,
             limit=200,
             order_by="playcount DESC"
@@ -372,6 +403,11 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
                 skill=category,
                 sr_min=round(query_sr - 1.5, 2),
                 sr_max=round(query_sr + 1.5, 2),
+                bpm_min=mod_bpm_min,
+                bpm_max=min(176, mod_bpm_max + 8) if mod_bpm_max else None,
+                ar_min=mod_ar_min,
+                ar_max=min(9.3, mod_ar_max + 0.2) if mod_ar_max else None,
+                cs_max=mod_cs_max,
                 exclude_ids=exclude_ids,
                 limit=200,
                 order_by="playcount DESC"
