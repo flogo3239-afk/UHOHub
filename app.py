@@ -18,13 +18,14 @@ import zipfile
 import socket
 import lzma
 import uuid
+import sqlite3
 from datetime import datetime
 try:
     import winreg
 except Exception:
     winreg = None
 
-CURRENT_APP_VERSION = "2.6.3"
+CURRENT_APP_VERSION = "2.7.0"
 GITHUB_REPO = "flogo3239-afk/UHOHub"
 
 def get_resource_path(relative_path):
@@ -37,20 +38,129 @@ def get_resource_path(relative_path):
 DYNAMIC_RANKED_MAPS_DB = []
 DYNAMIC_MAPS_BY_SKILL = {}
 OFFICIAL_TOURNAMENTS_DB = {}
-try:
+BEATMAP_SQLITE_DB_PATH = None
+
+def _find_resource_file(filename):
+    """Find a resource file across all candidate directories."""
     for candidate_dir in [getattr(sys, "_MEIPASS", ""), os.path.dirname(os.path.abspath(__file__)), os.getcwd(), r"C:\Users\louis\.gemini\antigravity\scratch"]:
         if not candidate_dir: continue
-        db_path = os.path.join(candidate_dir, "compact_ranked_maps.json")
-        if not DYNAMIC_RANKED_MAPS_DB and os.path.exists(db_path):
-            with open(db_path, "r", encoding="utf-8") as f:
-                DYNAMIC_RANKED_MAPS_DB = json.load(f)
-                DYNAMIC_MAPS_BY_SKILL = {}
-                for m in DYNAMIC_RANKED_MAPS_DB:
-                    sk = m.get('primary_skill', 'Aim')
-                    if sk not in DYNAMIC_MAPS_BY_SKILL:
-                        DYNAMIC_MAPS_BY_SKILL[sk] = []
-                    DYNAMIC_MAPS_BY_SKILL[sk].append(m)
-                
+        fpath = os.path.join(candidate_dir, filename)
+        if os.path.exists(fpath):
+            return fpath
+    return None
+
+def _init_sqlite_db():
+    """Initialize SQLite database connection for beatmap data."""
+    global BEATMAP_SQLITE_DB_PATH
+    db_path = _find_resource_file("beatmaps_analyzed.db")
+    if db_path:
+        BEATMAP_SQLITE_DB_PATH = db_path
+        try:
+            conn = sqlite3.connect(db_path)
+            count = conn.execute("SELECT COUNT(*) FROM maps").fetchone()[0]
+            conn.close()
+            print(f"[SQLite] Loaded beatmap database: {count} maps from {db_path}")
+            return True
+        except Exception as e:
+            print(f"[SQLite] Error loading {db_path}: {e}")
+            BEATMAP_SQLITE_DB_PATH = None
+    return False
+
+def _get_sqlite_conn():
+    """Get a thread-local SQLite connection."""
+    if not BEATMAP_SQLITE_DB_PATH:
+        return None
+    try:
+        conn = sqlite3.connect(BEATMAP_SQLITE_DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except:
+        return None
+
+def sqlite_query_maps(skill=None, sr_min=None, sr_max=None, exclude_ids=None, limit=200, order_by="playcount DESC"):
+    """Query maps from SQLite with filters. Returns list of dicts."""
+    conn = _get_sqlite_conn()
+    if not conn:
+        return []
+    try:
+        conditions = []
+        params = []
+        if skill:
+            conditions.append("primary_skill = ?")
+            params.append(skill)
+        if sr_min is not None:
+            conditions.append("sr >= ?")
+            params.append(sr_min)
+        if sr_max is not None:
+            conditions.append("sr <= ?")
+            params.append(sr_max)
+        if exclude_ids:
+            placeholders = ",".join("?" for _ in exclude_ids)
+            conditions.append(f"id NOT IN ({placeholders})")
+            params.extend(list(exclude_ids))
+        
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        query = f"SELECT * FROM maps {where} ORDER BY {order_by} LIMIT ?"
+        params.append(limit)
+        
+        rows = conn.execute(query, params).fetchall()
+        result = [dict(row) for row in rows]
+        conn.close()
+        return result
+    except Exception as e:
+        try: conn.close()
+        except: pass
+        return []
+
+def sqlite_get_skill_distribution():
+    """Get count of maps per primary_skill."""
+    conn = _get_sqlite_conn()
+    if not conn:
+        return {}
+    try:
+        rows = conn.execute("SELECT primary_skill, COUNT(*) FROM maps GROUP BY primary_skill ORDER BY COUNT(*) DESC").fetchall()
+        conn.close()
+        return {row[0]: row[1] for row in rows}
+    except:
+        try: conn.close()
+        except: pass
+        return {}
+
+def sqlite_get_total_count():
+    """Get total map count from SQLite."""
+    conn = _get_sqlite_conn()
+    if not conn:
+        return 0
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM maps").fetchone()[0]
+        conn.close()
+        return count
+    except:
+        try: conn.close()
+        except: pass
+        return 0
+
+# Initialize databases
+try:
+    has_sqlite = _init_sqlite_db()
+    
+    # Fallback: Load JSON if no SQLite DB
+    if not has_sqlite:
+        for candidate_dir in [getattr(sys, "_MEIPASS", ""), os.path.dirname(os.path.abspath(__file__)), os.getcwd(), r"C:\Users\louis\.gemini\antigravity\scratch"]:
+            if not candidate_dir: continue
+            db_path = os.path.join(candidate_dir, "compact_ranked_maps.json")
+            if not DYNAMIC_RANKED_MAPS_DB and os.path.exists(db_path):
+                with open(db_path, "r", encoding="utf-8") as f:
+                    DYNAMIC_RANKED_MAPS_DB = json.load(f)
+                    DYNAMIC_MAPS_BY_SKILL = {}
+                    for m in DYNAMIC_RANKED_MAPS_DB:
+                        sk = m.get('primary_skill', 'Aim')
+                        if sk not in DYNAMIC_MAPS_BY_SKILL:
+                            DYNAMIC_MAPS_BY_SKILL[sk] = []
+                        DYNAMIC_MAPS_BY_SKILL[sk].append(m)
+
+    for candidate_dir in [getattr(sys, "_MEIPASS", ""), os.path.dirname(os.path.abspath(__file__)), os.getcwd(), r"C:\Users\louis\.gemini\antigravity\scratch"]:
+        if not candidate_dir: continue
         t_path = os.path.join(candidate_dir, "official_tournament_pools.json")
         if not OFFICIAL_TOURNAMENTS_DB and os.path.exists(t_path):
             with open(t_path, "r", encoding="utf-8") as f:
@@ -233,7 +343,6 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
     req_mod = str(mod or "NM").upper().strip()
     if req_mod in ["NONE", "NO MOD", "NOMOD", "AUTO"]:
         req_mod = "NM"
-
     if req_mod in banned_mods:
         req_mod = "NM"
 
@@ -245,55 +354,94 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
     elif req_mod == "EZ":
         query_sr = min(9.5, target_sr / 0.72)
 
-    pool = DYNAMIC_MAPS_BY_SKILL.get(category)
-    if not pool:
-        pool = DYNAMIC_RANKED_MAPS_DB if DYNAMIC_RANKED_MAPS_DB else AI_BENCHMARK_POOL.get(category, AI_BENCHMARK_POOL.get("Aim", []))
-
-    scored_candidates = []
-    # Filter candidates by SR proximity and user feedback
-    sr_close_pool = [m for m in pool if abs(float(m.get('sr', 5.0)) - query_sr) <= 0.90]
-    eval_pool = sr_close_pool if sr_close_pool else pool
-
-    # Sample randomly if pool is large to ensure maximum variety and sub-millisecond response
-    sample_pool = random.sample(eval_pool, min(len(eval_pool), 150)) if len(eval_pool) > 150 else eval_pool
-
-    for m in sample_pool:
-        m_id = str(m.get('id', ''))
-        if m_id in exclude_ids or m.get('id') in exclude_ids:
-            continue
-
-        # Check User Thumbs-Down Feedback
-        if user_feedback and isinstance(user_feedback, dict):
-            fb = user_feedback.get(m_id)
-            if fb and fb.get("liked") is False:
-                continue  # AUTO-SKIP: Map explicitly downvoted by user!
-
-        fp = compute_map_pattern_fingerprint(m)
-        aff_score = fp.get(category, 0.50)
-
-        # If map is already pre-classified in DYNAMIC_MAPS_BY_SKILL as this category, guarantee high baseline affinity
-        if m.get('primary_skill') == category:
-            aff_score = max(aff_score, 0.75)
-
-        # User Thumbs-Up Boost
-        if user_feedback and isinstance(user_feedback, dict):
-            fb = user_feedback.get(m_id)
-            if fb and fb.get("liked") is True:
-                aff_score += 0.35
-
-        sr_diff = abs(float(m.get('sr', 5.0)) - query_sr)
-        rank_metric = aff_score * 2.0 - sr_diff
-        scored_candidates.append((rank_metric, aff_score, sr_diff, m))
-
-    scored_candidates.sort(key=lambda x: x[0], reverse=True)
-
-    # Filter top candidates
-    top_candidates = [item[3] for item in scored_candidates if item[2] <= 0.65]
-    if not top_candidates:
-        top_candidates = [item[3] for item in scored_candidates[:5]] if scored_candidates else pool
-
-    chosen = random.choice(top_candidates[:5]) if len(top_candidates) >= 5 else top_candidates[0]
+    # === SQLite Path (accurate HitObject-based classification) ===
+    if BEATMAP_SQLITE_DB_PATH:
+        sr_range = 0.80
+        candidates = sqlite_query_maps(
+            skill=category,
+            sr_min=round(query_sr - sr_range, 2),
+            sr_max=round(query_sr + sr_range, 2),
+            exclude_ids=exclude_ids,
+            limit=200,
+            order_by="playcount DESC"
+        )
+        
+        # Widen SR range if not enough candidates
+        if len(candidates) < 5:
+            candidates = sqlite_query_maps(
+                skill=category,
+                sr_min=round(query_sr - 1.5, 2),
+                sr_max=round(query_sr + 1.5, 2),
+                exclude_ids=exclude_ids,
+                limit=200,
+                order_by="playcount DESC"
+            )
+        
+        # Also try secondary_skill if still sparse
+        if len(candidates) < 3:
+            conn = _get_sqlite_conn()
+            if conn:
+                try:
+                    rows = conn.execute(
+                        "SELECT * FROM maps WHERE secondary_skill = ? AND sr BETWEEN ? AND ? ORDER BY playcount DESC LIMIT 100",
+                        (category, round(query_sr - 1.2, 2), round(query_sr + 1.2, 2))
+                    ).fetchall()
+                    candidates.extend([dict(r) for r in rows if str(dict(r).get("id","")) not in exclude_ids])
+                    conn.close()
+                except:
+                    try: conn.close()
+                    except: pass
+        
+        if candidates:
+            # Filter by user feedback
+            if user_feedback and isinstance(user_feedback, dict):
+                candidates = [m for m in candidates if not (user_feedback.get(str(m.get("id","")), {}).get("liked") is False)]
+            
+            # Pick from top candidates with randomness for variety
+            top_pool = candidates[:20]
+            chosen = random.choice(top_pool) if len(top_pool) > 1 else top_pool[0]
+        else:
+            # Absolute fallback: any map near the SR
+            fallback = sqlite_query_maps(sr_min=round(query_sr - 1.0, 2), sr_max=round(query_sr + 1.0, 2), limit=50)
+            chosen = random.choice(fallback) if fallback else {"id": "0", "name": "Unknown", "sr": query_sr, "bpm": 180, "cs": 4.0, "ar": 9.0, "od": 8.0, "len": 120, "status": "Ranked", "year": 2024}
     
+    # === JSON Fallback Path ===
+    else:
+        pool = DYNAMIC_MAPS_BY_SKILL.get(category)
+        if not pool:
+            pool = DYNAMIC_RANKED_MAPS_DB if DYNAMIC_RANKED_MAPS_DB else []
+
+        sr_close_pool = [m for m in pool if abs(float(m.get('sr', 5.0)) - query_sr) <= 0.90]
+        eval_pool = sr_close_pool if sr_close_pool else pool
+
+        sample_pool = random.sample(eval_pool, min(len(eval_pool), 150)) if len(eval_pool) > 150 else eval_pool
+
+        scored_candidates = []
+        for m in sample_pool:
+            m_id = str(m.get('id', ''))
+            if m_id in exclude_ids:
+                continue
+            if user_feedback and isinstance(user_feedback, dict):
+                fb = user_feedback.get(m_id)
+                if fb and fb.get("liked") is False:
+                    continue
+
+            fp = compute_map_pattern_fingerprint(m)
+            aff_score = fp.get(category, 0.50)
+            if m.get('primary_skill') == category:
+                aff_score = max(aff_score, 0.75)
+
+            sr_diff = abs(float(m.get('sr', 5.0)) - query_sr)
+            rank_metric = aff_score * 2.0 - sr_diff
+            scored_candidates.append((rank_metric, aff_score, sr_diff, m))
+
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        top_candidates = [item[3] for item in scored_candidates if item[2] <= 0.65]
+        if not top_candidates:
+            top_candidates = [item[3] for item in scored_candidates[:5]] if scored_candidates else pool
+        chosen = random.choice(top_candidates[:5]) if len(top_candidates) >= 5 else (top_candidates[0] if top_candidates else {"id": "0", "name": "Unknown", "sr": query_sr, "bpm": 180, "cs": 4.0, "ar": 9.0, "od": 8.0, "len": 120})
+
+    # === Build result (shared for both paths) ===
     raw_sr = float(chosen.get('sr', 5.0))
     raw_bpm = int(chosen.get('bpm', 180))
     raw_cs = float(chosen.get('cs', 4.0))
@@ -301,15 +449,9 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
     raw_od = float(chosen.get('od', 8.0))
     raw_len = int(chosen.get('len', 120))
 
-    # Apply Mod attribute scaling
-    eff_sr = raw_sr
-    eff_bpm = raw_bpm
-    eff_cs = raw_cs
-    eff_ar = raw_ar
-    eff_od = raw_od
-    eff_len = raw_len
-
+    eff_sr, eff_bpm, eff_cs, eff_ar, eff_od, eff_len = raw_sr, raw_bpm, raw_cs, raw_ar, raw_od, raw_len
     mod_suffix = ""
+
     if req_mod in ["DT", "NC"]:
         eff_sr = round(raw_sr * 1.40, 2)
         eff_bpm = int(raw_bpm * 1.5)
@@ -346,6 +488,8 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
     else:
         mod_goal_prefix = ""
 
+    # Use real description from SQLite if available
+    map_desc = str(chosen.get('description', '') or '')
     base_goals = {
         'Consistency': f"Versuche einen stabilen 97.5%+ FC über die gesamte Map ({dur_str}) ohne Nervosität zu halten.",
         'Speed': f"Kontrollierte Finger-Beschleunigung und saubere Tapping-Acc auf den {eff_bpm} BPM Bursts.",
@@ -357,12 +501,16 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
         'Precision': f"Exakte Treffer auf die kleinen CS {eff_cs:.1f} Circles mit maximaler Treffsicherheit."
     }
     
+    goal_text = mod_goal_prefix + base_goals.get(category, "Spiele die Map mit vollem Fokus auf saubere Accuracy.")
+    if map_desc:
+        goal_text += f" ({map_desc})"
+
     rating = f"{min(9.9, max(9.1, 9.2 + (eff_sr % 0.7))):.1f}/10"
     
     return {
-        'id': chosen['id'],
-        'name': chosen['name'] + mod_suffix,
-        'raw_name': chosen['name'],
+        'id': chosen.get('id', '0'),
+        'name': str(chosen.get('name', 'Unknown')) + mod_suffix,
+        'raw_name': str(chosen.get('name', 'Unknown')),
         'sr': eff_sr,
         'raw_sr': raw_sr,
         'year': chosen.get('year', 2024),
@@ -370,12 +518,13 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
         'rating': rating,
         'type': category,
         'mod': req_mod,
-        'goal': mod_goal_prefix + base_goals.get(category, "Spiele die Map mit vollem Fokus auf saubere Accuracy."),
+        'goal': goal_text,
         'bpm': eff_bpm,
         'cs': eff_cs,
         'ar': eff_ar,
         'od': eff_od,
-        'len': eff_len
+        'len': eff_len,
+        'description': map_desc,
     }
 
 def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
@@ -471,24 +620,20 @@ def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
 
     sum_w = sum(weights) or 1.0
     weighted_raw_sr = sum(r * w for r, w in zip(raw_srs, weights)) / sum_w
-    weighted_eff_sr = sum(e * w for e, w in zip(effective_srs, weights)) / sum_w
+    # Set benchmark difficulty to 0.55* below Top Plays (comfort baseline / skill floor)
+    effective_sr_calibrated = max(3.0, min(9.5, weighted_raw_sr - 0.55))
     weighted_acc = sum(a * w for a, w in zip(accs, weights)) / sum_w
     weighted_misses = sum(m * w for m, w in zip(misses_list, weights)) / sum_w
 
-    if weighted_misses <= 0.5 and weighted_acc >= 98.0:
-        tier = "Pushing (Hohe Acc & FCs -> Schwierigkeit +★)"
-    elif weighted_misses <= 1.8 and weighted_acc >= 95.0:
-        tier = "Sweet Spot (Gleichmaessig -> Exakte Stufe)"
-    else:
-        tier = "Consistency-Fokus (Misses/niedrige Acc -> Fundament festigen -★)"
+    tier = "Adaptive Baseline (~0.55★ unter Top-Plays)"
 
     return {
         "base_raw_sr": round(weighted_raw_sr, 2),
-        "effective_sr": round(weighted_eff_sr, 2),
+        "effective_sr": round(effective_sr_calibrated, 2),
         "avg_acc": round(weighted_acc, 2),
         "avg_misses": round(weighted_misses, 2),
         "mastery_tier": tier,
-        "explanation": f"Echter Top-Play Durchschnitt: ★ {weighted_raw_sr:.2f} (Acc: {weighted_acc:.1f}%, Misses: {weighted_misses:.1f}) -> Angepasste Trainings-Schwierigkeit: ★ {weighted_eff_sr:.2f}"
+        "explanation": f"Echter Top-Play Durchschnitt: ★ {weighted_raw_sr:.2f} (Acc: {weighted_acc:.1f}%) -> Benchmark-Test-Schwierigkeit (-0.55★ für realistischen Skill-Floor): ★ {effective_sr_calibrated:.2f}"
     }
 
 def calculate_skill_test_score(acc, misses, h50=0, maxcombo=0, map_sr=5.5, player_sr=5.5):
@@ -1279,432 +1424,1070 @@ def is_windows_autostart_enabled():
 AI_BENCHMARK_POOL = {
     "Consistency": [
         {
-            "id": "5744015",
-            "name": "Boxplot - Escape With The Clouds (V.I.P.) [Skybound]",
-            "sr": 4.6,
-            "year": 2026,
+            "id": "25863",
+            "name": "Tarou - Danjo [DJPop's Insane]",
+            "sr": 4.26,
+            "year": 2009,
             "status": "Ranked",
-            "rating": "9.6/10",
+            "rating": "9.5/10",
             "type": "Consistency",
-            "goal": "Versuche einen stabilen 97.5%+ FC ohne Nervositaet zu halten."
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
         },
         {
-            "id": "5456847",
-            "name": "MORE MORE JUMP! x Hatsune Miku - Torinoko City [Solitude]",
-            "sr": 4.1,
-            "year": 2026,
+            "id": "946065",
+            "name": "Koizumi Hanayo(CV.Kubo Yurika) - Kodoku na Heaven [Another]",
+            "sr": 4.29,
+            "year": 2016,
             "status": "Ranked",
-            "rating": "9.8/10",
+            "rating": "9.5/10",
             "type": "Consistency",
-            "goal": "Halte die hohe Konsistenz ueber den gesamten Song."
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
         },
         {
-            "id": "4329827",
-            "name": "LiSA - dawn (TV Size) [Insane]",
-            "sr": 4.8,
-            "year": 2024,
-            "status": "Ranked",
-            "rating": "9.8/10",
+            "id": "3247007",
+            "name": "Cookie Run - Meet Lime Cookie! [LAIMU KUKI [angry]]",
+            "sr": 4.39,
+            "year": 2022,
+            "status": "Loved",
+            "rating": "9.5/10",
             "type": "Consistency",
-            "goal": "Behalte die Ruhe in den dichten Mustern und halte mindestens 96.0% Acc."
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
         },
         {
-            "id": "5142205",
-            "name": "Ito Kashitaro - Fairytale, [Tranquility]",
-            "sr": 5.7,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.3/10",
-            "type": "Consistency",
-            "goal": "Konsistentes Flow-Aim ueber die gesamte Map mit >96.5% Acc."
-        },
-        {
-            "id": "3284712",
-            "name": "ClariS - Gravity [Beyond]",
-            "sr": 5.8,
+            "id": "3583471",
+            "name": "Loar feat. Hatsune Miku - Kanjou Deceive [ellae's Insane]",
+            "sr": 4.46,
             "year": 2022,
             "status": "Ranked",
-            "rating": "9.4/10",
+            "rating": "9.5/10",
             "type": "Consistency",
-            "goal": "Gleichmaessiges Snap-Aim ueber die gesamte Map mit >97.0% Acc."
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
         },
         {
-            "id": "4429732",
-            "name": "Rui Kamishiro (CV: Shunichi Toki) - Showtime Ruler [Extra]",
-            "sr": 5.8,
-            "year": 2024,
+            "id": "1889456",
+            "name": "Perfume - Laser Beam [Namki's Insane]",
+            "sr": 4.47,
+            "year": 2019,
             "status": "Ranked",
-            "rating": "9.4/10",
+            "rating": "9.5/10",
             "type": "Consistency",
-            "goal": "Meistere die Konsistenz auf schnellen Patterns ohne Misses."
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
         },
         {
-            "id": "4894709",
-            "name": "USAO - Interstellar Travel [Collab Expert]",
-            "sr": 5.8,
+            "id": "57380",
+            "name": "Nightcore - You Got Me Dancing [Insane]",
+            "sr": 4.48,
+            "year": 2010,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "659340",
+            "name": "u's - Music S.T.A.R.T!! [Nachi's Insane]",
+            "sr": 4.61,
+            "year": 2015,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "2166086",
+            "name": "sasakure.UK - Hisekai Harmonize feat. Kagamine Rin [zzx's Insane]",
+            "sr": 4.63,
+            "year": 2020,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "197745",
+            "name": "Kalafina - Manten [Collab]",
+            "sr": 4.64,
+            "year": 2022,
+            "status": "Loved",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "497679",
+            "name": "u's - Snow halation [Mochi's Insane]",
+            "sr": 4.66,
+            "year": 2016,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "1876631",
+            "name": "BlackY vs. Yooh - HAVOX [Ayyri's EXHAUST]",
+            "sr": 4.76,
+            "year": 2019,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "4545541",
+            "name": "Porter Robinson - Get Your Wish (Sewerslvt Remix) [lecandy's insane]",
+            "sr": 4.78,
             "year": 2025,
             "status": "Ranked",
-            "rating": "9.4/10",
+            "rating": "9.5/10",
             "type": "Consistency",
-            "goal": "Halte deine Genauigkeit auch auf High-Star Dichte stabil."
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "180103",
+            "name": "Shounen Radio - neu [Chrome]",
+            "sr": 4.81,
+            "year": 2013,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "1103520",
+            "name": "Nardis - Cosmo Memory [Ongaku's Another]",
+            "sr": 4.81,
+            "year": 2016,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
+        },
+        {
+            "id": "3481618",
+            "name": "MisomyL - Amnehilesie [amb1's Insane]",
+            "sr": 4.82,
+            "year": 2022,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Consistency",
+            "goal": "Stabiler Run auf dieser Consistency-Benchmark Map."
         }
     ],
     "Speed": [
         {
-            "id": "5385000",
-            "name": "DJKurara - Japanese Transformation [Reol's Insane]",
-            "sr": 4.9,
-            "year": 2026,
+            "id": "2449709",
+            "name": "Dua Lipa - Physical [Yuuya's Insane]",
+            "sr": 4.0,
+            "year": 2020,
             "status": "Ranked",
-            "rating": "9.2/10",
+            "rating": "9.5/10",
             "type": "Speed",
-            "goal": "Spiele die schnellen Bursts sauber ohne Fingerlocking mit >96.5% Acc."
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
         },
         {
-            "id": "4442738",
-            "name": "Yorushika - Haru (TV Size) [Insane]",
-            "sr": 4.8,
-            "year": 2024,
+            "id": "199600",
+            "name": "Suzuki Konomi - DAYS of DASH [A32's Hard]",
+            "sr": 4.0,
+            "year": 2013,
             "status": "Ranked",
-            "rating": "9.8/10",
+            "rating": "9.5/10",
             "type": "Speed",
-            "goal": "Schnelle Tapping-Bursts kontrolliert durchspielen."
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
         },
         {
-            "id": "4379484",
-            "name": "xi - Longinus [Insane]",
-            "sr": 5.6,
-            "year": 2024,
+            "id": "490802",
+            "name": "Haruna Luna - Startear [Insane]",
+            "sr": 4.01,
+            "year": 2014,
             "status": "Ranked",
-            "rating": "9.2/10",
+            "rating": "9.5/10",
             "type": "Speed",
-            "goal": "Kontrolliere die schnellen Burst-Wechsel (212 BPM) mit lockerer Handhaltung."
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
         },
         {
-            "id": "4437059",
-            "name": "Camellia - Xeroa [PaRaDogi's INFINITE]",
-            "sr": 5.5,
-            "year": 2024,
+            "id": "2040225",
+            "name": "Aimer - L-O-V-E [sunset serenade]",
+            "sr": 4.02,
+            "year": 2019,
             "status": "Ranked",
-            "rating": "9.8/10",
+            "rating": "9.5/10",
             "type": "Speed",
-            "goal": "220 BPM High-Speed Bursts mit sauberem Tapping-Release."
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
         },
         {
-            "id": "2116202",
-            "name": "Kurokotei - Galaxy Collapse [Cataclysmic Hypernova]",
-            "sr": 7.5,
+            "id": "483882",
+            "name": "FELT - Goldrop [Lunatic]",
+            "sr": 4.03,
+            "year": 2014,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "2503310",
+            "name": "zts - Captain Murasa [Nostalgic]",
+            "sr": 4.07,
+            "year": 2020,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "3245459",
+            "name": "lapix - Amazing Mirage (Extended) [Pho's Hard]",
+            "sr": 4.07,
+            "year": 2021,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "107297",
+            "name": "Kat DeLuna ft. Busta Rhymes - Run The Show (Nightcore Mix) [Insane]",
+            "sr": 4.07,
+            "year": 2011,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "2923932",
+            "name": "Den x JustaTee - Di Ve Nha [Insane]",
+            "sr": 4.09,
             "year": 2024,
             "status": "Ranked",
             "rating": "9.5/10",
             "type": "Speed",
-            "goal": "Pushe dein Speed-Limit mit maximaler Tapping-Frequenz (230 BPM)."
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "1184133",
+            "name": "Kraus - Pitch Fucker [Insane: Anxiety]",
+            "sr": 4.09,
+            "year": 2017,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "62963",
+            "name": "Helblinde - Ritsuen!! [HappyMix]",
+            "sr": 4.12,
+            "year": 2010,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "166151",
+            "name": "The Cab - Angel With A Shotgun (Nightcore Mix) [Giffen's Shotgun]",
+            "sr": 4.13,
+            "year": 2018,
+            "status": "Loved",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "125245",
+            "name": "Cascada - Ready Or Not (Nightcore Mix) [Insane]",
+            "sr": 4.17,
+            "year": 2012,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "236524",
+            "name": "Aoi Eir - Satellite [Insane]",
+            "sr": 4.17,
+            "year": 2014,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
+        },
+        {
+            "id": "2813113",
+            "name": "Kasokaso (Prismagic) feat. Sennzai - Watashi wa Yume to Kimi no Tame ni [Hyper]",
+            "sr": 4.17,
+            "year": 2021,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Speed",
+            "goal": "Stabiler Run auf dieser Speed-Benchmark Map."
         }
     ],
     "Aim": [
         {
-            "id": "5456847",
-            "name": "MORE MORE JUMP! x Hatsune Miku - Torinoko City [Solitude]",
-            "sr": 4.1,
-            "year": 2026,
+            "id": "4214887",
+            "name": "Kenshi Yonezu - KICK BACK [HARD]",
+            "sr": 4.0,
+            "year": 2025,
             "status": "Ranked",
-            "rating": "9.8/10",
+            "rating": "9.5/10",
             "type": "Aim",
-            "goal": "Saubere Jump-Snaps und gleichmaessige Cursor-Bewegung."
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
         },
         {
-            "id": "3741633",
-            "name": "ATARASHII GAKKO! - Koi Geba [NcFix's Insane]",
-            "sr": 4.8,
+            "id": "2514799",
+            "name": "Kuroki Nagisa - Genten Kaiki [Hard]",
+            "sr": 4.05,
+            "year": 2020,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "2701767",
+            "name": "Katy Perry - E.T. (Cut Ver.) [Mk's Light Insane]",
+            "sr": 4.1,
+            "year": 2021,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "4091479",
+            "name": "Yorushika - Shayou (TV Size) [Lost's Insane]",
+            "sr": 4.13,
             "year": 2023,
             "status": "Ranked",
-            "rating": "9.8/10",
+            "rating": "9.5/10",
             "type": "Aim",
-            "goal": "Praezises Treffen der schnellen Circle-Muster."
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
         },
         {
-            "id": "5518498",
-            "name": "MORE MORE JUMP! x Kagamine Rin - KILLER [INSANE]",
-            "sr": 5.3,
-            "year": 2026,
+            "id": "2519731",
+            "name": "Inui Toko - Kimagure Romantic [Light Insane]",
+            "sr": 4.14,
+            "year": 2020,
             "status": "Ranked",
-            "rating": "9.6/10",
+            "rating": "9.5/10",
             "type": "Aim",
-            "goal": "Saubere Jump-Snaps auf weite Winkel mit >98.0% Acc."
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
         },
         {
-            "id": "3378159",
-            "name": "LiSA - Gurenge feat. Un3h [ dj-Jo Remix ] TV Size [toybot's Expert]",
-            "sr": 5.4,
-            "year": 2022,
-            "status": "Ranked",
-            "rating": "9.7/10",
-            "type": "Aim",
-            "goal": "Treffe die scharfen Ecken praezise im Takt."
-        },
-        {
-            "id": "4268400",
-            "name": "TUYU - Shuuten no Saki ga Aru to Suru naraba. [Extra]",
-            "sr": 6.0,
+            "id": "4578832",
+            "name": "ClariS - CLICK (TV Size) [Insane]",
+            "sr": 4.27,
             "year": 2024,
             "status": "Ranked",
-            "rating": "9.6/10",
+            "rating": "9.5/10",
             "type": "Aim",
-            "goal": "Pushe deine Aim-Velocity auf High-Star Jumps."
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
         },
         {
-            "id": "5383289",
-            "name": "MORE MORE JUMP! x Kagamine Rin - KILLER [EXPERT]",
-            "sr": 6.5,
-            "year": 2026,
+            "id": "3949637",
+            "name": "kessoku band - Flashbacker [Spotlight]",
+            "sr": 4.27,
+            "year": 2023,
             "status": "Ranked",
-            "rating": "9.4/10",
+            "rating": "9.5/10",
             "type": "Aim",
-            "goal": "Praezises Cross-Screen Aim ohne Over- oder Undershooting."
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
         },
         {
-            "id": "5188664",
-            "name": "MORE MORE JUMP! x Kagamine Rin - KILLER [NEVER GIVE UP!]",
-            "sr": 7.6,
-            "year": 2026,
+            "id": "4271479",
+            "name": "mimimemeMIMI - CANDY MAGIC (TV Size) [Confession]",
+            "sr": 4.29,
+            "year": 2024,
             "status": "Ranked",
-            "rating": "9.8/10",
+            "rating": "9.5/10",
             "type": "Aim",
-            "goal": "Meistere extreme Jump-Geschwindigkeit und weite Distanzen."
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "4600555",
+            "name": "OxT - HOLLOW HUNGER (TV Size) [INSANE]",
+            "sr": 4.29,
+            "year": 2024,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "1118258",
+            "name": "Savage Garden - I Want You (TV Size) [Insane]",
+            "sr": 4.3,
+            "year": 2021,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "3502817",
+            "name": "Mizutani Runa (NanosizeMir) - Philosophyz ~TV animation ver.~ (TV Size) [Shunao's Insane]",
+            "sr": 4.31,
+            "year": 2022,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "3062395",
+            "name": "LOONA - Star [Orbit]",
+            "sr": 4.4,
+            "year": 2021,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "3948636",
+            "name": "Utada Hikaru - PINK BLOOD [I]",
+            "sr": 4.41,
+            "year": 2023,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "53493",
+            "name": "Nelly ft. Fergie - Party People [KIRBY'S BIRTHDAY PARTY!]",
+            "sr": 4.5,
+            "year": 2010,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
+        },
+        {
+            "id": "3096787",
+            "name": "glass beach - cold weather [i love the way you make me feel]",
+            "sr": 4.52,
+            "year": 2022,
+            "status": "Loved",
+            "rating": "9.5/10",
+            "type": "Aim",
+            "goal": "Stabiler Run auf dieser Aim-Benchmark Map."
         }
     ],
     "Stamina": [
         {
-            "id": "3055652",
-            "name": "DRAGON EYES - Twilight Symphony [PaRaDogi's Extra]",
-            "sr": 5.5,
-            "year": 2023,
-            "status": "Ranked",
-            "rating": "9.8/10",
-            "type": "Stamina",
-            "goal": "4:12 Minuten Dauer-Drain ohne Erschoepfung durchspielen (>97.0% Acc)."
-        },
-        {
-            "id": "5591821",
-            "name": "Yooh - Ice Angel [Divination Break]",
-            "sr": 5.7,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.3/10",
-            "type": "Stamina",
-            "goal": "Lange Stream-Passagen mit minimaler Unterarm-Spannung durchspielen."
-        },
-        {
-            "id": "3829104",
-            "name": "UNDEAD CORPORATION - The Empress [Insane]",
-            "sr": 5.2,
-            "year": 2024,
+            "id": "376291",
+            "name": "Lia - Saya's Song Remix [Saya]",
+            "sr": 4.51,
+            "year": 2014,
             "status": "Ranked",
             "rating": "9.5/10",
             "type": "Stamina",
-            "goal": "Gleichmaessige Ausdauer bei 195 BPM Dauer-Streams."
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
         },
         {
-            "id": "2415087",
-            "name": "DragonForce - Symphony of the Night [Legend]",
-            "sr": 6.3,
+            "id": "3649448",
+            "name": "Kanye West - I Wonder [Graduation]",
+            "sr": 4.52,
+            "year": 2024,
+            "status": "Loved",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "4150232",
+            "name": "Ryokuoushoku Shakai - Zutto Zutto Zutto [Collab Insane]",
+            "sr": 4.7,
             "year": 2023,
             "status": "Ranked",
-            "rating": "9.6/10",
+            "rating": "9.5/10",
             "type": "Stamina",
-            "goal": "5+ Minuten Marathon-Ausdauer mit gleichbleibendem Fingerdruck."
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "563971",
+            "name": "ChouCho - starlog [Insane]",
+            "sr": 4.82,
+            "year": 2015,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "963412",
+            "name": "Reol - Gokusaishiki [HW's Another]",
+            "sr": 4.84,
+            "year": 2016,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "429789",
+            "name": "Chata - Nocte of desperatio [Walpurgisnacht]",
+            "sr": 4.85,
+            "year": 2015,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "1821081",
+            "name": "Laur - Sound Chimera [Orthrus]",
+            "sr": 4.95,
+            "year": 2018,
+            "status": "Loved",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "2692580",
+            "name": "Minami - Lilac [Insane]",
+            "sr": 4.95,
+            "year": 2022,
+            "status": "Loved",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "941569",
+            "name": "sana - Packet Hero [LENXIS' Insane]",
+            "sr": 4.98,
+            "year": 2016,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "1909205",
+            "name": "ReoNa - forget-me-not [life goes on]",
+            "sr": 5.02,
+            "year": 2019,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "2880786",
+            "name": "minimum electric design - Hoshikuzu no Shoumei [Collab Lunatic]",
+            "sr": 5.03,
+            "year": 2021,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "379411",
+            "name": "MiddleIsland - Magnetic Shift [UWS's Extra]",
+            "sr": 5.08,
+            "year": 2014,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "1772924",
+            "name": "Culprate & Joe Ford - Gaucho [Kalibe x LCFC's Insane]",
+            "sr": 5.08,
+            "year": 2018,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "4481120",
+            "name": "Akatsuki Records - Bloody Devotion [Lunatic]",
+            "sr": 5.08,
+            "year": 2025,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
+        },
+        {
+            "id": "991609",
+            "name": "nano - Omoide Kakera [Habi's Insane]",
+            "sr": 5.1,
+            "year": 2016,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Stamina",
+            "goal": "Stabiler Run auf dieser Stamina-Benchmark Map."
         }
     ],
     "Tech": [
         {
-            "id": "5587354",
-            "name": "C-Show - AImee feat. Aitsuki Nakuru [Insane]",
-            "sr": 4.8,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.8/10",
-            "type": "Tech",
-            "goal": "Folge den schnellen Slider-Geschwindigkeiten ohne Slider-Breaks."
-        },
-        {
-            "id": "5662010",
-            "name": "Laur - Sound Chimera (Nyankovsky & Kobaryo Remix) [Insane]",
-            "sr": 5.1,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.4/10",
-            "type": "Tech",
-            "goal": "Lies die ungeraden Rhythmen und treffe die komplexen Slider-Heads."
-        },
-        {
-            "id": "5585617",
-            "name": "kikoyu - i. immaturity [don't come back.]",
-            "sr": 5.2,
-            "year": 2026,
+            "id": "902037",
+            "name": "MY FIRST STORY - Fukagyaku Replace [Irre's Insane]",
+            "sr": 4.37,
+            "year": 2016,
             "status": "Ranked",
             "rating": "9.5/10",
             "type": "Tech",
-            "goal": "Praezises Lesen von schnellen Slider-Velocity Wechseln."
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
         },
         {
-            "id": "5587356",
-            "name": "C-Show - AImee feat. Aitsuki Nakuru [New World]",
-            "sr": 6.1,
-            "year": 2026,
+            "id": "1643844",
+            "name": "M2U - Stellar [defiance's Insane]",
+            "sr": 4.53,
+            "year": 2018,
             "status": "Ranked",
-            "rating": "9.7/10",
+            "rating": "9.5/10",
             "type": "Tech",
-            "goal": "Meistere unkonventionelle Slider-Formen und Winkel."
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
         },
         {
-            "id": "3539583",
-            "name": "Maozon - Stasis [Expert]",
-            "sr": 6.5,
-            "year": 2023,
+            "id": "1403207",
+            "name": "ak+q - Vexaria [_83's Light Insane]",
+            "sr": 4.58,
+            "year": 2017,
             "status": "Ranked",
-            "rating": "9.4/10",
+            "rating": "9.5/10",
             "type": "Tech",
-            "goal": "Meistere die schnellen Slider-Ticks mit exaktem Timing."
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
         },
         {
-            "id": "5640345",
-            "name": "Laur - Sound Chimera (Nyankovsky & Kobaryo Remix) [Boppin's Blaster]",
-            "sr": 7.8,
-            "year": 2026,
+            "id": "1487640",
+            "name": "Hommarju - Rock It [Underdogs' Insane]",
+            "sr": 4.6,
+            "year": 2018,
             "status": "Ranked",
-            "rating": "9.3/10",
+            "rating": "9.5/10",
             "type": "Tech",
-            "goal": "Extreme Tech-Dynamik, Tag-Patterns und Slider-Kontrolle auf Apex-Niveau."
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "2792178",
+            "name": "hololive IDOL PROJECT - Candy-Go-Round [Amasea's Insane]",
+            "sr": 4.73,
+            "year": 2021,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "4728866",
+            "name": "Hatsuki Yura - HAMELN [Insane]",
+            "sr": 4.76,
+            "year": 2022,
+            "status": "Loved",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "4441018",
+            "name": "Yorushika - Haru (TV Size) [Insane]",
+            "sr": 4.8,
+            "year": 2024,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "1110592",
+            "name": "Naoki Miki(CV.Takahashi Rie) & Ebisuzawa Kurumi(CV.Ozawa Ari) - Unhappy End World [thzz's Insane]",
+            "sr": 4.81,
+            "year": 2017,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "1225664",
+            "name": "Mitsuyoshi Takenobu no Ani - Amphisbaena [Insane]",
+            "sr": 4.82,
+            "year": 2019,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "456247",
+            "name": "Igorrr - Double Monk [Insane]",
+            "sr": 4.9,
+            "year": 2014,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "1917090",
+            "name": "Nekomata Master+ - encounter [defiance's Insane]",
+            "sr": 4.99,
+            "year": 2019,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "994934",
+            "name": "Aqours - Kimi no Kokoro wa Kagayaiteru kai? [Sunshine]",
+            "sr": 5.14,
+            "year": 2016,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "1639264",
+            "name": "CELLON. - Labyrinth of Darkness [Insane]",
+            "sr": 5.14,
+            "year": 2018,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "396761",
+            "name": "kors k - Insane Techniques [Azer's Extra]",
+            "sr": 5.15,
+            "year": 2014,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
+        },
+        {
+            "id": "1059079",
+            "name": "BTS - DOPE [Sick!]",
+            "sr": 5.17,
+            "year": 2016,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Tech",
+            "goal": "Stabiler Run auf dieser Tech-Benchmark Map."
         }
     ],
     "Reading": [
         {
-            "id": "2734039",
-            "name": "steelplus - Event Horizon [Hyper]",
-            "sr": 4.0,
-            "year": 2025,
-            "status": "Ranked",
-            "rating": "9.7/10",
+            "id": "1010920",
+            "name": "Shimotsuki Haruka - Liblume [Heartbreak]",
+            "sr": 4.19,
+            "year": 2022,
+            "status": "Loved",
+            "rating": "9.5/10",
             "type": "Reading",
-            "goal": "Lies die Low-AR (8.0) Approach Circles entspannt ohne Hektik."
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
         },
         {
-            "id": "5697226",
-            "name": "Billie Eilish - WILDFLOWER ['til forever falls apart]",
-            "sr": 4.7,
-            "year": 2026,
+            "id": "2070432",
+            "name": "Nekomata Master - Sayonara Heaven [EX]",
+            "sr": 4.23,
+            "year": 2019,
             "status": "Ranked",
-            "rating": "9.7/10",
+            "rating": "9.5/10",
             "type": "Reading",
-            "goal": "Entspanntes Lesen von versetzten Low-AR Noten."
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
         },
         {
-            "id": "5311191",
-            "name": "DawMii - DiSKN0TZ [?]",
-            "sr": 5.0,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.3/10",
-            "type": "Reading",
-            "goal": "Trainiere Low-AR Reading bei hoher Objektdichte mit >97.5% Acc."
-        },
-        {
-            "id": "3934468",
-            "name": "NH22 - Isolation (Official LIMBO Remix) [vols' Insane]",
-            "sr": 5.4,
-            "year": 2025,
-            "status": "Ranked",
-            "rating": "9.7/10",
-            "type": "Reading",
-            "goal": "Lies ueberlappende Noten ohne Hektik (Auge fuehrt, Hand folgt)."
-        }
-    ],
-    "Streams": [
-        {
-            "id": "3829104",
-            "name": "UNDEAD CORPORATION - The Empress [Insane]",
-            "sr": 5.1,
-            "year": 2024,
-            "status": "Ranked",
-            "rating": "9.4/10",
-            "type": "Streams",
-            "goal": "Saubere 195 BPM Finger-Control bei zusammenhaengenden Streams."
-        },
-        {
-            "id": "4412935",
-            "name": "Chitose Sara - Arcadia [Extra]",
-            "sr": 5.5,
-            "year": 2024,
-            "status": "Ranked",
-            "rating": "9.8/10",
-            "type": "Streams",
-            "goal": "Saubere Finger-Control bei Cutstreams und Spaced Flow mit >98.0% Acc."
-        },
-        {
-            "id": "5591821",
-            "name": "Yooh - Ice Angel [Divination Break]",
-            "sr": 5.7,
-            "year": 2026,
-            "status": "Ranked",
-            "rating": "9.3/10",
-            "type": "Streams",
-            "goal": "Halte die Deathstreams mit gleichmaessigem Fingerdruck und sauberer Spur."
-        },
-        {
-            "id": "188814",
-            "name": "xi - FREEDOM DiVE [Another]",
-            "sr": 6.8,
+            "id": "3602548",
+            "name": "YUKA NAGASE - Miss Parallel World (Short Ver.) [I I I I I I]",
+            "sr": 4.25,
             "year": 2023,
             "status": "Ranked",
-            "rating": "9.9/10",
-            "type": "Streams",
-            "goal": "222 BPM High-BPM Deathstream Kontrolle ohne UR-Spikes."
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
         },
         {
-            "id": "744305",
-            "name": "Imperial Circus Dead Decadence - Uta [Himei]",
-            "sr": 7.1,
-            "year": 2024,
+            "id": "655470",
+            "name": "The Living Tombstone - Five Nights at Freddy's [Insane]",
+            "sr": 4.36,
+            "year": 2015,
             "status": "Ranked",
-            "rating": "9.8/10",
-            "type": "Streams",
-            "goal": "Meistere lange 205 BPM Spaced Streams auf Turnier-Niveau."
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "362423",
+            "name": "Kurubukko vs yukitani - Minamichita EVOLVED [Rz & CB's Hyper]",
+            "sr": 4.36,
+            "year": 2014,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "554519",
+            "name": "UNDEAD CORPORATION - Everything will freeze [Insane]",
+            "sr": 4.37,
+            "year": 2015,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "152726",
+            "name": "Xelia - Illumiscape [Hyper]",
+            "sr": 4.4,
+            "year": 2012,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "195372",
+            "name": "Another Infinity feat. Mayumi Morinaga - COME BACK TO MY HEART (Ryu* Remix) [Advanced]",
+            "sr": 4.41,
+            "year": 2013,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "119376",
+            "name": "Nekomata Master - Byakuya Gentou [Hyper]",
+            "sr": 4.43,
+            "year": 2011,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "1934707",
+            "name": "Hirano Aya, Katou Emiri, Fukuhara Kaori, Endou Aya - Motteke! Sailor Fuku (TV Size) [Insane]",
+            "sr": 4.48,
+            "year": 2019,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "99997",
+            "name": "Chris Brown Feat. Busta Rhymes & Lil Wayne - Look At Me Now [Insane]",
+            "sr": 4.55,
+            "year": 2011,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "1738876",
+            "name": "ZUN - A Sacred Lot [Oni]",
+            "sr": 4.58,
+            "year": 2018,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "1771347",
+            "name": "Bonjour Suzuki - Ano Mori de Matteru(tamame's the Promise Kiss Remix) [+ ktgster]",
+            "sr": 4.66,
+            "year": 2022,
+            "status": "Loved",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "4189623",
+            "name": "ZUN - Shiryou no Yozakura [Sakura Lunatic]",
+            "sr": 4.76,
+            "year": 2023,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
+        },
+        {
+            "id": "57683",
+            "name": "Humanoid - Mendes [Hyper]",
+            "sr": 4.76,
+            "year": 2010,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Reading",
+            "goal": "Stabiler Run auf dieser Reading-Benchmark Map."
         }
     ],
+    "Streams": [],
     "Precision": [
         {
-            "id": "4495142",
-            "name": "Kotoha - you are my curse [hyper]",
-            "sr": 4.4,
-            "year": 2024,
-            "status": "Ranked",
-            "rating": "9.4/10",
-            "type": "Precision",
-            "goal": "Exakte Treffer auf kleine CS 5.5 Circles mit >98.5% Acc."
-        },
-        {
-            "id": "5585617",
-            "name": "kikoyu - i. immaturity [don't come back.]",
-            "sr": 5.2,
-            "year": 2026,
+            "id": "2524925",
+            "name": "Nishiura Tomohito - Professor Layton's Theme [Insane]",
+            "sr": 4.04,
+            "year": 2021,
             "status": "Ranked",
             "rating": "9.5/10",
             "type": "Precision",
-            "goal": "Beherrsche kleine Circles (CS 5.0) mit ruhiger Hand."
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
         },
         {
-            "id": "4922783",
-            "name": "PUP - Bloody Mary, Kate and Ashley [Illusion]",
-            "sr": 5.7,
-            "year": 2025,
+            "id": "345283",
+            "name": "ClariS - with you [Insane]",
+            "sr": 4.24,
+            "year": 2014,
             "status": "Ranked",
-            "rating": "9.3/10",
+            "rating": "9.5/10",
             "type": "Precision",
-            "goal": "Praezises Timing auf kleiner Trefferflaeche (CS 5.2) mit hoher OD."
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "3418834",
+            "name": "Nekomata Master - Caring Dance [milr_'s Another]",
+            "sr": 4.33,
+            "year": 2022,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "2117133",
+            "name": "SHK - Violet Perfume [Matrix's Insane]",
+            "sr": 4.34,
+            "year": 2019,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "2939606",
+            "name": "Marianas Trench - Celebrity Status [Insane]",
+            "sr": 4.37,
+            "year": 2021,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "1224936",
+            "name": "Duca - Shiawase no Otoshimono [sahuang's Insane]",
+            "sr": 4.39,
+            "year": 2017,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "908059",
+            "name": "Seiryu - BLUE DRAGON [Tarrasky's Light Insane]",
+            "sr": 4.41,
+            "year": 2017,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "2604836",
+            "name": "LCA - Sayo Shigure no Uta [Kalindraz's Insane]",
+            "sr": 4.42,
+            "year": 2020,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "48327",
+            "name": "Toyosaki Aki - Cagayake! GIRLS (Full Ver.) [Insane]",
+            "sr": 4.46,
+            "year": 2010,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "764291",
+            "name": "Tatsh - reunion [Chewin's Hyper]",
+            "sr": 4.47,
+            "year": 2015,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "778555",
+            "name": "Celldweller - Senorita Bonita [Insane]",
+            "sr": 4.49,
+            "year": 2015,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "1255391",
+            "name": "ayase rie - yuima-ru*world [Real's Insane]",
+            "sr": 4.53,
+            "year": 2017,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "1022486",
+            "name": "TeddyLoid feat. Bonjour Suzuki - Pipo Password [By Your Side]",
+            "sr": 4.54,
+            "year": 2016,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "33158",
+            "name": "Yousei Teikoku - Last Moment [Insane]",
+            "sr": 4.62,
+            "year": 2009,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
+        },
+        {
+            "id": "2195915",
+            "name": "Yasutaka Nakata - Crazy Crazy (feat. Charli XCX & Kyary Pamyu Pamyu) [Miura's Another]",
+            "sr": 4.64,
+            "year": 2023,
+            "status": "Ranked",
+            "rating": "9.5/10",
+            "type": "Precision",
+            "goal": "Stabiler Run auf dieser Precision-Benchmark Map."
         }
     ]
 }
-
 
 class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
@@ -1712,7 +2495,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.TkdndVersion = TkinterDnD._require(self)
         self.title("UHO Hub")
         self.geometry("980x720")
-        self.minsize(900, 600)
+        self.minsize(980, 680)
 
         self.beatmap_cache = self.load_beatmaps()
         self.levels = [round(4.0 + i*0.1, 1) for i in range(61)]
@@ -2002,8 +2785,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def show_tutorial_welcome(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -2145,8 +2926,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def show_settings(self, active_tab="general"):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -3345,8 +4124,87 @@ del "%~f0" & exit
             self.add_modern_chat_bubble("ai", f"🤖 **Coach-Anpassung:** {resp_txt}")
     def gather_player_context(self):
         ctx = []
-        ctx.append(f"Spieler: {getattr(self, 'osu_username', 'Unbekannt')}")
+        user = getattr(self, 'osu_username', 'Unbekannt')
+        ctx.append(f"Spieler: {user}")
         ctx.append(f"osu! Supporter Status: {'Aktiv' if getattr(self, 'has_osu_supporter', False) else 'Nicht aktiv'}")
+
+        # 0. Live Telemetrie & Aktive Map (Echtzeit-Sitzung)
+        if hasattr(self, "_telemetry_data") and self._telemetry_data:
+            td = self._telemetry_data
+            ctx.append("\n--- AKTUELLE LIVE-OSU!-SESSION (ECHTZEIT-TELEMETRIE) ---")
+            ctx.append(f"• Aktueller Status: {'In Song-Auswahl' if td.get('is_song_select') else ('Im End-Screen' if td.get('is_results_screen') else 'Mitten im Gameplay (Map läuft)')}")
+            ctx.append(f"• Live-PP: {td.get('cur_pp', 0):.1f} pp | If-FC PP: {td.get('if_fc_pp', 0):.1f} pp | Rank: {td.get('grade', 'SS')}")
+            ctx.append(f"• Hits: 100s={td.get('h100', 0)} | 50s={td.get('h50', 0)} | Misses={td.get('h0', 0)} | Sliderbreaks={td.get('sb', 0)}")
+
+        # 1. Zuletzt gespielte Runden (Live aus der offiziellen osu! API)
+        api_k = getattr(self, "api_key", "")
+        if api_k and user and user != "Unbekannt":
+            try:
+                now_t = time.time()
+                cached = getattr(self, "_cached_recent_plays_context", None)
+                last_t = getattr(self, "_cached_recent_plays_time", 0)
+                if not cached or (now_t - last_t > 15):
+                    url = f"https://osu.ppy.sh/api/get_user_recent?k={api_k}&u={user}&m=0&limit=8"
+                    r = requests.get(url, timeout=3.5)
+                    if r.status_code == 200:
+                        rec_plays = r.json()
+                        if not hasattr(self, "_beatmap_title_cache"):
+                            self._beatmap_title_cache = {}
+                        
+                        lines = []
+                        for i, p in enumerate(rec_plays[:5]):
+                            bid = str(p.get("beatmap_id", ""))
+                            # Resolve real map title
+                            map_name = self._beatmap_title_cache.get(bid)
+                            if not map_name:
+                                map_meta = next((m for m in (DYNAMIC_RANKED_MAPS_DB or []) if str(m.get("id")) == bid), None)
+                                if map_meta:
+                                    map_name = map_meta.get("name")
+                                else:
+                                    try:
+                                        bm_r = requests.get(f"https://osu.ppy.sh/api/get_beatmaps?k={api_k}&b={bid}&m=0", timeout=2.5)
+                                        if bm_r.status_code == 200 and bm_r.json():
+                                            bm_data = bm_r.json()[0]
+                                            map_name = f"{bm_data.get('artist')} - {bm_data.get('title')} [{bm_data.get('version')}]"
+                                    except Exception:
+                                        pass
+                            
+                            if not map_name:
+                                map_name = f"Beatmap #{bid}"
+                            else:
+                                self._beatmap_title_cache[bid] = map_name
+                            
+                            h300 = int(p.get("count300", 0))
+                            h100 = int(p.get("count100", 0))
+                            h50 = int(p.get("count50", 0))
+                            miss = int(p.get("countmiss", 0))
+                            combo = int(p.get("maxcombo", 0))
+                            tot = h300 + h100 + h50 + miss
+                            acc = ((h300*300 + h100*100 + h50*50) / (tot*300) * 100) if tot > 0 else 0
+                            
+                            mods_int = int(p.get("enabled_mods", 0) or 0)
+                            mod_str = []
+                            if mods_int & 64: mod_str.append("DT")
+                            if mods_int & 512: mod_str.append("NC")
+                            if mods_int & 16: mod_str.append("HR")
+                            if mods_int & 8: mod_str.append("HD")
+                            if mods_int & 2: mod_str.append("EZ")
+                            if mods_int & 256: mod_str.append("HT")
+                            mods_label = "+".join(mod_str) if mod_str else "NoMod"
+                            rank_badge = p.get("rank", "F")
+                            date_str = p.get("date", "")
+                            
+                            prefix = "[ALLERLETZTE GESPIELTE RUNDE] " if i == 0 else f"[Runde #{i+1}] "
+                            lines.append(f"{prefix}Map: '{map_name}' | Mods: {mods_label} | Rang: {rank_badge} | Acc: {acc:.2f}% | Max Combo: {combo} | Misses: {miss} ({h100}x100, {h50}x50) | Datum: {date_str}")
+                        
+                        self._cached_recent_plays_context = "\n".join(lines) if lines else "Keine Runden in den letzten 24h verzeichnet."
+                        self._cached_recent_plays_time = now_t
+                
+                if getattr(self, "_cached_recent_plays_context", None):
+                    ctx.append("\n--- ZULETZT GESPIELTE RUNDEN (RECENT PLAYS LIVE AUS DER OSU! API) ---")
+                    ctx.append(self._cached_recent_plays_context)
+            except Exception:
+                pass
         
         if getattr(self, "last_profile_analysis", None):
             pa = self.last_profile_analysis
@@ -3488,9 +4346,17 @@ KONTEXT DES AKTUELLEN SPIELERS:
 =============================================================================
 {player_context}
 
-DEINE ANTWORT-RICHTLINIEN:
-- WICHTIG: Alle Analysen gelten AUSSCHLIESSLICH für osu! Standard (Mode 0)!
-- ANTWORTLÄNGE: Standard = ca. 3-5 prägnante Sätze. Auf den Punkt, motivierend und direkt umsetzbar.
+DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
+- SIMPEL, DIREKT & PRÄGNANT: Mache deine Antworten so einfach und übersichtlich wie möglich!
+- WICHTIG ZU 'ZULETZT GESPIELT':
+  * Wenn der Spieler fragt, was er zuletzt gespielt hat (z. B. 'was habe ich zuletzt gespielt?'):
+    -> Nenne ihm NUR die ALLERLETZTE Map (nicht alle 6 Runden als lange Liste aufzählen!).
+    -> Formatiere es extrem simpel und übersichtlich:
+       🎵 **Map:** [Exakter Map-Titel]
+       ⭐ **Ergebnis:** Rang [X] • [Acc]% Acc (Combo: [X] • [X] Misses)
+       💡 **Coach-Tipp:** 1-2 kurze, motivierende Sätze zur Runde.
+  * Zähle NIEMALS ungefragt alle vorherigen Runden als lange Liste auf!
+- Alle Analysen gelten AUSSCHLIESSLICH für osu! Standard (Mode 0)!
 - Du antwortest ZU 100% AUF DEUTSCH!"""
 
         # Call universal API with dynamic model discovery
@@ -3804,7 +4670,6 @@ DEINE ANTWORT-RICHTLINIEN:
         # Update Map Peak Record in database
         map_key = f"{bid}_{map_name}"
         is_new_rec, prev_rec = self.update_map_peak_record(map_key, map_name, peak_pp, combo, mods_str="NM")
-        self.update_live_pp_hud(cur_pp=calc_pp, peak_pp=peak_pp, if_fc_pp=if_fc_pp, map_peak_pp=max(peak_pp, prev_rec))
 
         # Check session highest peak
         cur_ses_peak = self.active_session.get("highest_peak_pp", 0.0)
@@ -4186,8 +5051,6 @@ DEINE ANTWORT-RICHTLINIEN:
     def show_daily_recap_dashboard(self, selected_recap_id=None):
         """Opens the full Day & Session Recap Center with historical timeline."""
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#101015")
@@ -4343,66 +5206,6 @@ DEINE ANTWORT-RICHTLINIEN:
     # MAIN MENU
     # ---------------------------------------------------------------------------
     
-    # ---------------------------------------------------------------------------
-    # WIDGETS & PP CALCULATOR SYSTEM (CONFIG, DRAG & DROP EDITOR, LIVE HUD)
-    # ---------------------------------------------------------------------------
-    def load_widgets_config(self):
-        default_cfg = {
-            "pp_calculator": {
-                "enabled": True,
-                "x": 1380,
-                "y": 45,
-                "width": 420,
-                "height": 80,
-                "scale": 1.0,
-                "show_peak": True,
-                "show_if_fc": True,
-                "show_map_peak": True,
-                "show_graph": True,
-                "opacity": 0.85
-            },
-            "session_stats": {
-                "enabled": False,
-                "x": 40,
-                "y": 40,
-                "width": 240,
-                "height": 90,
-                "opacity": 0.85
-            },
-            "ur_bar": {
-                "enabled": False,
-                "x": 750,
-                "y": 920,
-                "width": 320,
-                "height": 55,
-                "opacity": 0.85
-            },
-            "ai_coach_tips": {
-                "enabled": False,
-                "x": 1340,
-                "y": 260,
-                "width": 300,
-                "height": 115,
-                "opacity": 0.90
-            }
-        }
-        try:
-            cfg_file = "widgets_config.json"
-            if os.path.exists(cfg_file):
-                with open(cfg_file, "r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                    default_cfg.update(loaded)
-        except Exception:
-            pass
-        return default_cfg
-
-    def save_widgets_config(self):
-        try:
-            with open("widgets_config.json", "w", encoding="utf-8") as f:
-                json.dump(getattr(self, "widgets_config", {}), f, indent=2)
-        except Exception:
-            pass
-
     def load_map_peaks_history(self):
         try:
             if os.path.exists("map_peaks_history.json"):
@@ -4499,691 +5302,18 @@ DEINE ANTWORT-RICHTLINIEN:
 
     
     # ---------------------------------------------------------------------------
-    # WIDGETS HUB & INTERACTIVE DRAG & DROP POSITION EDITOR
+    # MAIN MENU
     # ---------------------------------------------------------------------------
-    def show_widgets_hub(self):
-        for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
-            widget.destroy()
-
-        master = ctk.CTkFrame(self, fg_color="#121216")
-        master.pack(fill="both", expand=True)
-        self.draw_lazer_background(master)
-
-        top_bar = ctk.CTkFrame(master, fg_color="#181822", height=60, corner_radius=12)
-        top_bar.pack(fill="x", padx=20, pady=(15, 10))
-        top_bar.pack_propagate(False)
-
-        ctk.CTkButton(top_bar, text="⬅ Hauptmenü", width=100, height=36, font=("Arial", 13, "bold"),
-                      fg_color="#25252e", hover_color="#353540", command=self.show_main_menu).pack(side="left", padx=15, pady=12)
-
-        ctk.CTkLabel(top_bar, text="🎨 In-Game Widgets & HUD Hub", font=("Arial", 18, "bold"), text_color="#00E5FF").pack(side="left", padx=10)
-
-        ctk.CTkButton(top_bar, text="📐 Widgets anordnen & testen", height=36, font=("Arial", 13, "bold"),
-                      fg_color="#1f538d", hover_color="#14375e", command=self.open_widget_position_editor).pack(side="right", padx=15, pady=12)
-
-        cards_scroll = ctk.CTkScrollableFrame(master, fg_color="transparent")
-        cards_scroll.pack(fill="both", expand=True, padx=20, pady=(0, 15))
-
-        if not hasattr(self, "widgets_config"):
-            self.widgets_config = self.load_widgets_config()
-
-        grid_frame = ctk.CTkFrame(cards_scroll, fg_color="transparent")
-        grid_frame.pack(expand=True, fill="both", pady=10)
-        grid_frame.grid_columnconfigure(0, weight=1)
-        grid_frame.grid_columnconfigure(1, weight=1)
-
-        # ----------------- WIDGET 1: LIVE PP & PEAK CALCULATOR -----------------
-        w1 = ctk.CTkFrame(grid_frame, fg_color="#161622", corner_radius=16, border_width=2, border_color="#1f538d")
-        w1.grid(row=0, column=0, padx=12, pady=10, sticky="nsew")
-
-        w1_top = ctk.CTkFrame(w1, fg_color="transparent")
-        w1_top.pack(fill="x", padx=16, pady=(14, 4))
-        ctk.CTkLabel(w1_top, text="🔥 Live PP & Peak Calculator", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left")
-        
-        pp_cfg = self.widgets_config.setdefault("pp_calculator", {
-            "enabled": True, "x": 1380, "y": 45, "show_peak": True, "show_if_fc": True, "show_map_peak": True, "show_graph": True
-        })
-
-        def toggle_pp(val=None):
-            pp_cfg["enabled"] = pp_switch.get()
-            self.save_widgets_config()
-
-        pp_switch = ctk.CTkSwitch(w1_top, text="Aktiv", font=("Arial", 12, "bold"), command=toggle_pp)
-        if pp_cfg.get("enabled", True): pp_switch.select()
-        else: pp_switch.deselect()
-        pp_switch.pack(side="right")
-
-        ctk.CTkLabel(w1, text="Echtzeit PP-Anzeige während des Plays mit 0 FPS Verlust. Zeigt aktuellen PP, Peak PP, If-FC PP und den All-Time Map Rekord.",
-                     font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 10))
-
-        # Sub-Options Box
-        sub_box = ctk.CTkFrame(w1, fg_color="#1e1e2c", corner_radius=10)
-        sub_box.pack(fill="x", padx=14, pady=(0, 14))
-
-        def make_sub_chk(parent, text, key, default=True):
-            var = ctk.BooleanVar(value=pp_cfg.get(key, default))
-            def on_change():
-                pp_cfg[key] = var.get()
-                self.save_widgets_config()
-            chk = ctk.CTkCheckBox(parent, text=text, font=("Arial", 11), variable=var, command=on_change,
-                                  checkbox_width=18, checkbox_height=18)
-            chk.pack(anchor="w", padx=12, pady=4)
-            return chk
-
-        make_sub_chk(sub_box, "📈 Peak-PP anzeigen (Höchster erreichter Wert im Play)", "show_peak", True)
-        make_sub_chk(sub_box, "✨ If-FC PP anzeigen (Was der Run ohne weitere Misses gibt)", "show_if_fc", True)
-        make_sub_chk(sub_box, "🏆 All-Time Map Peak anzeigen (Ewiger Rekord auf dieser Map)", "show_map_peak", True)
-        make_sub_chk(sub_box, "📊 Live-Verlaufsgraph anzeigen", "show_graph", True)
-
-        # ----------------- WIDGET 2: SESSION LIVE-STATS -----------------
-        w2 = ctk.CTkFrame(grid_frame, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2c2c3e")
-        w2.grid(row=0, column=1, padx=12, pady=10, sticky="nsew")
-
-        w2_top = ctk.CTkFrame(w2, fg_color="transparent")
-        w2_top.pack(fill="x", padx=16, pady=(14, 4))
-        ctk.CTkLabel(w2_top, text="📊 Session Live-Stats", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left")
-
-        s_cfg = self.widgets_config.setdefault("session_stats", {"enabled": False, "x": 40, "y": 40})
-        def toggle_session():
-            s_cfg["enabled"] = s_switch.get()
-            self.save_widgets_config()
-
-        s_switch = ctk.CTkSwitch(w2_top, text="Aktiv", font=("Arial", 12, "bold"), command=toggle_session)
-        if s_cfg.get("enabled", False): s_switch.select()
-        else: s_switch.deselect()
-        s_switch.pack(side="right")
-
-        ctk.CTkLabel(w2, text="Kompaktes HUD für heutigen Rang-Gewinn/Verlust, Net-PP Delta, Spielzeit und Pass/Fail-Quote während deiner Session.",
-                     font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 14))
-
-        # ----------------- WIDGET 3: LIVE UNSTABLE RATE BAR -----------------
-        w3 = ctk.CTkFrame(grid_frame, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2c2c3e")
-        w3.grid(row=1, column=0, padx=12, pady=10, sticky="nsew")
-
-        w3_top = ctk.CTkFrame(w3, fg_color="transparent")
-        w3_top.pack(fill="x", padx=16, pady=(14, 4))
-        ctk.CTkLabel(w3_top, text="🎯 Live UR & Timing Error Bar", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left")
-
-        ur_cfg = self.widgets_config.setdefault("ur_bar", {"enabled": False, "x": 750, "y": 920})
-        def toggle_ur():
-            ur_cfg["enabled"] = ur_switch.get()
-            self.save_widgets_config()
-
-        ur_switch = ctk.CTkSwitch(w3_top, text="Aktiv", font=("Arial", 12, "bold"), command=toggle_ur)
-        if ur_cfg.get("enabled", False): ur_switch.select()
-        else: ur_switch.deselect()
-        ur_switch.pack(side="right")
-
-        ctk.CTkLabel(w3, text="Präzisions-Leiste am unteren Bildschirmrand. Zeigt live Timing-Abweichungen (Early/Late) in Millisekunden und die Unstable Rate.",
-                     font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 14))
-
-        # ----------------- WIDGET 4: KI-COACH LIVE TIPPS -----------------
-        w4 = ctk.CTkFrame(grid_frame, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2c2c3e")
-        w4.grid(row=1, column=1, padx=12, pady=10, sticky="nsew")
-
-        w4_top = ctk.CTkFrame(w4, fg_color="transparent")
-        w4_top.pack(fill="x", padx=16, pady=(14, 4))
-        ctk.CTkLabel(w4_top, text="🤖 KI-Coach Live-Tipps", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left")
-
-        ai_cfg = self.widgets_config.setdefault("ai_coach_tips", {"enabled": False, "x": 1340, "y": 260})
-        def toggle_ai_hud():
-            ai_cfg["enabled"] = ai_switch.get()
-            self.save_widgets_config()
-
-        ai_switch = ctk.CTkSwitch(w4_top, text="Aktiv", font=("Arial", 12, "bold"), command=toggle_ai_hud)
-        if ai_cfg.get("enabled", False): ai_switch.select()
-        else: ai_switch.deselect()
-        ai_switch.pack(side="right")
-
-        ctk.CTkLabel(w4, text="Live-Feedback von Gemini direkt auf dem Bildschirm. Gibt sofortige Tipps bei Chokes, Stream-Müdigkeit oder Aim-Korrekturen.",
-                     font=("Arial", 12), text_color="#888899", justify="left", wraplength=360).pack(anchor="w", padx=16, pady=(0, 14))
-
-    # ---------------------------------------------------------------------------
-    # TOSU / GOSUMEMORY STYLE IN-GAME PP HUD, SCALING & TELEMETRY ENGINE
-    # ---------------------------------------------------------------------------
-    GRADE_COLORS = {
-        "SS": "#FFD700",
-        "SSH": "#E0E0E0",
-        "S": "#00E5FF",
-        "SH": "#E0E0E0",
-        "A": "#2ECC71",
-        "B": "#3498DB",
-        "C": "#FF477E",
-        "D": "#E74C3C",
-        "F": "#E74C3C"
-    }
-
-    def open_widget_position_editor(self):
-        if getattr(self, "_widget_editor_win", None) and self._widget_editor_win.winfo_exists():
-            self._widget_editor_win.lift()
-            return
-
-        if not hasattr(self, "widgets_config"):
-            self.widgets_config = self.load_widgets_config()
-
-        pp_cfg = self.widgets_config.get("pp_calculator", {"x": 1380, "y": 45, "scale": 1.0})
-        cur_x = int(pp_cfg.get("x", 1380))
-        cur_y = int(pp_cfg.get("y", 45))
-        cur_scale = float(pp_cfg.get("scale", 1.0))
-
-        editor = ctk.CTkToplevel(self)
-        self._widget_editor_win = editor
-        editor.title("📐 Tosu PP-Widget Position & Größe")
-        editor.geometry(f"510x240+{cur_x}+{cur_y}")
-        editor.attributes("-topmost", True)
-        editor.configure(fg_color="#0e0e14")
-        editor.resizable(False, False)
-
-        # Drag bar header
-        drag_bar = ctk.CTkFrame(editor, fg_color="#3742fa", height=30, corner_radius=6)
-        drag_bar.pack(fill="x", padx=8, pady=(8, 4))
-        drag_bar.pack_propagate(False)
-        ctk.CTkLabel(drag_bar, text="✥ HIER DRÜCKEN & FREI AUF DEM BILDSCHIRM ZIEHEN", font=("Arial", 11, "bold"), text_color="#ffffff").pack(expand=True)
-
-        # Editable Size Input Field (Kein Slider!)
-        scale_box = ctk.CTkFrame(editor, fg_color="#161622", corner_radius=8)
-        scale_box.pack(fill="x", padx=8, pady=4)
-
-        ctk.CTkLabel(scale_box, text="📏 Skalierung (%):", font=("Arial", 12, "bold"), text_color="#ffffff").pack(side="left", padx=(10, 4), pady=6)
-
-        entry_scale = ctk.CTkEntry(scale_box, width=54, height=28, font=("Arial", 12, "bold"), justify="center")
-        entry_scale.insert(0, str(int(round(cur_scale * 100))))
-        entry_scale.pack(side="left", padx=4, pady=6)
-
-        lbl_px_info = ctk.CTkLabel(scale_box, text=f"→ {int(420*cur_scale)}×{int(80*cur_scale)} px", font=("Arial", 11), text_color="#888899")
-        lbl_px_info.pack(side="right", padx=(4, 10), pady=6)
-
-        def apply_scale_from_entry(event=None):
-            try:
-                raw_txt = entry_scale.get().strip().replace("%", "")
-                val = int(raw_txt)
-                val = max(50, min(250, val))
-                s_val = round(val / 100.0, 2)
-                pp_cfg["scale"] = s_val
-                entry_scale.delete(0, "end")
-                entry_scale.insert(0, str(val))
-                lbl_px_info.configure(text=f"→ {int(420*s_val)}×{int(80*s_val)} px")
-                self.save_widgets_config()
-                self._apply_overlay_scaling()
-            except Exception:
-                pass
-
-        entry_scale.bind("<Return>", apply_scale_from_entry)
-        entry_scale.bind("<FocusOut>", apply_scale_from_entry)
-
-        def step_scale(delta):
-            try:
-                cur_v = int(entry_scale.get().strip().replace("%", ""))
-            except:
-                cur_v = 100
-            new_v = max(50, min(250, cur_v + delta))
-            entry_scale.delete(0, "end")
-            entry_scale.insert(0, str(new_v))
-            apply_scale_from_entry()
-
-        ctk.CTkButton(scale_box, text="−5%", width=38, height=26, font=("Arial", 11, "bold"), fg_color="#2b2b36", command=lambda: step_scale(-5)).pack(side="left", padx=2)
-        ctk.CTkButton(scale_box, text="+5%", width=38, height=26, font=("Arial", 11, "bold"), fg_color="#2b2b36", command=lambda: step_scale(5)).pack(side="left", padx=2)
-
-        def set_preset_val(v):
-            entry_scale.delete(0, "end")
-            entry_scale.insert(0, str(v))
-            apply_scale_from_entry()
-
-        ctk.CTkButton(scale_box, text="80%", width=40, height=26, font=("Arial", 10), fg_color="#1f538d", command=lambda: set_preset_val(80)).pack(side="left", padx=2)
-        ctk.CTkButton(scale_box, text="100%", width=42, height=26, font=("Arial", 10), fg_color="#1f538d", command=lambda: set_preset_val(100)).pack(side="left", padx=2)
-        ctk.CTkButton(scale_box, text="120%", width=42, height=26, font=("Arial", 10), fg_color="#1f538d", command=lambda: set_preset_val(120)).pack(side="left", padx=2)
-        ctk.CTkButton(scale_box, text="140%", width=42, height=26, font=("Arial", 10), fg_color="#1f538d", command=lambda: set_preset_val(140)).pack(side="left", padx=(2, 6))
-
-        # Preview Container
-        prev_container = ctk.CTkFrame(editor, fg_color="#101016", corner_radius=10, border_width=1, border_color="#232330")
-        prev_container.pack(fill="both", expand=True, padx=8, pady=4)
-
-        row = ctk.CTkFrame(prev_container, fg_color="transparent")
-        row.pack(expand=True, fill="both", padx=10, pady=4)
-
-        # Grade
-        ctk.CTkLabel(row, text="C", font=("Arial", 38, "bold"), text_color="#FF477E", width=42).pack(side="left", padx=(4, 10))
-
-        # Capsule
-        capsule = ctk.CTkFrame(row, fg_color="#181824", corner_radius=14)
-        capsule.pack(side="left", fill="both", expand=True, padx=(0, 4), pady=2)
-
-        # Top Pills
-        top_p = ctk.CTkFrame(capsule, fg_color="transparent", height=18)
-        top_p.pack(fill="x", padx=8, pady=(3, 0))
-        top_p.pack_propagate(False)
-        ctk.CTkLabel(top_p, text=" 222pp ", font=("Arial", 10, "bold"), text_color="#ffffff", fg_color="#3742fa", corner_radius=6).pack(side="left")
-        ctk.CTkLabel(top_p, text=" 9xSB ", font=("Arial", 10, "bold"), text_color="#dfe4ea", fg_color="#2f3542", corner_radius=6).pack(side="right")
-
-        # Mid
-        mid = ctk.CTkFrame(capsule, fg_color="transparent")
-        mid.pack(fill="x", padx=10, pady=(1, 2))
-
-        pp_f = ctk.CTkFrame(mid, fg_color="transparent")
-        pp_f.pack(side="left")
-        ctk.CTkLabel(pp_f, text="24", font=("Arial", 28, "bold"), text_color="#ffffff").pack(side="left")
-        ctk.CTkLabel(pp_f, text="pp", font=("Arial", 20, "bold"), text_color="#5352ed").pack(side="left", padx=(2, 0))
-
-        hits_f = ctk.CTkFrame(mid, fg_color="transparent")
-        hits_f.pack(side="right", padx=(10, 0))
-
-        # 100
-        c1 = ctk.CTkFrame(hits_f, fg_color="transparent"); c1.pack(side="left", padx=6)
-        ctk.CTkLabel(c1, text="206", font=("Arial", 16, "bold"), text_color="#ffffff").pack()
-        ctk.CTkFrame(c1, fg_color="#2ed573", height=3, width=16, corner_radius=2).pack(pady=(1, 0))
-
-        # 50
-        c2 = ctk.CTkFrame(hits_f, fg_color="transparent"); c2.pack(side="left", padx=6)
-        ctk.CTkLabel(c2, text="9", font=("Arial", 16, "bold"), text_color="#ffffff").pack()
-        ctk.CTkFrame(c2, fg_color="#a55eea", height=3, width=16, corner_radius=2).pack(pady=(1, 0))
-
-        # Miss
-        c3 = ctk.CTkFrame(hits_f, fg_color="transparent"); c3.pack(side="left", padx=6)
-        ctk.CTkLabel(c3, text="16", font=("Arial", 16, "bold"), text_color="#ffffff").pack()
-        ctk.CTkFrame(c3, fg_color="#ff4757", height=3, width=16, corner_radius=2).pack(pady=(1, 0))
-
-        # Save Button
-        def save_and_close():
-            try:
-                x = editor.winfo_x()
-                y = editor.winfo_y()
-                pp_cfg["x"] = x
-                pp_cfg["y"] = y
-                self.save_widgets_config()
-            except Exception: pass
-            editor.destroy()
-            self._widget_editor_win = None
-            self._apply_overlay_scaling()
-            if hasattr(self, "show_message"):
-                self.show_message("Gespeichert", f"Position ({x}, {y}) und Skalierung ({int(pp_cfg.get('scale', 1.0)*100)}%) gespeichert!")
-
-        ctk.CTkButton(editor, text="💾 Position & Größe speichern & schließen", font=("Arial", 11, "bold"), height=26,
-                      fg_color="#2E7D32", hover_color="#1B5E20", command=save_and_close).pack(fill="x", padx=8, pady=(0, 6))
-
-        # Drag binding
-        def on_press(e):
-            editor._offset_x = e.x_root - editor.winfo_x()
-            editor._offset_y = e.y_root - editor.winfo_y()
-
-        def on_motion(e):
-            new_x = e.x_root - getattr(editor, "_offset_x", 0)
-            new_y = e.y_root - getattr(editor, "_offset_y", 0)
-            editor.geometry(f"+{new_x}+{new_y}")
-
-        drag_bar.bind("<ButtonPress-1>", on_press)
-        drag_bar.bind("<B1-Motion>", on_motion)
-        for w in drag_bar.winfo_children():
-            w.bind("<ButtonPress-1>", on_press)
-            w.bind("<B1-Motion>", on_motion)
-
-    # ---------------------------------------------------------------------------
-    # LIVE IN-GAME PP WIDGET OVERLAY (ROCK-SOLID TOPMOST & ZERO CRASH)
-    # ---------------------------------------------------------------------------
-    def _apply_overlay_scaling(self):
-        if getattr(self, "_live_pp_win", None) and self._live_pp_win.winfo_exists():
-            self._live_pp_win.destroy()
-            self._live_pp_win = None
-        self._zorder_enforcer_running = False
-        self._live_telemetry_running = False
-        self._ensure_live_pp_overlay()
-
-    def _ensure_live_pp_overlay(self):
-        if not hasattr(self, "widgets_config"):
-            self.widgets_config = self.load_widgets_config()
-        
-        pp_cfg = self.widgets_config.get("pp_calculator", {})
-        if not pp_cfg.get("enabled", True):
-            if getattr(self, "_live_pp_win", None) and self._live_pp_win.winfo_exists():
-                self._live_pp_win.destroy()
-                self._live_pp_win = None
-            return
-
-        if getattr(self, "_live_pp_win", None) is None or not self._live_pp_win.winfo_exists():
-            win = tk.Toplevel(self)
-            self._live_pp_win = win
-            win.overrideredirect(True)
-            win.wm_attributes("-topmost", True)
-
-            scale = max(0.50, min(2.50, float(pp_cfg.get("scale", 1.0))))
-            x = int(pp_cfg.get("x", 1380))
-            y = int(pp_cfg.get("y", 45))
-            w = int(420 * scale)
-            h = int(80 * scale)
-            win.geometry(f"{w}x{h}+{x}+{y}")
-
-            BG_DARK = "#101016"
-            win.configure(bg=BG_DARK)
-
-            # Win32 Click-Through & TopMost Styles
-            try:
-                import ctypes
-                GWL_EXSTYLE = -20
-                WS_EX_LAYERED = 0x00080000
-                WS_EX_TRANSPARENT = 0x00000020
-                WS_EX_TOPMOST = 0x00000008
-                WS_EX_TOOLWINDOW = 0x00000080
-                WS_EX_NOACTIVATE = 0x08000000
-                hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
-                if hwnd == 0: hwnd = win.winfo_id()
-                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
-            except Exception:
-                pass
-
-            root_f = tk.Frame(win, bg=BG_DARK)
-            root_f.pack(fill="both", expand=True, padx=2, pady=2)
-
-            # 1. Left Rank Letter
-            grade_size = max(16, int(34 * scale))
-            lbl_grade = tk.Label(root_f, text="SS", font=("Arial", grade_size, "bold"), fg="#FFD700", bg=BG_DARK, width=3)
-            lbl_grade.pack(side="left", padx=(0, max(2, int(4 * scale))))
-            win._lbl_grade = lbl_grade
-
-            # 2. Main Capsule Frame
-            capsule = tk.Frame(root_f, bg="#181824", bd=0, highlightthickness=0)
-            capsule.pack(side="left", fill="both", expand=True, padx=(0, 2), pady=1)
-            win._capsule = capsule
-
-            # Top Badges
-            top_b_h = max(14, int(18 * scale))
-            top_b_row = tk.Frame(capsule, bg="#181824", height=top_b_h)
-            top_b_row.pack(fill="x", padx=max(4, int(6 * scale)), pady=(max(2, int(3 * scale)), 0))
-            top_b_row.pack_propagate(False)
-
-            badge_f_size = max(8, int(9 * scale))
-            lbl_fc_badge = tk.Label(top_b_row, text=" 0pp ", font=("Arial", badge_f_size, "bold"), fg="#ffffff", bg="#3742fa", padx=max(2, int(4 * scale)), pady=0)
-            lbl_fc_badge.pack(side="left", padx=(2, 0))
-            win._lbl_fc_badge = lbl_fc_badge
-
-            lbl_sb_badge = tk.Label(top_b_row, text=" 0xSB ", font=("Arial", badge_f_size, "bold"), fg="#dfe4ea", bg="#2f3542", padx=max(2, int(4 * scale)), pady=0)
-            lbl_sb_badge.pack(side="right", padx=(0, 2))
-            win._lbl_sb_badge = lbl_sb_badge
-
-            # Mid Stats
-            mid_row = tk.Frame(capsule, bg="#181824")
-            mid_row.pack(fill="x", padx=max(4, int(8 * scale)), pady=(1, 2))
-
-            pp_f = tk.Frame(mid_row, bg="#181824")
-            pp_f.pack(side="left")
-
-            pp_num_size = max(16, int(26 * scale))
-            lbl_pp_num = tk.Label(pp_f, text="0", font=("Arial", pp_num_size, "bold"), fg="#ffffff", bg="#181824")
-            lbl_pp_num.pack(side="left")
-            win._lbl_pp_num = lbl_pp_num
-
-            pp_unit_size = max(12, int(18 * scale))
-            lbl_pp_unit = tk.Label(pp_f, text="pp", font=("Arial", pp_unit_size, "bold"), fg="#5352ed", bg="#181824")
-            lbl_pp_unit.pack(side="left", padx=(1, 0))
-            win._lbl_pp_unit = lbl_pp_unit
-
-            # Hits
-            hits_f = tk.Frame(mid_row, bg="#181824")
-            hits_f.pack(side="right", padx=(max(4, int(6 * scale)), 0))
-
-            hits_f_size = max(10, int(15 * scale))
-            dot_w = max(8, int(14 * scale))
-            dot_h = max(2, int(3 * scale))
-
-            # 100
-            c100 = tk.Frame(hits_f, bg="#181824")
-            c100.pack(side="left", padx=max(2, int(5 * scale)))
-            lbl_100 = tk.Label(c100, text="0", font=("Arial", hits_f_size, "bold"), fg="#ffffff", bg="#181824")
-            lbl_100.pack()
-            tk.Frame(c100, bg="#2ed573", height=dot_h, width=dot_w).pack(pady=(1, 0))
-            win._lbl_100 = lbl_100
-
-            # 50
-            c50 = tk.Frame(hits_f, bg="#181824")
-            c50.pack(side="left", padx=max(2, int(5 * scale)))
-            lbl_50 = tk.Label(c50, text="0", font=("Arial", hits_f_size, "bold"), fg="#ffffff", bg="#181824")
-            lbl_50.pack()
-            tk.Frame(c50, bg="#a55eea", height=dot_h, width=dot_w).pack(pady=(1, 0))
-            win._lbl_50 = lbl_50
-
-            # Miss
-            c0 = tk.Frame(hits_f, bg="#181824")
-            c0.pack(side="left", padx=max(2, int(5 * scale)))
-            lbl_0 = tk.Label(c0, text="0", font=("Arial", hits_f_size, "bold"), fg="#ffffff", bg="#181824")
-            lbl_0.pack()
-            tk.Frame(c0, bg="#ff4757", height=dot_h, width=dot_w).pack(pady=(1, 0))
-            win._lbl_0 = lbl_0
-
-            # Progress Bar
-            prog_cv = tk.Canvas(capsule, height=max(2, int(3 * scale)), bg="#222232", bd=0, highlightthickness=0)
-            prog_cv.pack(fill="x", side="bottom")
-            win._prog_cv = prog_cv
-
-            win.lift()
-            win.deiconify()
-
-            self._start_overlay_zorder_enforcer()
-            self._start_live_telemetry_loop()
-
-    def _start_overlay_zorder_enforcer(self):
-        if getattr(self, "_zorder_enforcer_running", False):
-            return
-        self._zorder_enforcer_running = True
-
-        def _enforce_loop():
-            if not getattr(self, "_zorder_enforcer_running", False):
-                return
-            win = getattr(self, "_live_pp_win", None)
-            if win and win.winfo_exists():
-                try:
-                    import ctypes
-                    hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
-                    if hwnd == 0: hwnd = win.winfo_id()
-                    ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010 | 0x0040)
-                except Exception:
-                    pass
-            self.after(300, _enforce_loop)
-
-        self.after(300, _enforce_loop)
-
-    def _start_live_telemetry_loop(self):
-        if getattr(self, "_live_telemetry_running", False):
-            return
-        self._live_telemetry_running = True
-        self._telemetry_data = {}
-        self._tosu_backoff_until = 0.0
-        self._tosu_available = False
-
-        # --- BACKGROUND THREAD: polls data, stores in self._telemetry_data ---
-        import threading
-        def _bg_poll():
-            while getattr(self, "_live_telemetry_running", False):
-                data = {}
-                now = time.time()
-
-                # 1. Try Tosu/Gosumemory (with backoff)
-                if now >= self._tosu_backoff_until:
-                    try:
-                        r = requests.get("http://127.0.0.1:24050/json", timeout=0.12)
-                        if r.status_code == 200:
-                            d = r.json()
-                            self._tosu_available = True
-                            menu_st = int(d.get("menu", {}).get("state", 1) or 1)
-                            bm = d.get("menu", {}).get("bm", {})
-                            bm_time = bm.get("time", {})
-                            cur_t = float(bm_time.get("current", 0) or 0)
-                            full_t = max(1.0, float(bm_time.get("full", 1) or 1))
-                            progress = min(1.0, max(0.0, cur_t / full_t))
-
-                            if menu_st in [1, 4, 5]:
-                                pp_100 = float(bm.get("pp", {}).get("100", 0.0) or bm.get("pp", {}).get("ss", 0.0) or 0.0)
-                                if pp_100 <= 0: pp_100 = 260.0
-                                data = {"cur_pp": pp_100, "if_fc_pp": pp_100, "is_song_select": True,
-                                        "h100": 0, "h50": 0, "h0": 0, "sb": 0, "grade": "SS", "progress": 0.0}
-
-                            elif menu_st == 2:
-                                gameplay = d.get("gameplay", {})
-                                pp_data = gameplay.get("pp", {})
-                                hits = gameplay.get("hits", {})
-                                grade = str(hits.get("grade", {}).get("current", "SS") or "SS").upper()
-                                if grade == "NULL" or not grade: grade = "SS"
-                                data = {
-                                    "cur_pp": float(pp_data.get("current", 0.0) or 0.0),
-                                    "if_fc_pp": float(pp_data.get("fc", 0.0) or pp_data.get("max", 0.0) or 0.0),
-                                    "is_song_select": False,
-                                    "h100": int(hits.get("100", 0) or 0),
-                                    "h50": int(hits.get("50", 0) or 0),
-                                    "h0": int(hits.get("0", 0) or 0),
-                                    "sb": int(hits.get("sliderBreaks", 0) or 0),
-                                    "grade": grade, "progress": progress
-                                }
-
-                            elif menu_st in [7, 3]:
-                                res = d.get("resultsScreen", {})
-                                gp = d.get("gameplay", {})
-                                data = {
-                                    "cur_pp": float(res.get("pp", 0.0) or gp.get("pp", {}).get("current", 0.0) or 0.0),
-                                    "if_fc_pp": float(res.get("pp", 0.0) or 0.0),
-                                    "is_song_select": False, "is_results_screen": True,
-                                    "h100": int(res.get("100", 0) or gp.get("hits", {}).get("100", 0) or 0),
-                                    "h50": int(res.get("50", 0) or gp.get("hits", {}).get("50", 0) or 0),
-                                    "h0": int(res.get("0", 0) or gp.get("hits", {}).get("0", 0) or 0),
-                                    "sb": int(gp.get("hits", {}).get("sliderBreaks", 0) or 0),
-                                    "grade": str(res.get("grade", "S") or "S").upper(), "progress": 1.0
-                                }
-                        else:
-                            self._tosu_available = False
-                            self._tosu_backoff_until = now + 5.0
-                    except Exception:
-                        self._tosu_available = False
-                        self._tosu_backoff_until = now + 5.0
-
-                # 2. Fallback: osu! window title
-                if not data and not self._tosu_available:
-                    try:
-                        import ctypes
-                        user32 = ctypes.windll.user32
-                        found_title = ""
-                        def enum_cb(hwnd, lparam):
-                            nonlocal found_title
-                            if user32.IsWindowVisible(hwnd):
-                                length = user32.GetWindowTextLengthW(hwnd)
-                                if length > 0:
-                                    buff = ctypes.create_unicode_buffer(length + 1)
-                                    user32.GetWindowTextW(hwnd, buff, length + 1)
-                                    t = buff.value
-                                    if t == "osu!" or t.startswith("osu! "):
-                                        found_title = t
-                                        return False
-                            return True
-
-                        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
-                        user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
-
-                        if found_title:
-                            if " - " in found_title:
-                                if not hasattr(self, "_sim_play_start") or (now - getattr(self, "_sim_last_title_time", 0) > 25):
-                                    self._sim_play_start = now
-                                self._sim_last_title_time = now
-                                elapsed = max(0.1, now - self._sim_play_start)
-                                prog = min(1.0, elapsed / 120.0)
-
-                                # Parse SR from title if possible: "osu! - Artist - Title [Diff] (SR*)"
-                                est_sr = 5.0
-                                try:
-                                    import re
-                                    sr_match = re.search(r'\[.*?(\d+\.?\d*)\*\]', found_title)
-                                    if sr_match:
-                                        est_sr = float(sr_match.group(1))
-                                except Exception:
-                                    pass
-
-                                est_combo = int(prog * 800)
-                                est_acc = max(92.0, 100.0 - prog * 3.5)
-                                est_h100 = int(prog * 12)
-                                est_h50 = int(prog * 2)
-                                cur_pp, if_fc_pp = self.calculate_live_pp_metrics(
-                                    sr=est_sr, acc=est_acc, combo=est_combo, max_combo=800, misses=0)
-                                grade_cur = "SS" if est_h100 == 0 else ("S" if est_h100 < 8 else "A")
-
-                                data = {"cur_pp": cur_pp, "if_fc_pp": if_fc_pp, "is_song_select": False,
-                                        "h100": est_h100, "h50": est_h50, "h0": 0, "sb": 0,
-                                        "grade": grade_cur, "progress": prog}
-                            else:
-                                ss_pp, _ = self.calculate_live_pp_metrics(sr=5.0, acc=100.0, combo=800, max_combo=800, misses=0)
-                                data = {"cur_pp": ss_pp, "if_fc_pp": ss_pp, "is_song_select": True,
-                                        "h100": 0, "h50": 0, "h0": 0, "sb": 0, "grade": "SS", "progress": 0.0}
-                    except Exception:
-                        pass
-
-                if data:
-                    self._telemetry_data = data
-
-                time.sleep(0.15 if self._tosu_available else 0.5)
-
-        t = threading.Thread(target=_bg_poll, daemon=True)
-        t.start()
-
-        # --- UI THREAD: reads cached data and updates labels ---
-        def _ui_update():
-            if not getattr(self, "_live_telemetry_running", False):
-                return
-            d = getattr(self, "_telemetry_data", {})
-            if d:
-                self.update_live_pp_hud(**d)
-            self.after(200, _ui_update)
-
-        self.after(200, _ui_update)
-
-    def update_live_pp_hud(self, cur_pp=0.0, if_fc_pp=0.0, is_song_select=False, is_results_screen=False,
-                            h100=0, h50=0, h0=0, sb=0, grade="SS", progress=0.0):
-        win = getattr(self, "_live_pp_win", None)
-        if not win or not win.winfo_exists(): return
-
-        try:
-            g_clean = grade.upper()
-            g_col = self.GRADE_COLORS.get(g_clean, "#FFD700")
-            win._lbl_grade.config(text=g_clean, fg=g_col)
-
-            if is_song_select:
-                win._lbl_fc_badge.config(text=f" SS: {int(round(if_fc_pp))}pp ", bg="#5352ed")
-            elif is_results_screen:
-                win._lbl_fc_badge.config(text=f" FC: {int(round(if_fc_pp))}pp ", bg="#2E7D32")
-            else:
-                win._lbl_fc_badge.config(text=f" {int(round(if_fc_pp))}pp ", bg="#3742fa")
-
-            if is_song_select:
-                win._lbl_sb_badge.config(text=" 0xSB ", bg="#2f3542")
-            else:
-                sb_txt = f" {sb}xSB " if sb > 0 else (f" {h0}xMiss " if h0 > 0 else " 0xSB ")
-                sb_bg = "#ff4757" if (sb > 0 or h0 > 0) else "#2f3542"
-                win._lbl_sb_badge.config(text=sb_txt, bg=sb_bg)
-
-            win._lbl_pp_num.config(text=f"{int(round(cur_pp))}")
-            win._lbl_100.config(text=f"{h100}")
-            win._lbl_50.config(text=f"{h50}")
-            win._lbl_0.config(text=f"{h0}")
-
-            cv = win._prog_cv
-            cv.delete("all")
-            w = cv.winfo_width() or 300
-            h = cv.winfo_height() or 3
-            fill_w = max(0, min(w, int(w * progress)))
-            if fill_w > 0:
-                cv.create_rectangle(0, 0, fill_w, h, fill="#5352ed", width=0)
-        except Exception:
-            pass
-
-
     def show_main_menu(self):
         self._start_uho_presence_heartbeat_loop()
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
-        self._ensure_live_pp_overlay()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
         master.pack(fill="both", expand=True)
         self.draw_lazer_background(master)
 
-        frame = ctk.CTkFrame(master, fg_color="#181822", corner_radius=20, border_width=1, border_color="#2e2e3f", width=430, height=610)
+        frame = ctk.CTkFrame(master, fg_color="#181822", corner_radius=20, border_width=1, border_color="#2e2e3f", width=430, height=540)
         frame.place(relx=0.5, rely=0.5, anchor="center")
         frame.pack_propagate(False)
 
@@ -5200,10 +5330,6 @@ DEINE ANTWORT-RICHTLINIEN:
         ctk.CTkButton(frame, text="📊 Tages- & Session-Recap", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
                       fg_color="#7B1FA2", hover_color="#6A1B9A", text_color="#ffffff",
                       command=self.show_daily_recap_dashboard).pack(pady=5)
-
-        ctk.CTkButton(frame, text="🎨 In-Game Widgets & HUD", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
-                      fg_color="#00838F", hover_color="#006064", text_color="#ffffff",
-                      command=self.show_widgets_hub).pack(pady=5)
 
         ctk.CTkButton(frame, text="🌐 Multiplayer", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
                       fg_color="#00BFA5", hover_color="#00897B", text_color="#ffffff",
@@ -5226,8 +5352,6 @@ DEINE ANTWORT-RICHTLINIEN:
     # ---------------------------------------------------------------------------
     def show_multiplayer_hub(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -5321,8 +5445,6 @@ DEINE ANTWORT-RICHTLINIEN:
 
     def show_multiplayer_match_setup(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -5733,8 +5855,6 @@ DEINE ANTWORT-RICHTLINIEN:
     # ---------------------------------------------------------------------------
     def show_host_rotation_setup(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -5852,8 +5972,6 @@ DEINE ANTWORT-RICHTLINIEN:
 
     def show_host_rotation_lobby_view(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#101015")
@@ -5977,8 +6095,6 @@ DEINE ANTWORT-RICHTLINIEN:
         self._start_uho_presence_heartbeat_loop()
 
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -6038,21 +6154,6 @@ DEINE ANTWORT-RICHTLINIEN:
                 
                 c_top = ctk.CTkFrame(c, fg_color="transparent")
                 c_top.pack(fill="x", padx=10, pady=8)
-                
-                ctk.CTkLabel(c_top, text=f"👤 {fr}", font=("Arial", 13, "bold"), text_color="#ffffff").pack(side="left")
-                
-                # UHO Hub vs osu! Only Badge
-                if is_uho_user:
-                    ctk.CTkLabel(c_top, text="⚡ UHO Hub User", font=("Arial", 9, "bold"),
-                                 fg_color="#0a2838", text_color="#00E5FF", corner_radius=4).pack(side="left", padx=6)
-                    u_status = live_users[u_low].get("status", "In UHO Hub aktiv")
-                    ctk.CTkLabel(c_top, text=f"🟢 {u_status}", font=("Arial", 9, "bold"),
-                                 fg_color="#11331c", text_color="#00E676", corner_radius=4).pack(side="left", padx=4)
-                else:
-                    ctk.CTkLabel(c_top, text="🎮 osu! Spieler", font=("Arial", 9),
-                                 fg_color="#20202a", text_color="#888899", corner_radius=4).pack(side="left", padx=6)
-                    ctk.CTkLabel(c_top, text="⚪ Offline / Kein UHO Hub", font=("Arial", 9),
-                                 fg_color="#1a1a22", text_color="#777788", corner_radius=4).pack(side="left", padx=4)
 
                 def remove_f(u=fr):
                     if u in self.uho_friends_list:
@@ -6063,10 +6164,33 @@ DEINE ANTWORT-RICHTLINIEN:
                 def challenge_f(u=fr):
                     self.show_multiplayer_match_setup()
 
-                ctk.CTkButton(c_top, text="⚔️ Match", width=75, height=26, font=("Arial", 10, "bold"),
-                              fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=challenge_f).pack(side="right", padx=2)
-                ctk.CTkButton(c_top, text="✕", width=26, height=26, font=("Arial", 10, "bold"),
-                              fg_color="#3a2028", hover_color="#502028", text_color="#ff8888", command=remove_f).pack(side="right", padx=2)
+                # PACK RIGHT ACTION BUTTONS FIRST so they NEVER clip or truncate!
+                r_btn_box = ctk.CTkFrame(c_top, fg_color="transparent")
+                r_btn_box.pack(side="right", padx=0)
+
+                ctk.CTkButton(r_btn_box, text="✕", width=28, height=28, font=("Arial", 11, "bold"),
+                              fg_color="#3a2028", hover_color="#502028", text_color="#ff8888", command=remove_f).pack(side="right", padx=(4, 0))
+
+                ctk.CTkButton(r_btn_box, text="⚔️ Match", width=90, height=28, font=("Arial", 11, "bold"),
+                              fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=challenge_f).pack(side="right", padx=(4, 0))
+
+                # Left information & badges frame
+                l_info_box = ctk.CTkFrame(c_top, fg_color="transparent")
+                l_info_box.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+                ctk.CTkLabel(l_info_box, text=f"👤 {fr}", font=("Arial", 13, "bold"), text_color="#ffffff").pack(side="left")
+
+                if is_uho_user:
+                    ctk.CTkLabel(l_info_box, text="⚡ UHO Hub", font=("Arial", 9, "bold"),
+                                 fg_color="#0a2838", text_color="#00E5FF", corner_radius=4).pack(side="left", padx=6)
+                    u_status = live_users[u_low].get("status", "Online")
+                    ctk.CTkLabel(l_info_box, text=f"🟢 {u_status}", font=("Arial", 9, "bold"),
+                                 fg_color="#11331c", text_color="#00E676", corner_radius=4).pack(side="left", padx=2)
+                else:
+                    ctk.CTkLabel(l_info_box, text="🎮 osu! Spieler", font=("Arial", 9),
+                                 fg_color="#20202a", text_color="#888899", corner_radius=4).pack(side="left", padx=6)
+                    ctk.CTkLabel(l_info_box, text="⚪ Offline", font=("Arial", 9),
+                                 fg_color="#1a1a22", text_color="#777788", corner_radius=4).pack(side="left", padx=2)
 
         def add_f():
             u = add_entry.get().strip()
@@ -6202,8 +6326,6 @@ DEINE ANTWORT-RICHTLINIEN:
 
     def show_multiplayer_match_lobby(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#101015")
@@ -6818,8 +6940,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
     def show_tournament_selector(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         self.grid_columnconfigure(0, weight=1)
@@ -7322,8 +7442,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
     def show_tournament_match_lobby(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         self.grid_columnconfigure(0, weight=1)
@@ -7497,7 +7615,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
             p_top = ctk.CTkFrame(p_box, fg_color="transparent")
             p_top.pack(fill="x")
-            ctk.CTkLabel(p_top, text=f"🎮 AKTIVE MAP: {cur_slot} • {cur_map.get('name', '')[:34]}", font=("Arial", 12, "bold"), text_color="#00E5FF").pack(side="left")
 
             def open_direct_tourney(b=bid):
                 try: os.startfile(f"osu://b/{b}")
@@ -7506,14 +7623,20 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             def open_web_tourney(b=bid):
                 webbrowser.open(f"https://osu.ppy.sh/b/{b}")
 
-            ctk.CTkButton(p_top, text="🔄 Sync", font=("Arial", 10, "bold"), width=70, height=24,
+            # Right buttons packed FIRST so they never get squished!
+            r_tourney_btns = ctk.CTkFrame(p_top, fg_color="transparent")
+            r_tourney_btns.pack(side="right")
+
+            ctk.CTkButton(r_tourney_btns, text="🔄 Sync", font=("Arial", 11, "bold"), width=75, height=26,
                           fg_color="#1f538d", hover_color="#2b78c9", command=lambda: self.fetch_tourney_recent_plays(silent=False)).pack(side="right", padx=(4, 0))
 
-            ctk.CTkButton(p_top, text="🌐 Web", font=("Arial", 10), width=60, height=24,
+            ctk.CTkButton(r_tourney_btns, text="🌐 Web", font=("Arial", 11), width=70, height=26,
                           fg_color="#2b2b38", hover_color="#3a3a4c", command=open_web_tourney).pack(side="right", padx=(4, 0))
 
-            ctk.CTkButton(p_top, text="⚡ osu!direct", font=("Arial", 10, "bold"), width=85, height=24,
+            ctk.CTkButton(r_tourney_btns, text="⚡ osu!direct", font=("Arial", 11, "bold"), width=95, height=26,
                           fg_color="#FF66AA", hover_color="#C2185B", command=open_direct_tourney).pack(side="right", padx=(4, 0))
+
+            ctk.CTkLabel(p_top, text=f"🎮 AKTIVE MAP: {cur_slot} • {cur_map.get('name', '')[:40]}", font=("Arial", 12, "bold"), text_color="#00E5FF").pack(side="left", fill="x", expand=True)
 
             ctk.CTkLabel(p_box, text=f"Mod: {req_mod} • ★ {cur_map.get('sr', 5.0):.2f} | ⚡ Auto-Sync erfasst deinen Run automatisch nach Song-Ende (oder ziehe .osr Replay hierhin)",
                          font=("Arial", 10), text_color="#00E676").pack(anchor="w", pady=(2, 0))
@@ -8095,8 +8218,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
     # ---------------------------------------------------------------------------
     def show_custom_mappool_builder(self, from_multiplayer=False):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         self.grid_columnconfigure(0, weight=1)
@@ -8673,8 +8794,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
     def show_training_mode_selection(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -8770,8 +8889,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
     # ---------------------------------------------------------------------------
     def show_ai_interactive_training(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -9700,8 +9817,6 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
     # ---------------------------------------------------------------------------
     def show_deep_replay_analyzer(self, selected_replay=None, view_mode="aggregate", from_training=True):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         self.grid_columnconfigure(0, weight=1)
@@ -10145,8 +10260,6 @@ Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
 
     def show_completed_skill_radar_dashboard(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         self.grid_columnconfigure(0, weight=1)
@@ -10397,8 +10510,6 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
 
     def show_profile_analyzer(self, is_step1=False):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         self.grid_columnconfigure(0, weight=1)
@@ -10604,6 +10715,17 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
             u_acc = float(u_info.get("accuracy", 0.0)) if ('u_info' in locals() and u_info) else 0.0
             u_pc = int(u_info.get("playcount", 0)) if ('u_info' in locals() and u_info) else 0
 
+            # Calculate accurate average Star Rating from top plays
+            sr_pool = [float(p.get("sr", 5.0)) for p in enriched_top_plays if p.get("sr")]
+            if sr_pool:
+                # Weighted top 15 plays average
+                top_avg_sr = round(sum(sr_pool[:15]) / len(sr_pool[:15]), 2)
+            else:
+                top_avg_sr = round(((u_pp ** 0.36) * 0.78) if u_pp > 0 else 5.2, 2)
+            
+            # Benchmark test difficulty is set to ~0.55* below Top Plays (comfort baseline / skill floor)
+            target_test_sr = round(max(3.0, min(8.8, top_avg_sr - 0.55)), 1)
+
             self.after(0, lambda: self.profile_status_lbl.configure(text="🤖 KI analysiert alle 8 Skillsets...", text_color="#E91E63"))
 
             user_scores = {
@@ -10774,8 +10896,6 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
     # ---------------------------------------------------------------------------
     def show_uho_auth_screen(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -10844,8 +10964,6 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
             return
 
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         self._tester_card_widgets = {}
@@ -10922,13 +11040,20 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
         # Start automatic background polling loop
         self._start_tester_auto_sync_loop()
 
-        avg_score = 65
-        if self.last_profile_analysis and "scores" in self.last_profile_analysis:
-            s_vals = list(self.last_profile_analysis["scores"].values())
-            avg_score = sum(s_vals) / len(s_vals) if s_vals else 65
-
-        base_sr = 5.0 + (avg_score - 50) * 0.03
-        base_sr = round(max(4.6, min(7.2, base_sr)), 1)
+        pa = getattr(self, "last_profile_analysis", {}) or {}
+        p_stats = pa.get("player_stats", {})
+        if "target_test_sr" in p_stats:
+            base_sr = float(p_stats["target_test_sr"])
+        elif "top_avg_sr" in p_stats:
+            base_sr = round(max(3.0, float(p_stats["top_avg_sr"]) - 0.55), 1)
+        elif "adaptive_difficulty" in p_stats:
+            base_sr = round(max(3.0, float(p_stats["adaptive_difficulty"].get("effective_sr", 5.2)) - 0.55), 1)
+        else:
+            avg_score = 65
+            if "scores" in pa:
+                s_vals = list(pa["scores"].values())
+                avg_score = sum(s_vals) / len(s_vals) if s_vals else 65
+            base_sr = round(max(3.5, min(8.8, 5.0 + (avg_score - 50) * 0.035 - 0.55)), 1)
 
         if not getattr(self, "current_ai_skill_test", None):
             self.generate_new_ai_skill_test(base_sr=base_sr)
@@ -10938,8 +11063,6 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
 
     def show_skill_tester_prerequisite_modal(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -10975,21 +11098,21 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
         scores = pa.get("scores", {})
 
         if base_sr is None:
-            if "adaptive_difficulty" in p_stats:
-                base_sr = float(p_stats["adaptive_difficulty"].get("effective_sr", 5.2))
-            elif "effective_sr" in p_stats:
-                base_sr = float(p_stats["effective_sr"])
-            elif "avg_sr" in p_stats and p_stats["avg_sr"]:
-                base_sr = float(p_stats["avg_sr"])
+            if "target_test_sr" in p_stats:
+                base_sr = float(p_stats["target_test_sr"])
+            elif "top_avg_sr" in p_stats:
+                base_sr = round(max(3.0, float(p_stats["top_avg_sr"]) - 0.55), 1)
+            elif "adaptive_difficulty" in p_stats:
+                base_sr = round(max(3.0, float(p_stats["adaptive_difficulty"].get("effective_sr", 5.2)) - 0.55), 1)
             elif "pp" in p_stats and p_stats["pp"]:
                 pp = float(p_stats["pp"])
-                base_sr = (pp ** 0.36) * 0.78
+                base_sr = round(max(3.0, (pp ** 0.36) * 0.78 - 0.55), 1)
             elif scores:
                 s_vals = list(scores.values())
                 avg_score = sum(s_vals) / len(s_vals)
-                base_sr = 5.0 + (avg_score - 50) * 0.035
+                base_sr = round(max(3.0, 5.0 + (avg_score - 50) * 0.035 - 0.55), 1)
             else:
-                base_sr = 5.2
+                base_sr = 4.8
 
         base_sr = round(max(3.8, min(8.8, base_sr)), 1)
 
@@ -11439,8 +11562,6 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
     # ---------------------------------------------------------------------------
     def show_training_skillset_selection(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
@@ -11695,8 +11816,6 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
 
     def setup_ui(self):
         for widget in self.winfo_children():
-            if widget is getattr(self, "_live_pp_win", None):
-                continue
             widget.destroy()
 
         master = ctk.CTkFrame(self, fg_color="#121216")
