@@ -3515,42 +3515,36 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 modal_win.after(0, lambda: status_lbl.configure(text="✅ Download fertig! Starte nahtlosen Neustart...", text_color="#00E676"))
                 time.sleep(1.0)
 
-                # 5. Generate batch updater script that terminates old processes, updates binaries, and launches detached
-                bat_script = f"""@echo off
-setlocal enabledelayedexpansion
-title UHO Hub Auto-Updater
-echo Aktualisiere UHO Hub auf die neueste Version...
-timeout /t 2 /nobreak >nul
+                # 5. Seamless Hidden PowerShell Auto-Replacer (Zero manual interaction needed!)
+                current_pid = os.getpid()
+                ps_script = (
+                    f"$pid_wait = {current_pid}; "
+                    f"$src = '{target_file}'; "
+                    f"$dst = '{current_exe}'; "
+                    f"try {{ Wait-Process -Id $pid_wait -Timeout 10 -ErrorAction SilentlyContinue }} catch {{}}; "
+                    f"Start-Sleep -Milliseconds 600; "
+                    f"$retry = 0; "
+                    f"while ($retry -lt 15) {{ "
+                    f"    try {{ "
+                    f"        Copy-Item -Path $src -Destination $dst -Force -ErrorAction Stop; "
+                    f"        Remove-Item -Path $src -Force -ErrorAction SilentlyContinue; "
+                    f"        break; "
+                    f"    }} catch {{ "
+                    f"        Start-Sleep -Milliseconds 500; "
+                    f"        $retry++; "
+                    f"    }} "
+                    f"}}; "
+                    f"Start-Process -FilePath $dst"
+                )
 
-:wait_close
-taskkill /f /im "{current_filename}" >nul 2>&1
-taskkill /f /im "UHOHub.exe" >nul 2>&1
-taskkill /f /im "OsuTrainingTracker.exe" >nul 2>&1
-timeout /t 1 /nobreak >nul
-
-move /y "{target_file}" "{current_exe}" >nul 2>&1
-if exist "{target_file}" (
-    timeout /t 1 /nobreak >nul
-    goto wait_close
-)
-
-REM If old file was named OsuTrainingTracker.exe, also mirror it to UHOHub.exe
-if /i not "{current_filename}"=="UHOHub.exe" (
-    copy /y "{current_exe}" "{uho_target_path}" >nul 2>&1
-)
-
-echo Starte neue Version...
-powershell -NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath '{current_exe}'"
-del "%~f0" & exit
-"""
-                bat_path = os.path.join(current_dir, "uho_update_runner.bat")
-                with open(bat_path, "w", encoding="utf-8") as f:
-                    f.write(bat_script)
-
-                # 6. Launch batch script completely detached (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+                # Launch PowerShell completely detached and hidden
                 DETACHED_FLAGS = 0x00000008 | 0x00000200
-                subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=DETACHED_FLAGS, close_fds=True)
-                self.after(300, lambda: (self.destroy(), os._exit(0)))
+                subprocess.Popen(
+                    ["powershell.exe", "-WindowStyle", "Hidden", "-NoProfile", "-Command", ps_script],
+                    creationflags=DETACHED_FLAGS,
+                    close_fds=True
+                )
+                self.after(400, lambda: (self.destroy(), os._exit(0)))
 
             except Exception as e:
                 err_msg = str(e)
