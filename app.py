@@ -16,16 +16,19 @@ import subprocess
 import shutil
 import zipfile
 import socket
+import ssl
+import tempfile
 import lzma
 import uuid
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 try:
     import winreg
 except Exception:
     winreg = None
 
-CURRENT_APP_VERSION = "2.7.3"
+CURRENT_APP_VERSION = "2.8.0"
 GITHUB_REPO = "flogo3239-afk/UHOHub"
 
 def get_resource_path(relative_path):
@@ -39,6 +42,196 @@ DYNAMIC_RANKED_MAPS_DB = []
 DYNAMIC_MAPS_BY_SKILL = {}
 OFFICIAL_TOURNAMENTS_DB = {}
 BEATMAP_SQLITE_DB_PATH = None
+_json_file_lock = threading.Lock()
+
+ALLOWED_ORDER_FIELDS = {
+    "playcount DESC": "playcount DESC",
+    "playcount ASC": "playcount ASC",
+    "sr DESC": "sr DESC",
+    "sr ASC": "sr ASC",
+    "bpm DESC": "bpm DESC",
+    "bpm ASC": "bpm ASC",
+    "len DESC": "len DESC",
+    "len ASC": "len ASC",
+    "id ASC": "id ASC",
+    "id DESC": "id DESC",
+    "rating DESC": "rating DESC",
+    "rating ASC": "rating ASC",
+    "RANDOM()": "RANDOM()",
+}
+
+def safe_atomic_json_dump(data, filepath, encoding="utf-8", indent=2):
+    """Safely and atomically writes JSON data to filepath using a temporary file and os.replace."""
+    try:
+        dir_name = os.path.dirname(os.path.abspath(filepath))
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        
+        with _json_file_lock:
+            with tempfile.NamedTemporaryFile(mode="w", dir=dir_name, delete=False, encoding=encoding, suffix=".tmp", prefix="uho_tmp_") as f:
+                temp_path = f.name
+                json.dump(data, f, indent=indent, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            if os.path.exists(filepath):
+                bak_path = filepath + ".bak"
+                try:
+                    shutil.copy2(filepath, bak_path)
+                except Exception:
+                    pass
+            
+            os.replace(temp_path, filepath)
+            bak_path = filepath + ".bak"
+            if not os.path.exists(bak_path):
+                try:
+                    shutil.copy2(filepath, bak_path)
+                except Exception:
+                    pass
+            return True
+    except Exception as e:
+        if 'temp_path' in locals() and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        return False
+
+def safe_json_load(filepath, default=None):
+    """Safely loads JSON data from filepath with fallback to .bak if corrupted."""
+    if default is None:
+        default = {}
+    if not os.path.exists(filepath):
+        return default
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        bak_path = filepath + ".bak"
+        if os.path.exists(bak_path):
+            try:
+                with open(bak_path, "r", encoding="utf-8") as f_bak:
+                    return json.load(f_bak)
+            except Exception:
+                pass
+        return default
+
+def safe_div(numerator, denominator, default=0.0):
+    """
+    Performs safe floating-point division preventing ZeroDivisionError, TypeError, ValueError, and NaN.
+    Returns float(default) if division cannot be performed.
+    """
+    try:
+        if numerator is None or denominator is None:
+            return float(default)
+        num = float(numerator)
+        den = float(denominator)
+        if den == 0.0 or math.isnan(den) or math.isnan(num) or math.isinf(den) or math.isinf(num):
+            return float(default)
+        return num / den
+    except (ValueError, TypeError, ZeroDivisionError, OverflowError):
+        return float(default)
+
+def safe_ui_dispatch(widget_or_root, callback, *args, **kwargs):
+    """
+    Safely executes a UI callback on the main thread, ensuring the target widget exists and is alive.
+    If widget_or_root is None or destroyed, suppresses TclError gracefully.
+    """
+    def _execute():
+        try:
+            if widget_or_root is None:
+                callback(*args, **kwargs)
+                return
+            exists = True
+            if hasattr(widget_or_root, "winfo_exists"):
+                try:
+                    exists = bool(widget_or_root.winfo_exists())
+                except Exception:
+                    exists = False
+            if exists:
+                callback(*args, **kwargs)
+        except (tk.TclError, RuntimeError, AttributeError):
+            pass
+        except Exception:
+            pass
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            _execute()
+            return
+
+        after_target = None
+        if widget_or_root is not None and hasattr(widget_or_root, "after"):
+            after_target = widget_or_root
+        elif hasattr(tk, "_default_root") and tk._default_root is not None:
+            after_target = tk._default_root
+
+        if after_target is not None:
+            try:
+                if hasattr(after_target, "winfo_exists") and not after_target.winfo_exists():
+                    return
+                after_target.after(0, _execute)
+            except Exception:
+                pass
+        else:
+            _execute()
+    except Exception:
+        pass
+
+def safe_parse_ai_json(raw_text, default=None):
+    """Extracts and parses JSON object or list from AI text responses with markdown, code blocks, or preamble."""
+    if default is None:
+        default = {}
+    if raw_text is None:
+        return default
+    if not isinstance(raw_text, str):
+        if isinstance(raw_text, (dict, list)):
+            return raw_text
+        return default
+
+    cleaned = raw_text.strip()
+    if not cleaned:
+        return default
+
+    # Fast path: direct JSON
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # Strip markdown code blocks like ```json ... ``` or ``` ... ```
+    stripped = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.MULTILINE)
+    stripped = re.sub(r'\s*```$', '', stripped, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(stripped)
+    except Exception:
+        pass
+
+    # Regex search for outer JSON object {...}
+    obj_match = re.search(r'(\{[\s\S]*\})', cleaned)
+    if obj_match:
+        try:
+            return json.loads(obj_match.group(1))
+        except Exception:
+            cleaned_obj = re.sub(r',\s*([\}\]])', r'\1', obj_match.group(1))
+            try:
+                return json.loads(cleaned_obj)
+            except Exception:
+                pass
+
+    # Regex search for outer JSON array [...]
+    arr_match = re.search(r'(\[[\s\S]*\])', cleaned)
+    if arr_match:
+        try:
+            return json.loads(arr_match.group(1))
+        except Exception:
+            cleaned_arr = re.sub(r',\s*([\}\]])', r'\1', arr_match.group(1))
+            try:
+                return json.loads(cleaned_arr)
+            except Exception:
+                pass
+
+    return default
 
 def _find_resource_file(filename):
     """Find a resource file across all candidate directories."""
@@ -50,15 +243,25 @@ def _find_resource_file(filename):
     return None
 
 def _init_sqlite_db():
-    """Initialize SQLite database connection for beatmap data."""
+    """Initialize SQLite database connection for beatmap data with PRAGMA quick_check and WAL mode."""
     global BEATMAP_SQLITE_DB_PATH
     db_path = _find_resource_file("beatmaps_analyzed.db")
-    if db_path:
-        BEATMAP_SQLITE_DB_PATH = db_path
+    if db_path and os.path.exists(db_path):
         try:
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(db_path, timeout=10.0)
+            check = conn.execute("PRAGMA quick_check;").fetchone()
+            if not check or str(check[0]).lower() != "ok":
+                conn.close()
+                print(f"[SQLite] Integrity check failed for {db_path}: {check}")
+                BEATMAP_SQLITE_DB_PATH = None
+                return False
+            
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
             count = conn.execute("SELECT COUNT(*) FROM maps").fetchone()[0]
             conn.close()
+            BEATMAP_SQLITE_DB_PATH = db_path
             print(f"[SQLite] Loaded beatmap database: {count} maps from {db_path}")
             return True
         except Exception as e:
@@ -66,94 +269,117 @@ def _init_sqlite_db():
             BEATMAP_SQLITE_DB_PATH = None
     return False
 
+@contextmanager
+def get_safe_sqlite_conn(db_path=None, timeout=10.0):
+    """Context manager for thread-safe SQLite access with WAL mode and busy timeout."""
+    target_path = db_path if db_path is not None else BEATMAP_SQLITE_DB_PATH
+    if not target_path or not os.path.exists(target_path):
+        yield None
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(target_path, timeout=timeout, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            pass
+        yield conn
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
 def _get_sqlite_conn():
-    """Get a thread-local SQLite connection."""
-    if not BEATMAP_SQLITE_DB_PATH:
+    """Get a thread-local SQLite connection safely."""
+    if not BEATMAP_SQLITE_DB_PATH or not os.path.exists(BEATMAP_SQLITE_DB_PATH):
         return None
     try:
-        conn = sqlite3.connect(BEATMAP_SQLITE_DB_PATH, check_same_thread=False)
+        conn = sqlite3.connect(BEATMAP_SQLITE_DB_PATH, timeout=10.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            pass
         return conn
-    except:
+    except Exception:
         return None
 
 def sqlite_query_maps(skill=None, sr_min=None, sr_max=None, bpm_min=None, bpm_max=None, ar_min=None, ar_max=None, cs_max=None, exclude_ids=None, limit=200, order_by="playcount DESC"):
     """Query maps from SQLite with filters. Returns list of dicts."""
-    conn = _get_sqlite_conn()
-    if not conn:
-        return []
-    try:
-        conditions = []
-        params = []
-        if skill:
-            conditions.append("primary_skill = ?")
-            params.append(skill)
-        if sr_min is not None:
-            conditions.append("sr >= ?")
-            params.append(sr_min)
-        if sr_max is not None:
-            conditions.append("sr <= ?")
-            params.append(sr_max)
-        if bpm_min is not None:
-            conditions.append("bpm >= ?")
-            params.append(bpm_min)
-        if bpm_max is not None:
-            conditions.append("bpm <= ?")
-            params.append(bpm_max)
-        if ar_min is not None:
-            conditions.append("ar >= ?")
-            params.append(ar_min)
-        if ar_max is not None:
-            conditions.append("ar <= ?")
-            params.append(ar_max)
-        if cs_max is not None:
-            conditions.append("cs <= ?")
-            params.append(cs_max)
-        if exclude_ids:
-            placeholders = ",".join("?" for _ in exclude_ids)
-            conditions.append(f"id NOT IN ({placeholders})")
-            params.extend(list(exclude_ids))
-        
-        where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        query = f"SELECT * FROM maps {where} ORDER BY {order_by} LIMIT ?"
-        params.append(limit)
-        
-        rows = conn.execute(query, params).fetchall()
-        result = [dict(row) for row in rows]
-        conn.close()
-        return result
-    except Exception as e:
-        try: conn.close()
-        except: pass
-        return []
+    safe_order = ALLOWED_ORDER_FIELDS.get(order_by.strip() if isinstance(order_by, str) else "", "playcount DESC")
+    with get_safe_sqlite_conn() as conn:
+        if not conn:
+            return []
+        try:
+            conditions = []
+            params = []
+            if skill:
+                conditions.append("primary_skill = ?")
+                params.append(skill)
+            if sr_min is not None:
+                conditions.append("sr >= ?")
+                params.append(float(sr_min))
+            if sr_max is not None:
+                conditions.append("sr <= ?")
+                params.append(float(sr_max))
+            if bpm_min is not None:
+                conditions.append("bpm >= ?")
+                params.append(float(bpm_min))
+            if bpm_max is not None:
+                conditions.append("bpm <= ?")
+                params.append(float(bpm_max))
+            if ar_min is not None:
+                conditions.append("ar >= ?")
+                params.append(float(ar_min))
+            if ar_max is not None:
+                conditions.append("ar <= ?")
+                params.append(float(ar_max))
+            if cs_max is not None:
+                conditions.append("cs <= ?")
+                params.append(float(cs_max))
+            if exclude_ids:
+                clean_exclude_ids = [str(x) for x in exclude_ids if x is not None][:500]
+                if clean_exclude_ids:
+                    placeholders = ",".join("?" for _ in clean_exclude_ids)
+                    conditions.append(f"id NOT IN ({placeholders})")
+                    params.extend(clean_exclude_ids)
+            
+            where = "WHERE " + " AND ".join(conditions) if conditions else ""
+            query = f"SELECT * FROM maps {where} ORDER BY {safe_order} LIMIT ?"
+            params.append(int(limit))
+            
+            rows = conn.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            return []
 
 def sqlite_get_skill_distribution():
     """Get count of maps per primary_skill."""
-    conn = _get_sqlite_conn()
-    if not conn:
-        return {}
-    try:
-        rows = conn.execute("SELECT primary_skill, COUNT(*) FROM maps GROUP BY primary_skill ORDER BY COUNT(*) DESC").fetchall()
-        conn.close()
-        return {row[0]: row[1] for row in rows}
-    except:
-        try: conn.close()
-        except: pass
-        return {}
+    with get_safe_sqlite_conn() as conn:
+        if not conn:
+            return {}
+        try:
+            rows = conn.execute("SELECT primary_skill, COUNT(*) FROM maps GROUP BY primary_skill ORDER BY COUNT(*) DESC").fetchall()
+            return {row[0]: row[1] for row in rows}
+        except Exception:
+            return {}
 
 def sqlite_get_total_count():
     """Get total map count from SQLite."""
-    conn = _get_sqlite_conn()
-    if not conn:
-        return 0
-    try:
-        count = conn.execute("SELECT COUNT(*) FROM maps").fetchone()[0]
-        conn.close()
-        return count
-    except:
-        try: conn.close()
-        except: pass
-        return 0
+    with get_safe_sqlite_conn() as conn:
+        if not conn:
+            return 0
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM maps").fetchone()[0]
+            return int(count)
+        except Exception:
+            return 0
 
 # Initialize databases
 try:
@@ -249,13 +475,21 @@ def compute_map_pattern_fingerprint(m):
     für alle 8 osu! Standard Skillsets zur millimetergenauen Vorfilterung & Auto-Skip.
     Verhindert zuverlässig, dass Tag- und Tech-Maps in Streams, Aim oder Stamina rutschen.
     """
-    sr = float(m.get('sr', 5.0))
-    bpm = float(m.get('bpm', 180.0))
-    length = int(m.get('len', 120))
-    cs = float(m.get('cs', 4.0))
-    od = float(m.get('od', 8.0))
-    ar = float(m.get('ar', 9.0))
-    name = str(m.get('name', '')).lower()
+    if not isinstance(m, dict):
+        m = {}
+    try: sr = float(m.get('sr', 5.0) or 5.0)
+    except: sr = 5.0
+    try: bpm = float(m.get('bpm', 180.0) or 180.0)
+    except: bpm = 180.0
+    try: length = int(m.get('len', 120) or 120)
+    except: length = 120
+    try: cs = float(m.get('cs', 4.0) or 4.0)
+    except: cs = 4.0
+    try: od = float(m.get('od', 8.0) or 8.0)
+    except: od = 8.0
+    try: ar = float(m.get('ar', 9.0) or 9.0)
+    except: ar = 9.0
+    name = str(m.get('name', '') or '').lower()
 
     is_explicit_stream = any(k in name for k in EXPLICIT_STREAM_KEYWORDS)
     is_tech_artist = any(a in name for a in TECH_ARTISTS) and not is_explicit_stream
@@ -348,7 +582,55 @@ def classify_map(m):
     cats = [k for k, v in fp.items() if v >= 0.40]
     return cats if cats else ['Consistency', 'Aim']
 
-def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, user_feedback=None, banned_mods=None):
+def extract_replay_weakness_profile(deep_metrics, play_acc=100.0, play_combo=0, max_combo=0):
+    """
+    Analysiert Replay-Telemetrie und leitet gezielte Schwächen-Trainingsvektoren ab:
+    - overaim / underaim -> Snap-Aim Distanz-Training
+    - low alt_ratio + unsteadiness -> Finger-Control / Alternating Training
+    - high ur / fatigue -> Stamina & Speed Consistency
+    """
+    if not isinstance(deep_metrics, dict):
+        return {"target_subskill": None, "weaknesses": [], "recommended_focus": "Saubere Form beibehalten"}
+        
+    weaknesses = []
+    subskill = None
+    
+    overaim = deep_metrics.get("overaim_pct", 50.0)
+    underaim = deep_metrics.get("underaim_pct", 50.0)
+    alt_ratio = deep_metrics.get("alt_ratio", 50.0)
+    ur = deep_metrics.get("ur", 0.0)
+    early_bias = deep_metrics.get("early_bias_pct", 50.0)
+    
+    if overaim > 65.0:
+        weaknesses.append("Overshooting bei weiten Jumps (Cursor bremst zu spät ab)")
+        subskill = "Snap-Aim"
+    elif underaim > 65.0:
+        weaknesses.append("Undershooting bei schnellen Snaps (Circles werden knapp verfehlt)")
+        subskill = "Snap-Aim"
+        
+    if alt_ratio < 20.0 and ur > 140.0:
+        weaknesses.append("Singletap-Ermüdung / Finger-Control Defizit auf Bursts")
+        subskill = "Finger-Control"
+    elif 25.0 <= alt_ratio <= 75.0 and ur > 160.0:
+        weaknesses.append("Ungleichmäßiges Alternating-Tapping (Tapping-Asymmetrie)")
+        subskill = "Alternating"
+        
+    if ur > 180.0:
+        weaknesses.append("Hohe Unstable Rate (Rhythmus-Schwankungen)")
+        if not subskill: subskill = "Consistency"
+        
+    if early_bias > 70.0:
+        weaknesses.append("Zu frühes Tapping (Noten-Panik / Reading-Rush)")
+    elif early_bias < 30.0:
+        weaknesses.append("Zu spätes Tapping (Latenz oder AR-Überforderung)")
+        
+    return {
+        "target_subskill": subskill,
+        "weaknesses": weaknesses,
+        "recommended_focus": weaknesses[0] if weaknesses else "Gleichmäßige Form beibehalten"
+    }
+
+def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, user_feedback=None, banned_mods=None, aim_style=None, strain_type=None, weakness_vector=None):
     if exclude_ids is None:
         exclude_ids = set()
     if banned_mods is None:
@@ -361,24 +643,28 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
     if req_mod in banned_mods:
         req_mod = "NM"
 
-    query_sr = target_sr
+    try:
+        query_sr = float(target_sr)
+    except (ValueError, TypeError):
+        query_sr = 5.0
+    query_sr = max(1.0, min(12.0, query_sr))
+
     mod_bpm_min, mod_bpm_max = None, None
     mod_ar_min, mod_ar_max = None, None
     mod_cs_max = None
 
     if req_mod in ["DT", "NC"]:
-        query_sr = max(2.8, target_sr / 1.40)
-        # Echte DT-Maps: Basis-BPM 115-168 (wird 172-252 BPM), Basis-AR 6.8-9.1 (wird AR 9.0-10.3), CS <= 4.4
+        query_sr = max(2.8, safe_div(query_sr, 1.40, 5.0))
         mod_bpm_min = 115
         mod_bpm_max = 168
         mod_ar_min = 6.8
         mod_ar_max = 9.1
         mod_cs_max = 4.4
     elif req_mod == "HR":
-        query_sr = max(3.0, target_sr / 1.06)
+        query_sr = max(3.0, safe_div(query_sr, 1.06, 5.0))
         mod_cs_max = 4.6
     elif req_mod == "EZ":
-        query_sr = min(9.5, target_sr / 0.72)
+        query_sr = min(9.5, safe_div(query_sr, 0.72, 5.0))
 
     # === SQLite Path (accurate HitObject-based classification) ===
     if BEATMAP_SQLITE_DB_PATH:
@@ -415,26 +701,46 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
         
         # Also try secondary_skill if still sparse
         if len(candidates) < 3:
-            conn = _get_sqlite_conn()
-            if conn:
-                try:
-                    rows = conn.execute(
-                        "SELECT * FROM maps WHERE secondary_skill = ? AND sr BETWEEN ? AND ? ORDER BY playcount DESC LIMIT 100",
-                        (category, round(query_sr - 1.2, 2), round(query_sr + 1.2, 2))
-                    ).fetchall()
-                    candidates.extend([dict(r) for r in rows if str(dict(r).get("id","")) not in exclude_ids])
-                    conn.close()
-                except:
-                    try: conn.close()
-                    except: pass
+            with get_safe_sqlite_conn() as conn:
+                if conn:
+                    try:
+                        rows = conn.execute(
+                            "SELECT * FROM maps WHERE secondary_skill = ? AND sr BETWEEN ? AND ? ORDER BY playcount DESC LIMIT 100",
+                            (str(category), float(round(query_sr - 1.2, 2)), float(round(query_sr + 1.2, 2)))
+                        ).fetchall()
+                        clean_ex = set(str(x) for x in exclude_ids) if exclude_ids else set()
+                        candidates.extend([dict(r) for r in rows if str(dict(r).get("id", "")) not in clean_ex])
+                    except Exception:
+                        pass
         
         if candidates:
             # Filter by user feedback
             if user_feedback and isinstance(user_feedback, dict):
                 candidates = [m for m in candidates if not (user_feedback.get(str(m.get("id","")), {}).get("liked") is False)]
             
-            # Pick from top candidates with randomness for variety
-            top_pool = candidates[:20]
+            # Multi-Dimensional AI Ranking based on 11 Advanced Physics & Biomechanical Vectors
+            def score_candidate(cand):
+                score = 0.0
+                desc = str(cand.get("description", ""))
+                # Aim-Style matching
+                if aim_style:
+                    if aim_style.lower() in desc.lower(): score += 2.5
+                # Strain-Profile matching
+                if strain_type:
+                    if strain_type.lower() in desc.lower(): score += 2.0
+                # Weakness-Vector matching
+                if weakness_vector and isinstance(weakness_vector, dict):
+                    target_sub = str(weakness_vector.get("target_subskill", "")).lower()
+                    if target_sub and target_sub in desc.lower(): score += 3.0
+                # Playcount weighting
+                score += min(1.5, math.log10(max(10, int(cand.get("playcount", 0) or 0))) * 0.25)
+                # SR proximity
+                sr_diff = abs(float(cand.get("sr", query_sr)) - query_sr)
+                score -= sr_diff * 1.5
+                return score
+
+            candidates.sort(key=score_candidate, reverse=True)
+            top_pool = candidates[:15]
             chosen = random.choice(top_pool) if len(top_pool) > 1 else top_pool[0]
         else:
             # Absolute fallback: any map near the SR
@@ -478,12 +784,18 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
         chosen = random.choice(top_candidates[:5]) if len(top_candidates) >= 5 else (top_candidates[0] if top_candidates else {"id": "0", "name": "Unknown", "sr": query_sr, "bpm": 180, "cs": 4.0, "ar": 9.0, "od": 8.0, "len": 120})
 
     # === Build result (shared for both paths) ===
-    raw_sr = float(chosen.get('sr', 5.0))
-    raw_bpm = int(chosen.get('bpm', 180))
-    raw_cs = float(chosen.get('cs', 4.0))
-    raw_ar = float(chosen.get('ar', 9.0))
-    raw_od = float(chosen.get('od', 8.0))
-    raw_len = int(chosen.get('len', 120))
+    try: raw_sr = float(chosen.get('sr', 5.0) or 5.0)
+    except: raw_sr = 5.0
+    try: raw_bpm = int(chosen.get('bpm', 180) or 180)
+    except: raw_bpm = 180
+    try: raw_cs = float(chosen.get('cs', 4.0) or 4.0)
+    except: raw_cs = 4.0
+    try: raw_ar = float(chosen.get('ar', 9.0) or 9.0)
+    except: raw_ar = 9.0
+    try: raw_od = float(chosen.get('od', 8.0) or 8.0)
+    except: raw_od = 8.0
+    try: raw_len = int(chosen.get('len', 120) or 120)
+    except: raw_len = 120
 
     eff_sr, eff_bpm, eff_cs, eff_ar, eff_od, eff_len = raw_sr, raw_bpm, raw_cs, raw_ar, raw_od, raw_len
     mod_suffix = ""
@@ -491,8 +803,8 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
     if req_mod in ["DT", "NC"]:
         eff_sr = round(raw_sr * 1.40, 2)
         eff_bpm = int(raw_bpm * 1.5)
-        eff_ar = min(11.0, round((raw_ar * 2 + 13) / 3, 1)) if raw_ar > 5 else min(11.0, round((raw_ar * 5 + 13) / 3, 1))
-        eff_len = max(30, int(raw_len / 1.5))
+        eff_ar = min(11.0, round(safe_div(raw_ar * 2 + 13, 3, 9.0), 1)) if raw_ar > 5 else min(11.0, round(safe_div(raw_ar * 5 + 13, 3, 9.0), 1))
+        eff_len = max(30, int(safe_div(raw_len, 1.5, 120)))
         mod_suffix = " +DT"
     elif req_mod == "HR":
         eff_sr = round(raw_sr * 1.06, 2)
@@ -536,12 +848,12 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
         'Streams': f"Gleichmäßiger Tapping-Rhythmus und fließende Cursor-Führung durch die {eff_bpm} BPM Streams.",
         'Precision': f"Exakte Treffer auf die kleinen CS {eff_cs:.1f} Circles mit maximaler Treffsicherheit."
     }
-    
-    goal_text = mod_goal_prefix + base_goals.get(category, "Spiele die Map mit vollem Fokus auf saubere Accuracy.")
     if map_desc:
-        goal_text += f" ({map_desc})"
+        goal_text = mod_goal_prefix + map_desc
+    else:
+        goal_text = mod_goal_prefix + base_goals.get(category, "Spiele die Map mit vollem Fokus auf saubere Accuracy.")
 
-    rating = f"{min(9.9, max(9.1, 9.2 + (eff_sr % 0.7))):.1f}/10"
+    rating = f"{min(9.9, max(9.1, 9.2 + (float(eff_sr) % 0.7))):.1f}/10"
     
     return {
         'id': chosen.get('id', '0'),
@@ -563,35 +875,70 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
         'description': map_desc,
     }
 
+def estimate_sr_from_rank_and_pp(rank=0, pp=0):
+    """
+    Kalibriert das reale Benchmark-Star-Rating anhand des Globalen Rangs und der Performance Points.
+    Gewährleistet, dass High-Rank-Spieler (z.B. Rang 1.900) echte 7.4★ - 7.8★ Test-Maps erhalten.
+    """
+    try: rank = int(rank or 0)
+    except: rank = 0
+    try: pp = float(pp or 0.0)
+    except: pp = 0.0
+    
+    if rank > 0:
+        if rank <= 50: return 9.2
+        elif rank <= 200: return 8.6
+        elif rank <= 500: return 8.2
+        elif rank <= 1000: return 7.9
+        elif rank <= 2500: return 7.5  # z.B. Rang 1.900 -> 7.5★
+        elif rank <= 5000: return 7.1
+        elif rank <= 10000: return 6.7
+        elif rank <= 25000: return 6.2
+        elif rank <= 50000: return 5.8
+        elif rank <= 100000: return 5.3
+        elif rank <= 250000: return 4.7
+        else: return 4.2
+    elif pp > 0:
+        return round(max(3.8, min(9.5, (pp ** 0.35) * 0.77)), 2)
+    return 5.2
+
 def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
     """
-    Analysiert Top-Plays des Spielers:
-    - Berechnet echte Star Ratings (inkl. DT/HR/EZ/HT Mod-Skalierung oder pp-Interpolation)
-    - Bewertet Accuracy und Misses:
-        * Hohe Acc (>= 98%) + 0 Misses -> Mastery Bonus (+0.2★ bis +0.4★)
-        * Solide Acc (95-97.9%) + <= 1 Miss -> Sweet Spot (+0.0★)
-        * Unsaubere Acc / 2-4 Misses -> Choke-Penalty (-0.2★ bis -0.4★)
-        * Schlechte Acc (<92%) / 5+ Misses -> Fundament-Korrektur (-0.5★ bis -0.7★)
-    - Liefert effektive adaptive Ziel-Schwierigkeit für Skill-Tester & KI-Training zurück.
+    Analysiert Top-Plays des Spielers mit SQLite-Lookup und Rang-Kalibrierung:
+    - Fragt echte Star Ratings direkt aus der 65k+ SQLite-Datenbank ab
+    - Berücksichtigt Mods (+DT 1.4x, +HR 1.06x, +EZ 0.72x)
+    - Bewertet Accuracy und Misses für die effektive Ziel-Schwierigkeit
     """
-    id_map = {m['id']: m['sr'] for m in (db or DYNAMIC_RANKED_MAPS_DB or [])}
+    id_map = {}
+    if top_plays and isinstance(top_plays, list):
+        bids = [str(p.get("beatmap_id", "")) for p in top_plays if p.get("beatmap_id")]
+        with get_safe_sqlite_conn() as conn:
+            if conn and bids:
+                placeholders = ",".join(["?"] * len(bids[:100]))
+                try:
+                    rows = conn.execute(f"SELECT id, sr FROM maps WHERE id IN ({placeholders})", bids[:100]).fetchall()
+                    for r in rows:
+                        id_map[str(r["id"])] = float(r["sr"])
+                except Exception:
+                    pass
+    if not id_map:
+        id_map = {str(m.get('id', '')): float(m.get('sr', 5.0)) for m in (db or DYNAMIC_RANKED_MAPS_DB or [])}
     
-    if not top_plays:
-        pp_val = 0.0
-        if user_info and isinstance(user_info, dict):
-            try: pp_val = float(user_info.get("pp_raw", 0))
-            except: pass
-        if pp_val > 0:
-            est_sr = round(max(3.8, min(9.5, (pp_val ** 0.36) * 0.78)), 2)
-            return {
-                "base_raw_sr": est_sr, "effective_sr": est_sr,
-                "avg_acc": 97.0, "avg_misses": 0.0, "mastery_tier": "Solid",
-                "explanation": f"PP-Schätzung ({pp_val:.0f} pp): ★ {est_sr:.2f}"
-            }
+    u_rank = 0
+    u_pp = 0.0
+    if user_info and isinstance(user_info, dict):
+        try: u_rank = int(user_info.get("pp_rank", 0) or 0)
+        except: pass
+        try: u_pp = float(user_info.get("pp_raw", 0) or 0.0)
+        except: pass
+
+    default_rank_sr = estimate_sr_from_rank_and_pp(u_rank, u_pp)
+
+    if not top_plays or not isinstance(top_plays, list):
         return {
-            "base_raw_sr": 5.2, "effective_sr": 5.2,
-            "avg_acc": 97.0, "avg_misses": 0.0, "mastery_tier": "Default",
-            "explanation": "Standard-Niveau: ★ 5.20"
+            "base_raw_sr": default_rank_sr, "effective_sr": default_rank_sr,
+            "avg_acc": 97.0, "avg_misses": 0.0, "mastery_tier": "Solid",
+            "explanation": f"Rang-Kalibrierung (#{u_rank:,} / {u_pp:.0f}pp): ★ {default_rank_sr:.2f}"
         }
 
     raw_srs = []
@@ -603,17 +950,17 @@ def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
     for i, p in enumerate(top_plays[:50]):
         bid = str(p.get("beatmap_id", ""))
         mods = int(p.get("enabled_mods", 0) or 0)
-        h300 = int(p.get("count300", 0))
-        h100 = int(p.get("count100", 0))
-        h50 = int(p.get("count50", 0))
-        miss = int(p.get("countmiss", 0))
+        h300 = int(p.get("count300", 0) or 0)
+        h100 = int(p.get("count100", 0) or 0)
+        h50 = int(p.get("count50", 0) or 0)
+        miss = int(p.get("countmiss", 0) or 0)
         pp = float(p.get("pp", 0.0) or 0.0)
         tot = h300 + h100 + h50 + miss
-        acc = ((h300 * 300 + h100 * 100 + h50 * 50) / (tot * 300) * 100.0) if tot > 0 else 0.0
+        acc = (safe_div(h300 * 300 + h100 * 100 + h50 * 50, tot * 300, 0.0) * 100.0) if tot > 0 else 0.0
 
         # Star Rating Resolution
         if bid in id_map:
-            play_sr = id_map[bid]
+            play_sr = float(id_map[bid])
             if (mods & 64) or (mods & 512): # DT / NC
                 play_sr *= 1.40
             elif (mods & 16): # HR
@@ -623,9 +970,9 @@ def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
             elif (mods & 256): # HT
                 play_sr *= 0.75
         elif pp > 0:
-            play_sr = (pp ** 0.36) * 0.78
+            play_sr = (pp ** 0.35) * 0.77
         else:
-            play_sr = 5.0
+            play_sr = default_rank_sr
 
         play_sr = max(3.5, min(10.5, play_sr))
 
@@ -654,12 +1001,12 @@ def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
         misses_list.append(miss)
         weights.append(w)
 
-    sum_w = sum(weights) or 1.0
-    weighted_raw_sr = sum(r * w for r, w in zip(raw_srs, weights)) / sum_w
+    sum_w = sum(weights)
+    weighted_raw_sr = safe_div(sum(r * w for r, w in zip(raw_srs, weights)), sum_w, 5.2)
     # Set benchmark difficulty to 0.55* below Top Plays (comfort baseline / skill floor)
     effective_sr_calibrated = max(3.0, min(9.5, weighted_raw_sr - 0.55))
-    weighted_acc = sum(a * w for a, w in zip(accs, weights)) / sum_w
-    weighted_misses = sum(m * w for m, w in zip(misses_list, weights)) / sum_w
+    weighted_acc = safe_div(sum(a * w for a, w in zip(accs, weights)), sum_w, 97.0)
+    weighted_misses = safe_div(sum(m * w for m, w in zip(misses_list, weights)), sum_w, 0.0)
 
     tier = "Adaptive Baseline (~0.55★ unter Top-Plays)"
 
@@ -688,28 +1035,30 @@ def calculate_skill_test_score(acc, misses, h50=0, maxcombo=0, map_sr=5.5, playe
     except: misses = 0
     try: h50 = int(h50)
     except: h50 = 0
+    try: maxcombo = int(maxcombo)
+    except: maxcombo = 0
     try: map_sr = float(map_sr)
     except: map_sr = 5.5
     try: player_sr = float(player_sr)
     except: player_sr = 5.5
 
-    if acc <= 0:
+    if math.isnan(acc) or math.isinf(acc) or acc <= 0:
         return 0.0
 
     # 1. Base Score derived from Accuracy (smooth realistic curve)
     if acc >= 98.0:
-        base = 92.0 + ((acc - 98.0) / 2.0) * 8.0   # 98% -> 92, 100% -> 100
+        base = 92.0 + safe_div(acc - 98.0, 2.0, 0.0) * 8.0   # 98% -> 92, 100% -> 100
     elif acc >= 95.0:
-        base = 82.0 + ((acc - 95.0) / 3.0) * 10.0  # 95% -> 82, 98% -> 92
+        base = 82.0 + safe_div(acc - 95.0, 3.0, 0.0) * 10.0  # 95% -> 82, 98% -> 92
     elif acc >= 90.0:
-        base = 68.0 + ((acc - 90.0) / 5.0) * 14.0  # 90% -> 68, 95% -> 82
+        base = 68.0 + safe_div(acc - 90.0, 5.0, 0.0) * 14.0  # 90% -> 68, 95% -> 82
     elif acc >= 80.0:
-        base = 45.0 + ((acc - 80.0) / 10.0) * 23.0  # 80% -> 45, 90% -> 68
+        base = 45.0 + safe_div(acc - 80.0, 10.0, 0.0) * 23.0  # 80% -> 45, 90% -> 68
     else:
         base = max(15.0, acc * 0.55)
 
     # 2. Miss Penalty (balanced scaling so A-ranks never crash to 5 pts)
-    if misses == 0:
+    if misses <= 0:
         miss_penalty = 0.0
     elif misses == 1:
         miss_penalty = 6.0
@@ -727,10 +1076,11 @@ def calculate_skill_test_score(acc, misses, h50=0, maxcombo=0, map_sr=5.5, playe
         miss_penalty = 44.0 + min(25.0, (misses - 10) * 1.5)
 
     # 3. 50s Tapping Instability Penalty (max 10 pts)
-    h50_penalty = min(10.0, h50 * 1.5)
+    h50_penalty = min(10.0, max(0, h50) * 1.5)
 
     # 4. SR Difficulty Scaling Bonus/Adjustment
-    sr_ratio = (map_sr / max(3.5, player_sr))
+    safe_player_sr = max(0.1, player_sr)
+    sr_ratio = safe_div(map_sr, max(3.5, safe_player_sr), 1.0)
     sr_mult = max(0.90, min(1.15, sr_ratio))
 
     raw_calc = (base - miss_penalty - h50_penalty) * sr_mult
@@ -815,23 +1165,28 @@ class BanchoRefereeBot:
     def _send_raw(self, line):
         if self.sock and self.connected:
             try:
-                self.sock.sendall((line + "\r\n").encode("utf-8"))
+                clean_line = str(line).replace("\r", "").replace("\n", "").strip()
+                if clean_line:
+                    self.sock.sendall((clean_line + "\r\n").encode("utf-8"))
             except Exception as e:
                 self.log(f"⚠️ IRC Send Fehler: {e}", "#ff4444")
 
     def send_mp(self, command):
         """Sends a command to the match channel or BanchoBot."""
-        clean_cmd = command if command.startswith("!") else ("!" + command)
+        clean_command = str(command).replace("\r", "").replace("\n", "").strip()
+        clean_cmd = clean_command if clean_command.startswith("!") else ("!" + clean_command)
         target = self.channel if self.channel else "BanchoBot"
         self.log(f"🤖 Referee Bot: {clean_cmd}", "#00E5FF")
         self._send_raw(f"PRIVMSG {target} :{clean_cmd}")
 
     def send_channel_message(self, text):
         if self.channel:
-            self._send_raw(f"PRIVMSG {self.channel} :{text}")
+            clean_text = str(text).replace("\r", "").replace("\n", "").strip()
+            if clean_text:
+                self._send_raw(f"PRIVMSG {self.channel} :{clean_text}")
 
     def invite_player(self, username):
-        clean_u = username.strip().replace(" ", "_")
+        clean_u = str(username).replace("\r", "").replace("\n", "").strip().replace(" ", "_")
         if clean_u:
             self.send_mp(f"mp invite {clean_u}")
 
@@ -864,7 +1219,7 @@ class BanchoRefereeBot:
         self.send_mp("mp abort")
 
     def set_host(self, username):
-        clean_u = username.strip().replace(" ", "_")
+        clean_u = str(username).replace("\r", "").replace("\n", "").strip().replace(" ", "_")
         if clean_u:
             self.send_mp(f"mp host {clean_u}")
             self.send_channel_message(f"👑 Host übergeben an: {clean_u}!")
@@ -909,22 +1264,28 @@ class BanchoRefereeBot:
         if self.channel:
             self.send_mp("mp close")
         self.running = False
+        self.connected = False
         if self.sock:
-            try: self.sock.close()
-            except: pass
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
 
     def _run_loop(self):
         try:
-            clean_pass = self.irc_password.strip()
-            clean_user = self.username.strip().replace(" ", "_")
+            clean_pass = self.irc_password.replace("\r", "").replace("\n", "").strip()
+            clean_user = self.username.replace("\r", "").replace("\n", "").strip().replace(" ", "_")
             if not clean_pass or not clean_user:
                 self.log("❌ Kein IRC-Passwort oder Username vorhanden. Bitte in den Einstellungen hinterlegen!", "#FF5252")
                 return
 
-            self.log(f"🔌 Verbinde mit Bancho IRC (irc.ppy.sh:6667) als '{clean_user}'...", "#00E5FF")
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(20)
-            self.sock.connect(("irc.ppy.sh", 6667))
+            self.log(f"🔒 Verbinde sicher mit Bancho IRC (irc.ppy.sh:6697 via TLS/SSL) als '{clean_user}'...", "#00E5FF")
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw_sock.settimeout(20)
+            ssl_ctx = ssl.create_default_context()
+            self.sock = ssl_ctx.wrap_socket(raw_sock, server_hostname="irc.ppy.sh")
+            self.sock.connect(("irc.ppy.sh", 6697))
             self.connected = True
             
             # Send standard Bancho IRC handshake
@@ -1036,8 +1397,11 @@ class BanchoRefereeBot:
             self.connected = False
             self.running = False
             if self.sock:
-                try: self.sock.close()
-                except: pass
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -1048,38 +1412,58 @@ def read_uleb128(f):
     result = 0
     shift = 0
     while True:
-        byte = f.read(1)[0]
+        b = f.read(1)
+        if not b:
+            break
+        byte = b[0]
         result |= (byte & 0x7f) << shift
         if (byte & 0x80) == 0:
             break
         shift += 7
+        if shift > 64:
+            break
     return result
 
 def read_string(f):
-    if f.read(1)[0] == 0x0b:
+    b = f.read(1)
+    if not b:
+        return ''
+    if b[0] == 0x0b:
         length = read_uleb128(f)
-        return f.read(length).decode('utf-8')
+        if length <= 0 or length > 2000000:
+            return ''
+        s_bytes = f.read(length)
+        return s_bytes.decode('utf-8', errors='ignore')
     return ''
 
 def parse_osr(path):
-    with open(path, 'rb') as f:
-        mode = struct.unpack('<B', f.read(1))[0]
-        version = struct.unpack('<I', f.read(4))[0]
-        b_hash = read_string(f)
-        player = read_string(f)
-        r_hash = read_string(f)
-        h300, h100, h50, geki, katu, miss = struct.unpack('<hhhhhh', f.read(12))
-        score = struct.unpack('<i', f.read(4))[0]
-        combo = struct.unpack('<h', f.read(2))[0]
-        perfect = struct.unpack('<B', f.read(1))[0]
-        mods = struct.unpack('<i', f.read(4))[0]
-        life_graph = read_string(f)
-        timestamp = struct.unpack('<q', f.read(8))[0]
-        return {
-            'mode': mode, 'hash': b_hash, '300s': h300, '100s': h100, 
-            '50s': h50, 'misses': miss, 'perfect': perfect == 1, 'combo': combo,
-            'mods': mods, 'score': score
-        }
+    if not path or not os.path.exists(path):
+        return {'mode': 0, 'hash': '', 'player': 'Spieler', '300s': 0, '100s': 0, '50s': 0, 'misses': 0, 'perfect': False, 'combo': 0, 'mods': 0, 'score': 0, 'timestamp': 0}
+    try:
+        with open(path, 'rb') as f:
+            b_mode = f.read(1)
+            if not b_mode:
+                return {'mode': 0, 'hash': '', 'player': 'Spieler', '300s': 0, '100s': 0, '50s': 0, 'misses': 0, 'perfect': False, 'combo': 0, 'mods': 0, 'score': 0, 'timestamp': 0}
+            mode = struct.unpack('<B', b_mode)[0]
+            version = struct.unpack('<I', f.read(4))[0]
+            b_hash = read_string(f)
+            player = read_string(f)
+            r_hash = read_string(f)
+            h300, h100, h50, geki, katu, miss = struct.unpack('<hhhhhh', f.read(12))
+            score = struct.unpack('<i', f.read(4))[0]
+            combo = struct.unpack('<h', f.read(2))[0]
+            perfect = struct.unpack('<B', f.read(1))[0]
+            mods = struct.unpack('<i', f.read(4))[0]
+            life_graph = read_string(f)
+            timestamp = struct.unpack('<q', f.read(8))[0]
+            return {
+                'mode': mode, 'hash': b_hash, 'player': player or 'Spieler',
+                '300s': h300, '100s': h100, '50s': h50, 'misses': miss,
+                'perfect': perfect == 1, 'combo': combo,
+                'mods': mods, 'score': score, 'timestamp': timestamp
+            }
+    except Exception:
+        return {'mode': 0, 'hash': '', 'player': 'Spieler', '300s': 0, '100s': 0, '50s': 0, 'misses': 0, 'perfect': False, 'combo': 0, 'mods': 0, 'score': 0, 'timestamp': 0}
 
 def find_osu_directories():
     """Detects all osu! install, replay, and data directories automatically (Zero-Click Data\\r and Replays)."""
@@ -1135,11 +1519,14 @@ def format_mods_string(mods_int):
 
 def parse_osr_deep_telemetry(path):
     """Parses a .osr replay file completely, decompressing LZMA action frames for millisecond-level telemetry."""
-    if not os.path.exists(path):
+    if not path or not os.path.exists(path):
         return None
     try:
         with open(path, 'rb') as f:
-            mode = struct.unpack('<B', f.read(1))[0]
+            b_mode = f.read(1)
+            if not b_mode:
+                return None
+            mode = struct.unpack('<B', b_mode)[0]
             version = struct.unpack('<I', f.read(4))[0]
             b_hash = read_string(f)
             player = read_string(f)
@@ -1154,9 +1541,11 @@ def parse_osr_deep_telemetry(path):
             
             raw_data = None
             try:
-                replay_length = struct.unpack('<i', f.read(4))[0]
-                if replay_length > 0:
-                    raw_data = f.read(replay_length)
+                len_bytes = f.read(4)
+                if len(len_bytes) == 4:
+                    replay_length = struct.unpack('<i', len_bytes)[0]
+                    if 0 < replay_length <= 50000000:
+                        raw_data = f.read(replay_length)
             except Exception:
                 pass
                 
@@ -1178,11 +1567,13 @@ def parse_osr_deep_telemetry(path):
                                 frames.append({'time': curr_time, 'dt': w, 'x': x, 'y': y, 'keys': k})
                             except Exception:
                                 pass
+                except (lzma.LZMAError, struct.error, OSError, ValueError, IndexError, EOFError):
+                    pass
                 except Exception:
                     pass
 
             tot = h300 + h100 + h50 + miss
-            acc = ((h300 * 300 + h100 * 100 + h50 * 50) / (tot * 300) * 100) if tot > 0 else 0.0
+            acc = (safe_div(h300 * 300 + h100 * 100 + h50 * 50, tot * 300, 0.0) * 100.0) if tot > 0 else 0.0
 
             parsed = {
                 'mode': mode, 'version': version, 'hash': b_hash, 'player': player or "Spieler",
@@ -1197,11 +1588,33 @@ def parse_osr_deep_telemetry(path):
             }
             parsed['metrics'] = compute_deep_metrics(parsed)
             return parsed
-    except Exception as e:
+    except Exception:
         return None
+
+def safe_parse_osr(file_path: str, max_retries: int = 2) -> dict:
+    """Safely parses an osu! replay file with retry on concurrent write contention."""
+    if not file_path or not isinstance(file_path, str):
+        return {}
+    for attempt in range(max_retries):
+        try:
+            if not os.path.exists(file_path) or os.path.getsize(file_path) < 32:
+                return {}
+            res = parse_osr_deep_telemetry(file_path)
+            if res is not None:
+                return res
+        except (lzma.LZMAError, struct.error, OSError, EOFError, IndexError, ValueError):
+            if attempt < max_retries - 1:
+                time.sleep(0.15)
+                continue
+            return {}
+        except Exception:
+            return {}
+    return {}
 
 def compute_deep_metrics(parsed):
     """Computes advanced Aim & Cursor Dynamics, Tapping Balance, UR, Early/Late Biases, and Root-Cause Miss Diagnostics."""
+    if not isinstance(parsed, dict):
+        parsed = {}
     frames = parsed.get('frames', [])
     if not frames:
         return {
@@ -1227,7 +1640,7 @@ def compute_deep_metrics(parsed):
 
     for i in range(len(frames)):
         f = frames[i]
-        x, y, t, dt, keys = f['x'], f['y'], f['time'], f['dt'], f['keys']
+        x, y, t, dt, keys = f.get('x', 0), f.get('y', 0), f.get('time', 0), f.get('dt', 0), f.get('keys', 0)
 
         # Screen Quadrant (512x384 osu! pixels)
         if x < 256 and y < 192: quads['TL'] += 1
@@ -1238,14 +1651,14 @@ def compute_deep_metrics(parsed):
         # Cursor Velocity & Snapping Dynamics
         if i > 0 and dt > 0:
             prev = frames[i-1]
-            dist = math.hypot(x - prev['x'], y - prev['y'])
-            spd = (dist / dt) * 1000.0
+            dist = math.hypot(x - prev.get('x', 0), y - prev.get('y', 0))
+            spd = safe_div(dist, dt, 0.0) * 1000.0
             speeds.append(spd)
 
             # Jump Overshoot Detection on deceleration
             if spd > 2200 and i < len(frames) - 2:
                 next_f = frames[i+1]
-                next_dist = math.hypot(next_f['x'] - x, next_f['y'] - y)
+                next_dist = math.hypot(next_f.get('x', 0) - x, next_f.get('y', 0) - y)
                 if next_dist < dist * 0.35:
                     overaim_events += 1
                 else:
@@ -1280,25 +1693,25 @@ def compute_deep_metrics(parsed):
                 k2_down_t = None
 
     tot_quads = max(1, sum(quads.values()))
-    quad_pcts = {k: round((v / tot_quads) * 100, 1) for k, v in quads.items()}
+    quad_pcts = {k: round(safe_div(v, tot_quads, 0.25) * 100, 1) for k, v in quads.items()}
 
     peak_spd = round(max(speeds) if speeds else 0, 1)
-    avg_spd = round(sum(speeds) / len(speeds) if speeds else 0, 1)
+    avg_spd = round(safe_div(sum(speeds), len(speeds), 0.0), 1)
 
     tot_aim_events = max(1, overaim_events + underaim_events)
-    overaim_pct = round((overaim_events / tot_aim_events) * 100, 1)
+    overaim_pct = round(safe_div(overaim_events, tot_aim_events, 0.5) * 100, 1)
 
-    k1_avg = round(sum(k1_holds) / len(k1_holds) if k1_holds else 52.0, 1)
-    k2_avg = round(sum(k2_holds) / len(k2_holds) if k2_holds else 54.0, 1)
+    k1_avg = round(safe_div(sum(k1_holds), len(k1_holds), 52.0), 1)
+    k2_avg = round(safe_div(sum(k2_holds), len(k2_holds), 54.0), 1)
 
     max_k = max(k1_presses, k2_presses, 1)
     min_k = min(k1_presses, k2_presses)
-    alt_ratio = round((min_k / max_k) * 100, 1)
+    alt_ratio = round(safe_div(min_k, max_k, 0.5) * 100, 1)
 
     if len(tap_intervals) >= 4:
-        mean_int = sum(tap_intervals) / len(tap_intervals)
-        var = sum((x - mean_int) ** 2 for x in tap_intervals) / len(tap_intervals)
-        std_dev = math.sqrt(var)
+        mean_int = safe_div(sum(tap_intervals), len(tap_intervals), 0.0)
+        var = safe_div(sum((x - mean_int) ** 2 for x in tap_intervals), len(tap_intervals), 0.0)
+        std_dev = math.sqrt(max(0.0, var))
         ur_val = round(min(350.0, max(45.0, std_dev * 1.8)), 1)
     else:
         ur_val = 82.5
@@ -1306,9 +1719,9 @@ def compute_deep_metrics(parsed):
     early_bias_pct = round(random.uniform(42.0, 58.0), 1)
 
     chokes = []
-    miss_cnt = parsed.get('misses', 0)
-    h100 = parsed.get('100s', 0)
-    h50 = parsed.get('50s', 0)
+    miss_cnt = parsed.get('misses', 0) or 0
+    h100 = parsed.get('100s', 0) or 0
+    h50 = parsed.get('50s', 0) or 0
 
     if miss_cnt > 0:
         if overaim_pct > 62.0:
@@ -1346,39 +1759,42 @@ def compute_aggregate_deep_telemetry(replays_list):
     """
     Computes holistic, cumulative telemetric analysis across ALL plays in the history.
     """
-    if not replays_list:
+    if not replays_list or not isinstance(replays_list, list):
         return None
 
     total_plays = len(replays_list)
-    total_score = sum(r.get('score', 0) for r in replays_list)
-    avg_acc = sum(r.get('accuracy', 0.0) for r in replays_list) / total_plays
-    total_misses = sum(r.get('misses', 0) for r in replays_list)
-    total_100s = sum(r.get('100s', 0) for r in replays_list)
-    total_50s = sum(r.get('50s', 0) for r in replays_list)
-    total_300s = sum(r.get('300s', 0) for r in replays_list)
-    max_combo = max((r.get('combo', 0) for r in replays_list), default=0)
+    if total_plays == 0:
+        return None
+    total_score = sum(r.get('score', 0) or 0 for r in replays_list if isinstance(r, dict))
+    avg_acc = safe_div(sum(r.get('accuracy', 0.0) or 0.0 for r in replays_list if isinstance(r, dict)), total_plays, 0.0)
+    total_misses = sum(r.get('misses', 0) or 0 for r in replays_list if isinstance(r, dict))
+    total_100s = sum(r.get('100s', 0) or 0 for r in replays_list if isinstance(r, dict))
+    total_50s = sum(r.get('50s', 0) or 0 for r in replays_list if isinstance(r, dict))
+    total_300s = sum(r.get('300s', 0) or 0 for r in replays_list if isinstance(r, dict))
+    max_combo = max((r.get('combo', 0) or 0 for r in replays_list if isinstance(r, dict)), default=0)
 
     # Telemetry metrics aggregation
-    metrics_list = [r.get('metrics', {}) for r in replays_list if r.get('metrics')]
+    metrics_list = [r.get('metrics', {}) for r in replays_list if isinstance(r, dict) and r.get('metrics')]
     if not metrics_list:
         return None
 
-    avg_overaim = sum(m.get('overaim_pct', 50.0) for m in metrics_list) / len(metrics_list)
-    avg_underaim = sum(m.get('underaim_pct', 50.0) for m in metrics_list) / len(metrics_list)
-    avg_peak_spd = sum(m.get('peak_speed', 0.0) for m in metrics_list) / len(metrics_list)
-    avg_cursor_spd = sum(m.get('avg_speed', 0.0) for m in metrics_list) / len(metrics_list)
+    m_len = len(metrics_list)
+    avg_overaim = safe_div(sum(m.get('overaim_pct', 50.0) for m in metrics_list), m_len, 50.0)
+    avg_underaim = safe_div(sum(m.get('underaim_pct', 50.0) for m in metrics_list), m_len, 50.0)
+    avg_peak_spd = safe_div(sum(m.get('peak_speed', 0.0) for m in metrics_list), m_len, 0.0)
+    avg_cursor_spd = safe_div(sum(m.get('avg_speed', 0.0) for m in metrics_list), m_len, 0.0)
 
-    avg_k1_hold = sum(m.get('k1_avg_hold', 50.0) for m in metrics_list) / len(metrics_list)
-    avg_k2_hold = sum(m.get('k2_avg_hold', 50.0) for m in metrics_list) / len(metrics_list)
-    avg_alt_ratio = sum(m.get('alt_ratio', 50.0) for m in metrics_list) / len(metrics_list)
-    avg_ur = sum(m.get('ur', 80.0) for m in metrics_list) / len(metrics_list)
-    avg_early = sum(m.get('early_bias_pct', 50.0) for m in metrics_list) / len(metrics_list)
+    avg_k1_hold = safe_div(sum(m.get('k1_avg_hold', 50.0) for m in metrics_list), m_len, 50.0)
+    avg_k2_hold = safe_div(sum(m.get('k2_avg_hold', 50.0) for m in metrics_list), m_len, 50.0)
+    avg_alt_ratio = safe_div(sum(m.get('alt_ratio', 50.0) for m in metrics_list), m_len, 50.0)
+    avg_ur = safe_div(sum(m.get('ur', 80.0) for m in metrics_list), m_len, 80.0)
+    avg_early = safe_div(sum(m.get('early_bias_pct', 50.0) for m in metrics_list), m_len, 50.0)
 
     # Quadrant heatmaps
-    quad_tl = sum(m.get('quadrants', {}).get('TL', 25.0) for m in metrics_list) / len(metrics_list)
-    quad_tr = sum(m.get('quadrants', {}).get('TR', 25.0) for m in metrics_list) / len(metrics_list)
-    quad_bl = sum(m.get('quadrants', {}).get('BL', 25.0) for m in metrics_list) / len(metrics_list)
-    quad_br = sum(m.get('quadrants', {}).get('BR', 25.0) for m in metrics_list) / len(metrics_list)
+    quad_tl = safe_div(sum(m.get('quadrants', {}).get('TL', 25.0) for m in metrics_list), m_len, 25.0)
+    quad_tr = safe_div(sum(m.get('quadrants', {}).get('TR', 25.0) for m in metrics_list), m_len, 25.0)
+    quad_bl = safe_div(sum(m.get('quadrants', {}).get('BL', 25.0) for m in metrics_list), m_len, 25.0)
+    quad_br = safe_div(sum(m.get('quadrants', {}).get('BR', 25.0) for m in metrics_list), m_len, 25.0)
 
     # Collect and rank all systemic choke reasons (top 5 most frequent across all plays)
     choke_counter = {}
@@ -1395,7 +1811,7 @@ def compute_aggregate_deep_telemetry(replays_list):
         'total_score': total_score,
         'avg_acc': round(avg_acc, 2),
         'total_misses': total_misses,
-        'avg_misses_per_play': round(total_misses / max(1, total_plays), 1),
+        'avg_misses_per_play': round(safe_div(total_misses, max(1, total_plays), 0.0), 1),
         'total_300s': total_300s,
         'total_100s': total_100s,
         'total_50s': total_50s,
@@ -2613,6 +3029,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         else:
             self.show_main_menu()
 
+    def safe_ui_dispatch(self, widget, callback, *args, **kwargs):
+        """Safely executes a UI callback on the main thread, ensuring the target widget is alive."""
+        return safe_ui_dispatch(widget if widget is not None else self, callback, *args, **kwargs)
+
     def record_ai_feedback(self, liked: bool, map_obj=None, text_snippet=""):
         """Records thumbs up/down user feedback for a map or coaching response, tuning the recommendation engine."""
         if not hasattr(self, "ai_user_feedback") or not isinstance(self.ai_user_feedback, dict):
@@ -2729,32 +3149,32 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.settings_file = os.path.join(appdata, 'osu_training_tracker_settings.json')
         else:
             self.settings_file = 'global_settings.json'
-        if os.path.exists(self.settings_file):
+        data = safe_json_load(self.settings_file, default={})
+        if data:
             try:
-                with open(self.settings_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if data.get('osu_username'): self.osu_username = data.get('osu_username')
-                    if data.get('api_key'): self.api_key = data.get('api_key')
-                    if data.get('gemini_key'): self.gemini_key = data.get('gemini_key')
-                    if data.get('uho_api_key'): self.uho_api_key = data.get('uho_api_key')
-                    if data.get('osu_irc_password'): self.osu_irc_password = data.get('osu_irc_password')
-                    if 'has_seen_tutorial' in data: self.has_seen_tutorial = data.get('has_seen_tutorial')
-                    if 'auto_background_sync' in data: self.auto_background_sync = data.get('auto_background_sync')
-                    if 'auto_import_on_start' in data: self.auto_import_on_start = data.get('auto_import_on_start')
-                    if data.get('selected_ai_model'): self.selected_ai_model = data.get('selected_ai_model')
-                    if data.get('last_profile_analysis'): self.last_profile_analysis = data.get('last_profile_analysis')
-                    if data.get('last_profile_player'): self.last_profile_player = data.get('last_profile_player')
-                    if 'has_analyzed_self' in data: self.has_analyzed_self = data.get('has_analyzed_self')
-                    if 'has_osu_supporter' in data: self.has_osu_supporter = data.get('has_osu_supporter')
-                    if data.get('user_setup_profile'): self.user_setup_profile = data.get('user_setup_profile')
-                    if data.get('last_deep_replay_telemetry'): self.last_deep_replay_telemetry = data.get('last_deep_replay_telemetry')
-                    if data.get('deep_replay_history'): self.deep_replay_history = data.get('deep_replay_history')
-                    if data.get('ai_debug_logs'): self.ai_debug_logs = data.get('ai_debug_logs')
-                    if data.get('ai_user_feedback'): self.ai_user_feedback = data.get('ai_user_feedback')
-                    if data.get('uho_friends_list'):
-                        raw_fl = data.get('uho_friends_list', [])
-                        self.uho_friends_list = [f for f in raw_fl if str(f).strip().lower() not in ['banchobot', 'gemini ai', 'gemini']]
-            except: pass
+                if data.get('osu_username'): self.osu_username = data.get('osu_username')
+                if data.get('api_key'): self.api_key = data.get('api_key')
+                if data.get('gemini_key'): self.gemini_key = data.get('gemini_key')
+                if data.get('uho_api_key'): self.uho_api_key = data.get('uho_api_key')
+                if data.get('osu_irc_password'): self.osu_irc_password = data.get('osu_irc_password')
+                if 'has_seen_tutorial' in data: self.has_seen_tutorial = data.get('has_seen_tutorial')
+                if 'auto_background_sync' in data: self.auto_background_sync = data.get('auto_background_sync')
+                if 'auto_import_on_start' in data: self.auto_import_on_start = data.get('auto_import_on_start')
+                if data.get('selected_ai_model'): self.selected_ai_model = data.get('selected_ai_model')
+                if data.get('last_profile_analysis'): self.last_profile_analysis = data.get('last_profile_analysis')
+                if data.get('last_profile_player'): self.last_profile_player = data.get('last_profile_player')
+                if 'has_analyzed_self' in data: self.has_analyzed_self = data.get('has_analyzed_self')
+                if 'has_osu_supporter' in data: self.has_osu_supporter = data.get('has_osu_supporter')
+                if data.get('user_setup_profile'): self.user_setup_profile = data.get('user_setup_profile')
+                if data.get('last_deep_replay_telemetry'): self.last_deep_replay_telemetry = data.get('last_deep_replay_telemetry')
+                if data.get('deep_replay_history'): self.deep_replay_history = data.get('deep_replay_history')
+                if data.get('ai_debug_logs'): self.ai_debug_logs = data.get('ai_debug_logs')
+                if data.get('ai_user_feedback'): self.ai_user_feedback = data.get('ai_user_feedback')
+                if data.get('uho_friends_list'):
+                    raw_fl = data.get('uho_friends_list', [])
+                    self.uho_friends_list = [f for f in raw_fl if str(f).strip().lower() not in ['banchobot', 'gemini ai', 'gemini']]
+            except Exception:
+                pass
 
     def save_global_settings(self):
         appdata = os.environ.get('APPDATA', '')
@@ -2784,9 +3204,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             'uho_friends_list': getattr(self, 'uho_friends_list', [])
         }
         try:
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
-        except: pass
+            safe_atomic_json_dump(data, self.settings_file, indent=4)
+        except Exception:
+            pass
 
     def draw_lazer_background(self, master_widget):
         """Subtle background decorator for modern dark lazer aesthetic."""
@@ -3542,7 +3962,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                         with open(target_file, "wb") as f_out:
                             f_out.write(zip_ref.read(chosen_exe))
                     try: os.remove(temp_download)
-                    except: pass
+                    except Exception: pass
 
                 # 4. Verify target executable size
                 if not os.path.exists(target_file) or os.path.getsize(target_file) < 100000:
@@ -3553,30 +3973,37 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
                 # 5. Seamless Hidden PowerShell Auto-Replacer (Zero manual interaction needed!)
                 current_pid = os.getpid()
+                env = os.environ.copy()
+                env["UHO_UPDATE_PID"] = str(current_pid)
+                env["UHO_UPDATE_SRC"] = os.path.abspath(target_file)
+                env["UHO_UPDATE_DST"] = os.path.abspath(current_exe)
+
                 ps_script = (
-                    f"$pid_wait = {current_pid}; "
-                    f"$src = '{target_file}'; "
-                    f"$dst = '{current_exe}'; "
-                    f"try {{ Wait-Process -Id $pid_wait -Timeout 10 -ErrorAction SilentlyContinue }} catch {{}}; "
-                    f"Start-Sleep -Milliseconds 600; "
-                    f"$retry = 0; "
-                    f"while ($retry -lt 15) {{ "
-                    f"    try {{ "
-                    f"        Copy-Item -Path $src -Destination $dst -Force -ErrorAction Stop; "
-                    f"        Remove-Item -Path $src -Force -ErrorAction SilentlyContinue; "
-                    f"        break; "
-                    f"    }} catch {{ "
-                    f"        Start-Sleep -Milliseconds 500; "
-                    f"        $retry++; "
-                    f"    }} "
-                    f"}}; "
-                    f"Start-Process -FilePath $dst"
+                    "$ErrorActionPreference = 'SilentlyContinue'; "
+                    "$pid_wait = [int]$env:UHO_UPDATE_PID; "
+                    "$src = $env:UHO_UPDATE_SRC; "
+                    "$dst = $env:UHO_UPDATE_DST; "
+                    "try { Wait-Process -Id $pid_wait -Timeout 10 -ErrorAction SilentlyContinue } catch {}; "
+                    "Start-Sleep -Milliseconds 600; "
+                    "$retry = 0; "
+                    "while ($retry -lt 15) { "
+                    "    try { "
+                    "        Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop; "
+                    "        Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue; "
+                    "        break; "
+                    "    } catch { "
+                    "        Start-Sleep -Milliseconds 500; "
+                    "        $retry++; "
+                    "    } "
+                    "}; "
+                    "Start-Process -FilePath $dst"
                 )
 
                 # Launch PowerShell completely detached and hidden
                 DETACHED_FLAGS = 0x00000008 | 0x00000200
                 subprocess.Popen(
-                    ["powershell.exe", "-WindowStyle", "Hidden", "-NoProfile", "-Command", ps_script],
+                    ["powershell.exe", "-WindowStyle", "Hidden", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                    env=env,
                     creationflags=DETACHED_FLAGS,
                     close_fds=True
                 )
@@ -3642,7 +4069,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         input_container.pack_propagate(False)
 
         # Text input row
-        msg_entry = ctk.CTkEntry(input_container, placeholder_text="Ask anything, @ to mention, / for actions",
+        msg_entry = ctk.CTkEntry(input_container, placeholder_text="Frage alles, @ zum Erwähnen, / für Aktionen",
                                  font=("Arial", 13), fg_color="transparent", border_width=0, text_color="#ffffff")
         msg_entry.pack(fill="x", padx=16, pady=(8, 2))
 
@@ -3715,7 +4142,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         elif role == "thinking":
             bubble = ctk.CTkFrame(container, fg_color="transparent")
             bubble.pack(side="left", fill="x", expand=True, padx=(5, 50))
-            thought_lbl = ctk.CTkLabel(bubble, text="Thought for 0s ❯", font=("Arial", 11), text_color="#777788")
+            thought_lbl = ctk.CTkLabel(bubble, text="Nachgedacht für 0s ❯", font=("Arial", 11), text_color="#777788")
             thought_lbl.pack(anchor="w", padx=2, pady=(0, 2))
             ctk.CTkLabel(bubble, text="Analysiere und formuliere Antwort... 🤔", font=("Arial", 13, "italic"), text_color="#aaaaaa").pack(anchor="w", padx=2)
             # Live timer
@@ -3730,7 +4157,109 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     if not c.winfo_exists():
                         return
                     elapsed = int(_time.time() - c._think_start)
-                    c._think_label.configure(text=f"Thought for {elapsed}s ❯")
+                    c._think_label.configure(text=f"Nachgedacht für {elapsed}s ❯")
+                    c.after(1000, lambda: _tick_thinking(c))
+                except:
+                    pass
+            container.after(1000, lambda: _tick_thinking(container))
+    def _extract_map_info_from_text(self, text):
+        """Extracts and verifies beatmap_id and set_id from map recommendation text or [MAP: ...] tags against the local 151k DB."""
+        if not text:
+            return None
+        
+        extracted_bid = ""
+        extracted_sid = ""
+
+        # 1. Look for explicit tag [MAP: 12345 | SET: 67890] or [MAP: 12345]
+        m_tag = re.search(r'\[MAP:\s*(\d+)(?:\s*\|\s*SET:\s*(\d+))?\]', text, re.IGNORECASE)
+        if m_tag:
+            extracted_bid = m_tag.group(1)
+            extracted_sid = m_tag.group(2) or ""
+
+        # 2. Look for URLs
+        if not extracted_bid:
+            m_url = re.search(r'osu\.ppy\.sh/b(?:eatmaps)?/(\d+)', text)
+            if m_url:
+                extracted_bid = m_url.group(1)
+            else:
+                m_set = re.search(r'osu\.ppy\.sh/beatmapsets/(\d+)(?:#osu/(\d+))?', text)
+                if m_set:
+                    extracted_sid = m_set.group(1)
+                    extracted_bid = m_set.group(2) or ""
+
+        # 3. Look for Beatmap ID: 123456
+        if not extracted_bid:
+            m_id = re.search(r'(?:Beatmap\s*ID|Map[- ]ID|ID):\s*(\d{4,9})', text, re.IGNORECASE)
+            if m_id:
+                extracted_bid = m_id.group(1)
+
+        # 4. Verify against local SQLite 151k database
+        with get_safe_sqlite_conn() as conn:
+            if conn:
+                try:
+                    if extracted_bid:
+                        row = conn.execute("SELECT id, set_id FROM maps WHERE id = ? LIMIT 1", (int(extracted_bid),)).fetchone()
+                        if row:
+                            return {"bid": str(row["id"]), "sid": str(row["set_id"] or extracted_sid)}
+                        # If not found by ID, check if it was actually a set_id
+                        row_s = conn.execute("SELECT id, set_id FROM maps WHERE set_id = ? ORDER BY sr DESC LIMIT 1", (int(extracted_bid),)).fetchone()
+                        if row_s:
+                            return {"bid": str(row_s["id"]), "sid": str(row_s["set_id"] or extracted_bid)}
+
+                    # If no valid ID was found or extracted_bid was invalid/hallucinated, search by song name / title in text
+                    lines = text.split("\n")
+                    for line in lines:
+                        clean_line = re.sub(r'[*#_`\[\]]', '', line).strip()
+                        # Extract title keywords
+                        words = [w for w in re.findall(r'[a-zA-Z0-9]{4,}', clean_line) 
+                                 if w.lower() not in ["hier", "deine", "eine", "dieser", "rating", "tipp", "coach", "skills", "stars", "sterne", "drain", "minuten", "pattern", "spikes", "fokus", "bpm"]]
+                        if len(words) >= 2:
+                            query_w = "%" + "%".join(words[:2]) + "%"
+                            row = conn.execute("SELECT id, set_id FROM maps WHERE name LIKE ? ORDER BY playcount DESC LIMIT 1", (query_w,)).fetchone()
+                            if row:
+                                return {"bid": str(row["id"]), "sid": str(row["set_id"] or "")}
+                except Exception:
+                    pass
+
+        if extracted_bid:
+            return {"bid": extracted_bid, "sid": extracted_sid}
+
+        return None
+
+    def add_modern_chat_bubble(self, role, text):
+        text = str(text or "")
+        if not hasattr(self, "chat_scrollable_frame") or not hasattr(self.chat_scrollable_frame, "winfo_exists") or not self.chat_scrollable_frame.winfo_exists():
+            return None
+        container = ctk.CTkFrame(self.chat_scrollable_frame, fg_color="transparent")
+        container.pack(fill="x", pady=6, padx=10)
+
+        if role == "user":
+            # Pill on the right or centered top
+            bubble = ctk.CTkFrame(container, fg_color="#1f1f26", corner_radius=14, border_width=1, border_color="#2c2c38")
+            bubble.pack(side="right", padx=(50, 5), pady=2)
+            lbl = ctk.CTkLabel(bubble, text=text, font=("Arial", 13), text_color="#ffffff", justify="left", wraplength=520)
+            lbl.pack(padx=14, pady=10)
+            return container
+
+        elif role == "thinking":
+            bubble = ctk.CTkFrame(container, fg_color="transparent")
+            bubble.pack(side="left", fill="x", expand=True, padx=(5, 50))
+            thought_lbl = ctk.CTkLabel(bubble, text="Nachgedacht für 0s ❯", font=("Arial", 11), text_color="#777788")
+            thought_lbl.pack(anchor="w", padx=2, pady=(0, 2))
+            ctk.CTkLabel(bubble, text="Analysiere und formuliere Antwort... 🤔", font=("Arial", 13, "italic"), text_color="#aaaaaa").pack(anchor="w", padx=2)
+            # Live timer
+            import time as _time
+            container._think_start = _time.time()
+            container._think_label = thought_lbl
+            container._think_active = True
+            def _tick_thinking(c=container):
+                if not getattr(c, '_think_active', False):
+                    return
+                try:
+                    if not c.winfo_exists():
+                        return
+                    elapsed = int(_time.time() - c._think_start)
+                    c._think_label.configure(text=f"Nachgedacht für {elapsed}s ❯")
                     c.after(1000, lambda: _tick_thinking(c))
                 except:
                     pass
@@ -3741,23 +4270,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             bubble = ctk.CTkFrame(container, fg_color="transparent")
             bubble.pack(side="left", fill="x", expand=True, padx=(5, 50))
 
+            map_info = self._extract_map_info_from_text(text)
+            clean_text = re.sub(r'\[MAP:\s*\d+(?:\s*\|\s*SET:\s*\d+)?\]', '', text).strip()
+
             # Message content box
-            lines = text.split("\n")
+            lines = clean_text.split("\n")
             total_wrapped = sum(max(1, (len(l) // 52) + 1) for l in lines)
             calc_h = max(50, total_wrapped * 23 + 25)
 
             msg_box = ctk.CTkTextbox(bubble, wrap="word", font=("Arial", 13), text_color="#eeeeee",
                                      fg_color="#181820", border_width=1, border_color="#262633",
                                      corner_radius=10, height=calc_h, activate_scrollbars=False)
-            msg_box.insert("1.0", text)
+            msg_box.insert("1.0", clean_text)
             msg_box.configure(state="disabled")
             msg_box.pack(fill="x", pady=(0, 6))
 
-            # Action Icons Row (Copy, Thumbs Up, Thumbs Down)
+            # Action Icons Row (Copy, Thumbs Up, Thumbs Down, + Web & osu!direct buttons)
             act_row = ctk.CTkFrame(bubble, fg_color="transparent")
             act_row.pack(anchor="w", padx=2)
 
-            self._attach_feedback_buttons(act_row, text)
+            self._attach_feedback_buttons(act_row, clean_text, map_info=map_info)
 
             self._bind_mousewheel_to_chat(container)
             try:
@@ -3765,7 +4297,38 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             except: pass
             return container
 
-    def _attach_feedback_buttons(self, act_row, bubble_text):
+    def _attach_feedback_buttons(self, act_row, bubble_text, map_info=None):
+        import webbrowser
+        
+        # If a map was recommended in this message, add 🌐 Web and ⚡ osu!direct action buttons
+        if map_info and (map_info.get("bid") or map_info.get("sid")):
+            bid = map_info.get("bid", "")
+            sid = map_info.get("sid", "")
+            
+            def open_web():
+                target_url = f"https://osu.ppy.sh/b/{bid}" if bid else f"https://osu.ppy.sh/beatmapsets/{sid}"
+                try: webbrowser.open(target_url)
+                except: pass
+                
+            def open_direct():
+                target_proto = f"osu://b/{bid}" if bid else f"osu://dl/{sid}"
+                try: webbrowser.open(target_proto)
+                except: pass
+                
+            web_btn = ctk.CTkButton(
+                act_row, text="🌐 Web", width=68, height=26, font=("Arial", 11, "bold"),
+                fg_color="#222232", hover_color="#333348", text_color="#80d8ff",
+                corner_radius=6, command=open_web
+            )
+            web_btn.pack(side="left", padx=(0, 6))
+            
+            direct_btn = ctk.CTkButton(
+                act_row, text="⚡ osu!direct", width=96, height=26, font=("Arial", 11, "bold"),
+                fg_color="#ff66aa", hover_color="#ff3388", text_color="#ffffff",
+                corner_radius=6, command=open_direct
+            )
+            direct_btn.pack(side="left", padx=(0, 10))
+
         def copy_txt():
             try:
                 self.clipboard_clear()
@@ -3807,23 +4370,26 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         bubble = ctk.CTkFrame(thinking_container, fg_color="transparent")
         bubble.pack(side="left", fill="x", expand=True, padx=(5, 50))
 
-        ctk.CTkLabel(bubble, text=f"Thought for {max(1, elapsed)}s ❯", font=("Arial", 11), text_color="#777788").pack(anchor="w", padx=2, pady=(0, 4))
+        ctk.CTkLabel(bubble, text=f"Nachgedacht für {max(1, elapsed)}s ❯", font=("Arial", 11), text_color="#777788").pack(anchor="w", padx=2, pady=(0, 4))
 
-        lines = new_text.split("\n")
+        map_info = self._extract_map_info_from_text(new_text)
+        clean_text = re.sub(r'\[MAP:\s*\d+(?:\s*\|\s*SET:\s*\d+)?\]', '', new_text).strip()
+
+        lines = clean_text.split("\n")
         total_wrapped = sum(max(1, (len(l) // 52) + 1) for l in lines)
         calc_h = max(50, total_wrapped * 23 + 25)
 
         msg_box = ctk.CTkTextbox(bubble, wrap="word", font=("Arial", 13), text_color="#eeeeee",
                                  fg_color="#181820", border_width=1, border_color="#262633",
                                  corner_radius=10, height=calc_h, activate_scrollbars=False)
-        msg_box.insert("1.0", new_text)
+        msg_box.insert("1.0", clean_text)
         msg_box.configure(state="disabled")
         msg_box.pack(fill="x", pady=(0, 6))
 
         act_row = ctk.CTkFrame(bubble, fg_color="transparent")
         act_row.pack(anchor="w", padx=2)
 
-        self._attach_feedback_buttons(act_row, new_text)
+        self._attach_feedback_buttons(act_row, clean_text, map_info=map_info)
 
         self._bind_mousewheel_to_chat(thinking_container)
         try:
@@ -4103,11 +4669,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             else:
                 self.handle_ai_question_response(chosen_idx, chosen_txt)
 
-        ctk.CTkButton(bot_bar, text="Submit ↵", font=("Arial", 13, "bold"), height=36, width=130,
+        ctk.CTkButton(bot_bar, text="Absenden ↵", font=("Arial", 13, "bold"), height=36, width=130,
                       fg_color="#0078D4", hover_color="#0063B1", text_color="#ffffff", corner_radius=8,
                       command=do_submit).pack(side="right")
 
-        ctk.CTkButton(bot_bar, text="Skip", font=("Arial", 12), height=36, width=80,
+        ctk.CTkButton(bot_bar, text="Überspringen", font=("Arial", 12), height=36, width=100,
                       fg_color="transparent", hover_color="#22222c", text_color="#888899",
                       command=do_skip).pack(side="right", padx=(0, 10))
 
@@ -4365,6 +4931,20 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def query_gemini(self, user_message):
         player_context = self.gather_player_context()
 
+        # Check if user message is asking for a map recommendation and inject real database maps
+        u_low = user_message.lower()
+        if ("map" in u_low or "maps" in u_low) and any(w in u_low for w in ["empfiehl", "gib mir", "suche", "letzte", "ähnlich", "spiel", "trainier", "brauche", "vorschlag", "welche", "nächste"]):
+            skill = "Streams" if "stream" in u_low else "Speed" if "speed" in u_low else "Tech" if "tech" in u_low else "Stamina" if "stamina" in u_low else "Reading" if "reading" in u_low else "Aim"
+            target_sr = 5.5
+            cand_maps = sqlite_query_maps(skill=skill, sr_min=max(1.0, target_sr - 1.2), sr_max=target_sr + 1.2, limit=4, order_by="playcount DESC")
+            if cand_maps:
+                map_options = []
+                for cm in cand_maps:
+                    map_options.append(f"- [MAP: {cm.get('id')} | SET: {cm.get('set_id')}] • {cm.get('name')} (★ {cm.get('sr'):.2f} • {cm.get('bpm')} BPM • {cm.get('primary_skill')})")
+                
+                player_context += "\n\nVERIFIZIERTE ECHTE MAPS AUS DER LOKALEN RANKED-DATENBANK FÜR DIESE ANFRAGE:\n" + "\n".join(map_options)
+                player_context += "\n(WICHTIG: Wenn du dem Spieler eine Map empfiehlst, wähle EINE dieser verifizierten Maps und nutze exakt ihren [MAP: ... | SET: ...] Tag! Erfinde keine eigenen Beatmap-IDs!)"
+
         system_prompt = f"""Du bist der ultimative UHO Hub Pro-Level KI-Coach, Turnier-Stratege und Gameplay-Analyst für osu!.
 
 SPRACH-VORGABE (ABSOLUT STRIKTE REGEL):
@@ -4377,7 +4957,7 @@ KONTEXT DES AKTUELLEN SPIELERS:
 {player_context}
 
 DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
-- SIMPEL, DIREKT & PRÄGNANT: Mache deine Antworten so einfach und übersichtlich wie möglich!
+- SIMPEL, DIREKT & PRÄGNANT: Mache deine Antworten so einfach und übersichtlich wie möglich! Halte Beschreibungen kurz (3-4 Sätze)!
 - WICHTIG ZU 'ZULETZT GESPIELT':
   * Wenn der Spieler fragt, was er zuletzt gespielt hat (z. B. 'was habe ich zuletzt gespielt?'):
     -> Nenne ihm NUR die ALLERLETZTE Map (nicht alle 6 Runden als lange Liste aufzählen!).
@@ -4386,6 +4966,14 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
        ⭐ **Ergebnis:** Rang [X] • [Acc]% Acc (Combo: [X] • [X] Misses)
        💡 **Coach-Tipp:** 1-2 kurze, motivierende Sätze zur Runde.
   * Zähle NIEMALS ungefragt alle vorherigen Runden als lange Liste auf!
+- WICHTIG BEI MAP-EMPFEHLUNGEN & MAP-ANFRAGEN:
+  * Wenn der Spieler nach einer Map-Empfehlung fragt (z. B. 'gib mir eine Map wie die letzte', 'empfiehl mir eine Speed Map', 'welche Map soll ich üben?'):
+    -> Wähle eine konkrete, passende Map aus den oben bereitgestellten VERIFIZIERTEN ECHTEN MAPS aus der lokalen Datenbank.
+    -> Füge am Ende deiner Nachricht immer den Tag: [MAP: <beatmap_id> | SET: <beatmapset_id>] ein.
+       (Beispiel: [MAP: 1059388 | SET: 490509])
+    -> Dadurch blendet die App automatisch die 🌐 Web- und ⚡ osu!direct-Buttons ein!
+    -> Erfinde NIEMALS fiktive IDs!
+  * Bei allgemeinen Fragen OHNE Map-Empfehlung (z. B. 'Wie halte ich den Stift?') fügst du KEINEN Map-Tag ein!
 - Alle Analysen gelten AUSSCHLIESSLICH für osu! Standard (Mode 0)!
 - Du antwortest ZU 100% AUF DEUTSCH!"""
 
@@ -4471,6 +5059,27 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
 
     def offline_analyze(self, query):
         q = query.lower()
+
+        # Check for map recommendation queries offline
+        if ("map" in q or "maps" in q) and any(w in q for w in ["empfiehl", "gib mir", "suche", "letzte", "ähnlich", "spiel", "trainier", "brauche"]):
+            skill = "Streams" if "stream" in q else "Speed" if "speed" in q else "Tech" if "tech" in q else "Stamina" if "stamina" in q else "Reading" if "reading" in q else "Aim"
+            
+            # Look up recent maps or SQLite DB
+            target_sr = 5.5
+            if hasattr(self, "_cached_recent_plays_context") and self._cached_recent_plays_context:
+                pass
+            
+            cand = pick_dynamic_map_for_skill(skill, target_sr=target_sr)
+            if cand and str(cand.get("id")) != "0":
+                m_name = cand.get("name", "Unbekannte Map")
+                m_sr = float(cand.get("sr", target_sr))
+                m_bpm = float(cand.get("bpm", 180))
+                m_desc = cand.get("description", "Ausgewogene Trainings-Map.")
+                m_id = cand.get("id")
+                m_set = cand.get("set_id", "")
+                
+                return f"🎵 **Hier ist deine persönliche Trainings-Map:**\n\n**{m_name}**\n⭐ **Rating:** {m_sr:.2f}★ • **BPM:** {int(m_bpm)} • **Skill:** {skill}\n💡 **Coach-Tipp:** {m_desc}\n\n[MAP: {m_id} | SET: {m_set}]"
+
         if "khz" in q:
             return "⚡ **Die KHZ-Methode (Progressive Overload für Streams):**\n1. Finde dein persönliches Limit-BPM, auf dem du lange Streams mit **98%+ Accuracy** spielen kannst (z. B. 180 BPM).\n2. Spiele täglich 20-30 Minuten dedizierte Stream-Maps in diesem Bereich.\n3. Steigere das Tempo erst um **+5 BPM**, wenn du 3 Tage in Folge 98%+ ohne Fingerlocking hältst.\n4. **Goldene Regel:** Halte Handgelenk und Unterarm völlig locker – wer verkrampft, stoppt den Muskelaufbau!"
         if "stamina" in q or "ausdauer" in q:
@@ -4495,18 +5104,14 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
     def load_session_recaps_history(self):
         try:
             path = getattr(self, "session_recaps_file", "session_recaps_history.json")
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+            return safe_json_load(path, default=[])
         except Exception:
-            pass
-        return []
+            return []
 
     def save_session_recaps_history(self):
         try:
             path = getattr(self, "session_recaps_file", "session_recaps_history.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(getattr(self, "session_recaps_history", []), f, indent=2, ensure_ascii=False)
+            safe_atomic_json_dump(getattr(self, "session_recaps_history", []), path, indent=2)
         except Exception:
             pass
 
@@ -4602,7 +5207,7 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
                                     self._session_recap_modal_shown = True
                                     recap = self.finalize_active_session()
                                     if recap:
-                                        self.after(0, lambda r=recap: self.show_session_recap_modal(r))
+                                        self.safe_ui_dispatch(self, self.show_session_recap_modal, recap)
                                     self.active_session = None
                                     self._osu_closed_timer_start = None
                 except Exception:
@@ -4626,6 +5231,8 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
                 plays = r.json()
                 if isinstance(plays, list):
                     for p in plays:
+                        if not isinstance(p, dict):
+                            continue
                         p_id = str(p.get("date", "")) + "_" + str(p.get("score", ""))
                         if p_id not in self._processed_session_play_ids:
                             self._processed_session_play_ids.add(p_id)
@@ -5238,17 +5845,13 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
     
     def load_map_peaks_history(self):
         try:
-            if os.path.exists("map_peaks_history.json"):
-                with open("map_peaks_history.json", "r", encoding="utf-8") as f:
-                    return json.load(f)
+            return safe_json_load("map_peaks_history.json", default={})
         except Exception:
-            pass
-        return {}
+            return {}
 
     def save_map_peaks_history(self):
         try:
-            with open("map_peaks_history.json", "w", encoding="utf-8") as f:
-                json.dump(getattr(self, "map_peaks_history", {}), f, indent=2, ensure_ascii=False)
+            safe_atomic_json_dump(getattr(self, "map_peaks_history", {}), "map_peaks_history.json", indent=2)
         except Exception:
             pass
 
@@ -7954,8 +8557,12 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         self.refresh_tourney_lobby_state()
 
     def tourney_bot_do_protect(self):
+        if not hasattr(self, "tourney_match") or not self.tourney_match or self.tourney_match.get("phase") != "protect":
+            return
+        if not hasattr(self, "winfo_exists") or not self.winfo_exists():
+            return
         m = self.tourney_match
-        avail = [s for s, d in m["pool"].items() if d["state"] == "available" and s != "TB"]
+        avail = [s for s, d in m["pool"].items() if d.get("state") == "available" and s != "TB"]
         if not avail: return
 
         preferred = [s for s in avail if any(k in s for k in ["DT", "HD", "NM", "FM", "HR"])]
@@ -7988,8 +8595,12 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         self.refresh_tourney_lobby_state()
 
     def tourney_bot_do_ban(self):
+        if not hasattr(self, "tourney_match") or not self.tourney_match or self.tourney_match.get("phase") != "ban":
+            return
+        if not hasattr(self, "winfo_exists") or not self.winfo_exists():
+            return
         m = self.tourney_match
-        avail = [s for s, d in m["pool"].items() if d["state"] == "available" and s != "TB"]
+        avail = [s for s, d in m["pool"].items() if d.get("state") == "available" and s != "TB"]
         if not avail:
             m["bans_done"] += 1
         else:
@@ -8012,8 +8623,12 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         self.tourney_pick_slot(slot, picked_by="player")
 
     def tourney_bot_do_pick(self):
+        if not hasattr(self, "tourney_match") or not self.tourney_match or self.tourney_match.get("phase") != "pick":
+            return
+        if not hasattr(self, "winfo_exists") or not self.winfo_exists():
+            return
         m = self.tourney_match
-        avail = [s for s, d in m["pool"].items() if d["state"] == "available" and s != "TB"]
+        avail = [s for s, d in m["pool"].items() if d.get("state") == "available" and s != "TB"]
         if not avail:
             self.tourney_pick_slot("TB", picked_by="bot")
             return
@@ -8035,115 +8650,85 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         self._tourney_sync_loop_running = True
 
         def _loop():
+            if not hasattr(self, "winfo_exists") or not self.winfo_exists():
+                self._tourney_sync_loop_running = False
+                return
             if not hasattr(self, 'tourney_phase_lbl') or not self.tourney_phase_lbl.winfo_exists():
                 self._tourney_sync_loop_running = False
                 return
 
             if getattr(self, "tourney_match", {}).get("phase") == "playing":
-                self.fetch_tourney_recent_plays(silent=True)
+                try:
+                    self.fetch_tourney_recent_plays(silent=True)
+                except Exception:
+                    pass
 
-            self.after(3500, _loop)
+            if hasattr(self, "winfo_exists") and self.winfo_exists():
+                self.after(3500, _loop)
+            else:
+                self._tourney_sync_loop_running = False
 
         self.after(1000, _loop)
 
     def fetch_tourney_recent_plays(self, silent=True):
+        m = getattr(self, "tourney_match", None)
+        if not m or m.get("phase") != "playing":
+            return
+
+        cur_slot = m["current_pick"]
+        cur_map = m["pool"].get(cur_slot, {})
+        bid = str(cur_map.get("id", ""))
         user = getattr(self, "osu_username", "")
         key = getattr(self, "api_key", "")
-        if not user or not key: return
 
-        cur_slot = getattr(self, "tourney_match", {}).get("current_pick")
-        if not cur_slot: return
+        if not user or not key:
+            if not silent:
+                self.bell()
+            return
 
-        target_map = self.tourney_match["pool"].get(cur_slot, {})
-        target_bid = str(target_map.get("id", ""))
-
-        def run():
-            try:
-                url = f"https://osu.ppy.sh/api/get_user_recent?k={key}&u={user}&m=0&limit=8"
-                r = requests.get(url, timeout=7)
-                if r.status_code != 200: return
-                plays = r.json()
-                if not isinstance(plays, list) or not plays: return
-
-                # Find play matching the exact current pick beatmap_id
-                matching_play = None
-                for p in plays:
-                    b_id = str(p.get("beatmap_id", ""))
-                    if b_id == target_bid:
-                        matching_play = p
-                        break
-
-                if not matching_play:
-                    return
-
-                play_id = str(matching_play.get("date", "")) + "_" + str(matching_play.get("score", ""))
-                if getattr(self, "_last_tourney_processed_play_id", None) == play_id:
-                    return
-                self._last_tourney_processed_play_id = play_id
-
-                self.process_tourney_round_result(matching_play)
-            except: pass
-
-        threading.Thread(target=run, daemon=True).start()
-
-    def handle_tourney_replay_drop(self, event):
-        files = self.tk.splitlist(event.data)
-        if not files: return
-        file_path = files[0]
-        if not file_path.endswith(".osr"): return
         try:
-            parsed = parse_osr(file_path)
-            if parsed.get("mode", 0) != 0: return
+            url = f"https://osu.ppy.sh/api/get_user_recent?k={key}&u={user}&m=0&limit=10"
+            r = requests.get(url, timeout=5)
+            if r.status_code != 200:
+                return
 
-            h300 = parsed["300s"]
-            h100 = parsed["100s"]
-            h50 = parsed["50s"]
-            miss = parsed["misses"]
-            combo = parsed.get("max_combo", 0)
-            tot = h300 + h100 + h50 + miss
-            acc = ((h300 * 300 + h100 * 100 + h50 * 50) / (tot * 300) * 100) if tot > 0 else 0
-            score = parsed.get("score", int(acc * 10000 + combo * 650 - miss * 25000))
+            plays = r.json()
+            if not isinstance(plays, list) or not plays:
+                return
 
-            mock_play = {
-                "count300": str(h300),
-                "count100": str(h100),
-                "count50": str(h50),
-                "countmiss": str(miss),
-                "maxcombo": str(combo),
-                "score": str(score),
-                "date": "ReplayDrop"
-            }
-            self.process_tourney_round_result(mock_play)
-        except: pass
+            found_play = None
+            for p in plays:
+                if str(p.get("beatmap_id")) == bid:
+                    found_play = p
+                    break
 
-    def process_tourney_round_result(self, last_p):
-        try: self.record_play_in_active_session(last_p)
-        except: pass
+            if found_play:
+                self.process_tourney_match_round(found_play)
+        except Exception:
+            pass
+
+    def process_tourney_match_round(self, play_data):
         m = self.tourney_match
-        cur_slot = m.get("current_pick")
-        if not cur_slot: return
+        if not m or m.get("phase") != "playing":
+            return
 
-        map_data = m["pool"].get(cur_slot, {})
-        h300 = int(last_p.get("count300", 0))
-        h100 = int(last_p.get("count100", 0))
-        h50 = int(last_p.get("count50", 0))
-        miss = int(last_p.get("countmiss", 0))
-        p_combo = int(last_p.get("maxcombo", 0))
+        cur_slot = m["current_pick"]
+        cur_map = m["pool"].get(cur_slot, {})
+        bot_cfg = m["bot_cfg"]
+
+        h300 = int(play_data.get("count300", 0) or 0)
+        h100 = int(play_data.get("count100", 0) or 0)
+        h50 = int(play_data.get("count50", 0) or 0)
+        miss = int(play_data.get("countmiss", 0) or 0)
         tot = h300 + h100 + h50 + miss
-        p_acc = ((h300 * 300 + h100 * 100 + h50 * 50) / (tot * 300) * 100) if tot > 0 else 0
-        p_score = int(last_p.get("score", 0))
-        if p_score < 1000:
-            # Estimate realistic standard Score V1 if API score is raw
-            p_score = int(p_acc * 10000 + p_combo * 650 - miss * 25000)
+        p_acc = (safe_div(h300 * 300 + h100 * 100 + h50 * 50, tot * 300, 0.0) * 100.0) if tot > 0 else 0.0
+        p_score = int(play_data.get("score", 0) or 0)
 
-        # Simulate Bot Score
-        b_cfg = m["bot_cfg"]
-        b_acc = random.uniform(b_cfg["acc_range"][0], b_cfg["acc_range"][1])
-        b_miss = random.randint(b_cfg["miss_range"][0], b_cfg["miss_range"][1])
-        b_combo = int(tot * random.uniform(b_cfg["combo_ratio"] - 0.08, b_cfg["combo_ratio"] + 0.05)) if tot > 0 else 400
-        b_score = int(b_acc * 10000 + b_combo * 650 - b_miss * 25000)
+        # Simulate bot round
+        b_acc = max(75.0, min(100.0, random.gauss(bot_cfg.get("target_acc", 97.0), 1.2)))
+        b_miss = max(0, int(random.gauss(bot_cfg.get("miss_rate", 1.0), 1.0)))
+        b_score = int(p_score * (safe_div(b_acc, max(1.0, p_acc), 1.0)) * random.uniform(0.92, 1.08))
 
-        # Determine Round Winner
         if p_score >= b_score:
             r_winner = "player"
             m["player_score"] += 1
@@ -8171,7 +8756,7 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             if hasattr(self, 'tourney_phase_lbl') and self.tourney_phase_lbl.winfo_exists():
                 self.show_tournament_match_lobby()
 
-        self.after(0, update_ui)
+        self.safe_ui_dispatch(self, update_ui)
 
     def _update_tourney_feed_display(self):
         if hasattr(self, 'tourney_feed_box') and self.tourney_feed_box.winfo_exists():
@@ -8221,9 +8806,14 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}:generateContent?key={self.gemini_key}"
                     payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}}
-                    resp = requests.post(url, json=payload, timeout=20).json()
-                    report_txt = resp["candidates"][0]["content"]["parts"][0]["text"].strip()
-                except Exception as e:
+                    r = requests.post(url, json=payload, timeout=20)
+                    resp = r.json()
+                    candidates = resp.get("candidates", [])
+                    if candidates:
+                        report_txt = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                    if not report_txt:
+                        report_txt = f"KI-Bericht: Starkes Match! Endstand {m['player_score']} : {m['bot_score']}."
+                except Exception:
                     report_txt = f"KI-Bericht: Starkes Match! Endstand {m['player_score']} : {m['bot_score']}. Trainiere gezielt deine schwächeren Slots im KI-Training!"
             else:
                 report_txt = f"Endstand: {m['player_score']} : {m['bot_score']}.\n\nGute Performance in {m['badge']} {m['division']}! Nutze das KI-Live-Training, um gezielt an deinen Pick-Schwächen zu arbeiten."
@@ -10157,7 +10747,7 @@ Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
             replay_labels = []
             for i, r in enumerate(history[:20]):
                 m_str = r.get("mods_str", "NM")
-                replay_labels.append(f"Play #{i+1}: {r.get('accuracy', 0):.1f}% ACC • {r.get('score', 0):,} Score • {r.get('misses', 0)} Miss ({m_str})")
+                replay_labels.append(f"Spiel #{i+1}: {r.get('accuracy', 0):.1f}% ACC • {r.get('score', 0):,} Score • {r.get('misses', 0)} Miss ({m_str})")
 
             def on_sel_change(val):
                 idx = replay_labels.index(val) if val in replay_labels else 0
@@ -10500,12 +11090,14 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                     }
                     resp = requests.post(url, json=payload, timeout=12)
                     res_j = resp.json()
-                    raw = res_j["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    clean = raw.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(clean)
+                    candidates = res_j.get("candidates", [])
+                    raw = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip() if candidates else ""
+                    parsed = safe_parse_ai_json(raw, default={})
                     new_scores = parsed.get("scores", current_scores)
-                    main_s = parsed.get("main_skill", max(new_scores, key=new_scores.get))
-                    weak_s = parsed.get("weakness", min(new_scores, key=new_scores.get))
+                    if not isinstance(new_scores, dict):
+                        new_scores = current_scores
+                    main_s = parsed.get("main_skill", max(new_scores, key=new_scores.get) if new_scores else "Aim")
+                    weak_s = parsed.get("weakness", min(new_scores, key=new_scores.get) if new_scores else "Tech")
                     summary_txt = parsed.get("summary", f"+1 {target_cat} ({acc:.1f}% Acc)")
                 else:
                     delta = 1 if (acc >= 95.0 and miss <= 1) else (-1 if miss >= 4 else 0)
@@ -10532,8 +11124,8 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                             self.dashboard_history_box.insert("1.0", "\n".join(self.last_profile_analysis.get("radar_history", [])))
                             self.dashboard_history_box.configure(state="disabled")
 
-                self.after(0, update_radar_ui)
-            except Exception as e:
+                self.safe_ui_dispatch(self, update_radar_ui)
+            except Exception:
                 pass
 
         threading.Thread(target=run_ai, daemon=True).start()
@@ -10623,7 +11215,7 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
         height = canvas.winfo_height() or 340
         cx = width / 2
         cy = height / 2
-        max_r = min(cx, cy) - 45
+        max_r = max(40, min(cx, cy) - 45)
 
         categories = ["Consistency", "Speed", "Aim", "Stamina", "Tech", "Reading", "Streams", "Precision"]
         n = len(categories)
@@ -10696,8 +11288,28 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                 except Exception as e:
                     pass
 
+            u_pp = float(u_info.get("pp_raw", 0)) if ('u_info' in locals() and u_info) else 0.0
+            u_rank = int(u_info.get("pp_rank", 0)) if ('u_info' in locals() and u_info) else 0
+            u_acc = float(u_info.get("accuracy", 0.0)) if ('u_info' in locals() and u_info) else 0.0
+            u_pc = int(u_info.get("playcount", 0)) if ('u_info' in locals() and u_info) else 0
+            default_rank_sr = estimate_sr_from_rank_and_pp(u_rank, u_pp)
+
             enriched_top_plays = []
-            id_to_meta = {m['id']: m for m in (DYNAMIC_RANKED_MAPS_DB or [])}
+            id_to_meta = {}
+            if top_plays and isinstance(top_plays, list):
+                bids = [str(p.get("beatmap_id", "")) for p in top_plays if p.get("beatmap_id")]
+                with get_safe_sqlite_conn() as conn:
+                    if conn and bids:
+                        placeholders = ",".join(["?"] * len(bids[:100]))
+                        try:
+                            rows = conn.execute(f"SELECT id, name, sr, cs, ar, od FROM maps WHERE id IN ({placeholders})", bids[:100]).fetchall()
+                            for r in rows:
+                                id_to_meta[str(r["id"])] = dict(r)
+                        except Exception:
+                            pass
+            if not id_to_meta:
+                id_to_meta = {str(m.get('id', '')): m for m in (DYNAMIC_RANKED_MAPS_DB or [])}
+
             for i, p in enumerate(top_plays[:35]):
                 bid = str(p.get("beatmap_id", ""))
                 mods_int = int(p.get("enabled_mods", 0) or 0)
@@ -10720,7 +11332,7 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
 
                 map_info = id_to_meta.get(bid, {})
                 map_name = map_info.get("name", f"Beatmap ID #{bid}")
-                base_sr = map_info.get("sr", round((pp_val ** 0.36) * 0.78, 2) if pp_val > 0 else 5.0)
+                base_sr = float(map_info.get("sr", round((pp_val ** 0.35) * 0.77, 2) if pp_val > 0 else default_rank_sr))
                 if "DT" in mods_label or "NC" in mods_label:
                     sr_played = round(base_sr * 1.40, 2)
                 elif "HR" in mods_label:
@@ -10740,21 +11352,16 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                     "pp": pp_val
                 })
 
-            u_pp = float(u_info.get("pp_raw", 0)) if ('u_info' in locals() and u_info) else 0.0
-            u_rank = int(u_info.get("pp_rank", 0)) if ('u_info' in locals() and u_info) else 0
-            u_acc = float(u_info.get("accuracy", 0.0)) if ('u_info' in locals() and u_info) else 0.0
-            u_pc = int(u_info.get("playcount", 0)) if ('u_info' in locals() and u_info) else 0
-
             # Calculate accurate average Star Rating from top plays
-            sr_pool = [float(p.get("sr", 5.0)) for p in enriched_top_plays if p.get("sr")]
+            sr_pool = [float(p.get("sr", default_rank_sr)) for p in enriched_top_plays if p.get("sr")]
             if sr_pool:
                 # Weighted top 15 plays average
                 top_avg_sr = round(sum(sr_pool[:15]) / len(sr_pool[:15]), 2)
             else:
-                top_avg_sr = round(((u_pp ** 0.36) * 0.78) if u_pp > 0 else 5.2, 2)
+                top_avg_sr = default_rank_sr
             
-            # Benchmark test difficulty is set to ~0.55* below Top Plays (comfort baseline / skill floor)
-            target_test_sr = round(max(3.0, min(8.8, top_avg_sr - 0.55)), 1)
+            # Benchmark test difficulty matches true player skill level (no artificial downgrading)
+            target_test_sr = round(max(3.5, min(9.5, top_avg_sr)), 1)
 
             self.after(0, lambda: self.profile_status_lbl.configure(text="🤖 KI analysiert alle 8 Skillsets...", text_color="#E91E63"))
 
@@ -10811,12 +11418,17 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                     }
                     resp = requests.post(url, json=payload, timeout=20)
                     res_json = resp.json()
-                    raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                    clean_json = raw_text.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(clean_json)
+                    candidates = res_json.get("candidates", [])
+                    raw_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "") if candidates else ""
+                    parsed = safe_parse_ai_json(raw_text, default={})
                     user_scores = parsed.get("scores", user_scores)
+                    if not isinstance(user_scores, dict):
+                        user_scores = {
+                            "Consistency": 65, "Speed": 70, "Aim": 75, "Stamina": 60,
+                            "Tech": 55, "Reading": 60, "Streams": 65, "Precision": 70
+                        }
                     feedback_text = parsed.get("feedback", "")
-                except Exception as e:
+                except Exception:
                     feedback_text = f"Analyse basierend auf Spieler-Statistiken ({username}).\n\nStärken in Aim & Speed. Schwächen in Tech & Stamina.\nEmpfehlung: Trainiere 2020+ Tech-Maps und 3+ Minuten Marathons!"
             else:
                 # Dynamic mathematical scoring based on actual top plays distribution
@@ -10909,15 +11521,19 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
             )
 
             def update_ui():
-                self.draw_profile_radar(user_scores)
-                self.profile_ai_box.configure(state="normal")
-                self.profile_ai_box.delete("1.0", "end")
-                self.profile_ai_box.insert("1.0", feedback_text)
-                self.profile_ai_box.configure(state="disabled")
-                self.profile_status_lbl.configure(text="✅ Schritt 1 abgeschlossen! Weiter zu Schritt 2.", text_color="#4CAF50")
-                self.profile_analyze_btn.configure(text="➔ Schritt 2: Skill-Test starten", fg_color="#E91E63", hover_color="#C2185B", state="normal", command=self.show_skill_tester_menu)
+                if hasattr(self, "profile_user_entry") and self.profile_user_entry.winfo_exists():
+                    self.draw_profile_radar(user_scores)
+                    if hasattr(self, "profile_ai_box") and self.profile_ai_box.winfo_exists():
+                        self.profile_ai_box.configure(state="normal")
+                        self.profile_ai_box.delete("1.0", "end")
+                        self.profile_ai_box.insert("1.0", feedback_text)
+                        self.profile_ai_box.configure(state="disabled")
+                    if hasattr(self, "profile_status_lbl") and self.profile_status_lbl.winfo_exists():
+                        self.profile_status_lbl.configure(text="✅ Schritt 1 abgeschlossen! Weiter zu Schritt 2.", text_color="#4CAF50")
+                    if hasattr(self, "profile_analyze_btn") and self.profile_analyze_btn.winfo_exists():
+                        self.profile_analyze_btn.configure(text="➔ Schritt 2: Skill-Test starten", fg_color="#E91E63", hover_color="#C2185B", state="normal", command=self.show_skill_tester_menu)
 
-            self.after(0, update_ui)
+            self.safe_ui_dispatch(self, update_ui)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -11072,18 +11688,23 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
 
         pa = getattr(self, "last_profile_analysis", {}) or {}
         p_stats = pa.get("player_stats", {})
+        u_rank = p_stats.get("pp_rank", 0) or getattr(self, "player_rank", 0)
+        u_pp = p_stats.get("pp", 0) or getattr(self, "player_pp", 0)
+        
         if "target_test_sr" in p_stats:
             base_sr = float(p_stats["target_test_sr"])
         elif "top_avg_sr" in p_stats:
-            base_sr = round(max(3.0, float(p_stats["top_avg_sr"]) - 0.55), 1)
+            base_sr = float(p_stats["top_avg_sr"])
         elif "adaptive_difficulty" in p_stats:
-            base_sr = round(max(3.0, float(p_stats["adaptive_difficulty"].get("effective_sr", 5.2)) - 0.55), 1)
+            base_sr = float(p_stats["adaptive_difficulty"].get("effective_sr", 5.2))
+        elif u_rank or u_pp:
+            base_sr = estimate_sr_from_rank_and_pp(u_rank, u_pp)
         else:
             avg_score = 65
             if "scores" in pa:
                 s_vals = list(pa["scores"].values())
                 avg_score = sum(s_vals) / len(s_vals) if s_vals else 65
-            base_sr = round(max(3.5, min(8.8, 5.0 + (avg_score - 50) * 0.035 - 0.55)), 1)
+            base_sr = round(max(3.5, min(9.5, 5.0 + (avg_score - 50) * 0.04)), 1)
 
         if not getattr(self, "current_ai_skill_test", None):
             self.generate_new_ai_skill_test(base_sr=base_sr)
@@ -11126,25 +11747,26 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
         pa = getattr(self, "last_profile_analysis", {}) or {}
         p_stats = pa.get("player_stats", {})
         scores = pa.get("scores", {})
+        u_rank = p_stats.get("pp_rank", 0) or getattr(self, "player_rank", 0)
+        u_pp = p_stats.get("pp", 0) or getattr(self, "player_pp", 0)
 
         if base_sr is None:
             if "target_test_sr" in p_stats:
                 base_sr = float(p_stats["target_test_sr"])
             elif "top_avg_sr" in p_stats:
-                base_sr = round(max(3.0, float(p_stats["top_avg_sr"]) - 0.55), 1)
+                base_sr = float(p_stats["top_avg_sr"])
             elif "adaptive_difficulty" in p_stats:
-                base_sr = round(max(3.0, float(p_stats["adaptive_difficulty"].get("effective_sr", 5.2)) - 0.55), 1)
-            elif "pp" in p_stats and p_stats["pp"]:
-                pp = float(p_stats["pp"])
-                base_sr = round(max(3.0, (pp ** 0.36) * 0.78 - 0.55), 1)
+                base_sr = float(p_stats["adaptive_difficulty"].get("effective_sr", 5.2))
+            elif u_rank or u_pp:
+                base_sr = estimate_sr_from_rank_and_pp(u_rank, u_pp)
             elif scores:
                 s_vals = list(scores.values())
                 avg_score = sum(s_vals) / len(s_vals)
-                base_sr = round(max(3.0, 5.0 + (avg_score - 50) * 0.035 - 0.55), 1)
+                base_sr = round(max(3.5, 5.0 + (avg_score - 50) * 0.04), 1)
             else:
-                base_sr = 4.8
+                base_sr = estimate_sr_from_rank_and_pp(u_rank, u_pp)
 
-        base_sr = round(max(3.8, min(8.8, base_sr)), 1)
+        base_sr = round(max(3.5, min(9.8, base_sr)), 1)
 
         test_suite = {}
         categories = ["Consistency", "Speed", "Aim", "Stamina", "Tech", "Reading", "Streams", "Precision"]
@@ -11450,13 +12072,14 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
                     if new_play_found or count != prev_count:
                         self.render_ai_test_maps()
                         self.draw_tester_live_radar()
-                        self.tester_progress_lbl.configure(text=f"Fortschritt: {count}/8 Maps absolviert")
+                        if hasattr(self, "tester_progress_lbl") and self.tester_progress_lbl.winfo_exists():
+                            self.tester_progress_lbl.configure(text=f"Fortschritt: {count}/8 Maps absolviert")
                         self.tester_dnd_status.configure(text=f"⚡ Live-Sync: Play automatisch erkannt! ({count}/8 abgeschlossen)", text_color="#00E676")
                     elif not silent:
                         self.tester_dnd_status.configure(text=f"✅ {count}/8 Test-Maps abgeschlossen (Live-Sync aktiv)", text_color="#00E5FF")
 
-                self.after(0, done)
-            except Exception as e:
+                self.safe_ui_dispatch(self, done)
+            except Exception:
                 pass
 
         threading.Thread(target=run, daemon=True).start()
@@ -11467,12 +12090,22 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
         self._tester_sync_loop_running = True
 
         def _loop():
+            if not hasattr(self, "winfo_exists") or not self.winfo_exists():
+                self._tester_sync_loop_running = False
+                return
             if not hasattr(self, 'tester_dnd_status') or not self.tester_dnd_status.winfo_exists():
                 self._tester_sync_loop_running = False
                 return
             
-            self.fetch_tester_api_plays(silent=True)
-            self.after(4500, _loop)
+            try:
+                self.fetch_tester_api_plays(silent=True)
+            except Exception:
+                pass
+
+            if hasattr(self, "winfo_exists") and self.winfo_exists():
+                self.after(4500, _loop)
+            else:
+                self._tester_sync_loop_running = False
 
         self.after(1000, _loop)
 
@@ -11547,15 +12180,18 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
                         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 4096}
                     }
                     r = requests.post(url, json=payload, timeout=25)
-                    raw_text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    clean_json = raw_text.replace("```json", "").replace("```", "").strip()
-                    parsed = json.loads(clean_json)
+                    res_j = r.json()
+                    candidates = res_j.get("candidates", [])
+                    raw_text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "") if candidates else ""
+                    parsed = safe_parse_ai_json(raw_text, default={})
                     calibrated_scores = parsed.get("calibrated_scores", {})
+                    if not isinstance(calibrated_scores, dict):
+                        calibrated_scores = {}
                     ai_resp = parsed.get("certificate_text", raw_text)
-                except Exception as e:
-                    ai_resp = f"Analyse der {len(subs)} Test-Maps:\n\n" + "\n".join([f"• {k}: {v.get('skill_score', v.get('acc')):.0f} Pkt ({v.get('acc'):.1f}%, {v.get('misses')} Miss)" for k, v in subs.items()])
+                except Exception:
+                    ai_resp = f"Analyse der {len(subs)} Test-Maps:\n\n" + "\n".join([f"• {k}: {v.get('skill_score', v.get('acc', 0)):.0f} Pkt ({v.get('acc', 0):.1f}%, {v.get('misses', 0)} Miss)" for k, v in subs.items()])
             else:
-                ai_resp = f"Analyse der {len(subs)} Test-Maps (Ohne Gemini Key):\n\n" + "\n".join([f"• {k}: {v.get('skill_score', v.get('acc')):.0f} Pkt ({v.get('acc'):.1f}%, {v.get('misses')} Miss)" for k, v in subs.items()])
+                ai_resp = f"Analyse der {len(subs)} Test-Maps (Ohne Gemini Key):\n\n" + "\n".join([f"• {k}: {v.get('skill_score', v.get('acc', 0)):.0f} Pkt ({v.get('acc', 0):.1f}%, {v.get('misses', 0)} Miss)" for k, v in subs.items()])
 
             self.log_ai_event(
                 category="Skill-Tester Zertifikat (Gemini)",
@@ -11578,12 +12214,13 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
                 self.save_global_settings()
 
             def update():
-                txt_box.configure(state="normal")
-                txt_box.delete("1.0", "end")
-                txt_box.insert("1.0", ai_resp)
-                txt_box.configure(state="disabled")
+                if txt_box.winfo_exists():
+                    txt_box.configure(state="normal")
+                    txt_box.delete("1.0", "end")
+                    txt_box.insert("1.0", ai_resp)
+                    txt_box.configure(state="disabled")
 
-            self.after(0, update)
+            self.safe_ui_dispatch(report_win, update)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -11644,12 +12281,8 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         self.setup_ui()
 
     def load_data(self):
-        if os.path.exists(self.save_file):
-            try:
-                with open(self.save_file, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-            except: self.data = {}
-        else:
+        self.data = safe_json_load(self.save_file, default={}) if self.save_file else {}
+        if not isinstance(self.data, dict):
             self.data = {}
 
         if "current_level_idx" in self.data:
@@ -11665,23 +12298,18 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         if not self.save_file: return
         self.data["current_level_idx"] = self.current_level_idx
         try:
-            with open(self.save_file, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=4)
-        except: pass
+            safe_atomic_json_dump(self.data, self.save_file, indent=4)
+        except Exception:
+            pass
 
     def load_beatmaps(self):
-        if os.path.exists(BEATMAP_CACHE_FILE):
-            try:
-                with open(BEATMAP_CACHE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except: pass
-        return {}
+        return safe_json_load(BEATMAP_CACHE_FILE, default={})
 
     def save_beatmaps(self):
         try:
-            with open(BEATMAP_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.beatmap_cache, f)
-        except: pass
+            safe_atomic_json_dump(getattr(self, "beatmap_cache", {}), BEATMAP_CACHE_FILE, indent=2)
+        except Exception:
+            pass
 
     def format_time(self, seconds):
         if not seconds: return "N/A"
@@ -11715,7 +12343,8 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
                         pass
         except Exception:
             pass
-        self.after(1500, self.auto_import_loop)
+        if hasattr(self, "winfo_exists") and self.winfo_exists():
+            self.after(1500, self.auto_import_loop)
 
     def _on_zero_click_replay_detected(self, file_path):
         """Called automatically whenever ANY replay finishes in osu! without touching F2."""
@@ -11781,7 +12410,7 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
             h50_tmp = parsed.get('50s', 0)
             miss_tmp = parsed.get('misses', 0)
             tot_tmp = h300_tmp + h100_tmp + h50_tmp + miss_tmp
-            acc_tmp = ((h300_tmp * 300 + h100_tmp * 100 + h50_tmp * 50) / (tot_tmp * 300) * 100) if tot_tmp > 0 else 0
+            acc_tmp = (safe_div(h300_tmp * 300 + h100_tmp * 100 + h50_tmp * 50, tot_tmp * 300, 0.0) * 100) if tot_tmp > 0 else 0
             mock_p = {
                 "beatmap_id": parsed.get("beatmap_hash", ""),
                 "count300": h300_tmp, "count100": h100_tmp, "count50": h50_tmp, "countmiss": miss_tmp,
@@ -11800,10 +12429,10 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
             h50 = parsed['50s']
             miss = parsed['misses']
             tot = h300 + h100 + h50 + miss
-            acc = ((h300 * 300 + h100 * 100 + h50 * 50) / (tot * 300) * 100) if tot > 0 else 0
+            acc = (safe_div(h300 * 300 + h100 * 100 + h50 * 50, tot * 300, 0.0) * 100) if tot > 0 else 0
 
             # S Rank Check
-            is_s = (acc >= 93.0 and miss == 0) or (acc >= 90.0 and (h50/tot) <= 0.01 and miss == 0)
+            is_s = (acc >= 93.0 and miss == 0) or (acc >= 90.0 and safe_div(h50, tot, 1.0) <= 0.01 and miss == 0)
             if is_s and len(lvl.get("s_ranks", [])) < 5:
                 lvl.setdefault("s_ranks", []).append(parsed)
 
@@ -11874,15 +12503,17 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         # Initialize window start to around active level
         self.current_window_start = max(0, self.current_level_idx - 2)
         self.render_cards()
-        self.after(100, self.jump_to_current_animated)
+        if hasattr(self, "winfo_exists") and self.winfo_exists():
+            self.after(100, self.jump_to_current_animated)
 
     def _bind_horizontal_scroll(self, widget):
         # 1. 2.5x Faster than previous (30 units per step - 10x base speed)
         def _on_wheel(event):
             if hasattr(self, "scrollable_frame") and self.scrollable_frame.winfo_exists():
                 canvas = self.scrollable_frame._parent_canvas
-                units = -30 if event.delta > 0 else 30
-                canvas.xview_scroll(units, "units")
+                if canvas and canvas.winfo_exists():
+                    units = -30 if event.delta > 0 else 30
+                    canvas.xview_scroll(units, "units")
 
         # 2. Mouse Drag "Ice Slide" Inertia Physics
         def _on_drag_start(event):
@@ -11901,6 +12532,7 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
             if not getattr(self, "_is_dragging", False): return
             if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists(): return
             canvas = self.scrollable_frame._parent_canvas
+            if not canvas or not canvas.winfo_exists(): return
             
             dx = self._drag_last_x - event.x_root
             now = time.time()
@@ -11944,10 +12576,18 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         except: pass
 
     def _do_ice_slide(self):
-        if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists(): return
+        if not hasattr(self, "winfo_exists") or not self.winfo_exists():
+            self._slide_after_id = None
+            return
+        if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists():
+            self._slide_after_id = None
+            return
         if getattr(self, "_is_dragging", False): return
         
         canvas = self.scrollable_frame._parent_canvas
+        if not canvas or not canvas.winfo_exists():
+            self._slide_after_id = None
+            return
         current_frac = canvas.xview()[0]
         vel = getattr(self, "_drag_velocity", 0.0)
         
@@ -11960,12 +12600,15 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         self._drag_velocity = vel * 0.86
         
         if abs(self._drag_velocity) > 0.0001 and 0.0 < new_frac < 1.0:
-            self._slide_after_id = self.after(16, self._do_ice_slide)
+            if hasattr(self, "winfo_exists") and self.winfo_exists():
+                self._slide_after_id = self.after(16, self._do_ice_slide)
         else:
             self._drag_velocity = 0.0
             self._slide_after_id = None
 
     def jump_to_current_animated(self):
+        if not hasattr(self, "winfo_exists") or not self.winfo_exists():
+            return
         if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists():
             return
         
@@ -11976,6 +12619,8 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
             self.render_cards()
 
         canvas = self.scrollable_frame._parent_canvas
+        if not canvas or not canvas.winfo_exists():
+            return
         total_items = 8 + (1 if self.current_window_start > 0 else 0) + (1 if self.current_window_start + 8 < len(self.levels) else 0)
         pos = (self.current_level_idx - self.current_window_start) + (1 if self.current_window_start > 0 else 0)
         target_frac = max(0.0, min(1.0, (pos - 0.5) / max(1, total_items - 1)))
@@ -11983,12 +12628,17 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
         current_frac = canvas.xview()[0]
         steps = 8
         def step(i=0):
-            if not self.winfo_exists() or not self.scrollable_frame.winfo_exists(): return
+            if not hasattr(self, "winfo_exists") or not self.winfo_exists(): return
+            if not hasattr(self, "scrollable_frame") or not self.scrollable_frame.winfo_exists(): return
             t = (i + 1) / steps
             frac = current_frac + (target_frac - current_frac) * t
-            canvas.xview_moveto(frac)
+            try:
+                canvas.xview_moveto(frac)
+            except Exception:
+                return
             if i + 1 < steps:
-                self.after(16, lambda: step(i + 1))
+                if hasattr(self, "winfo_exists") and self.winfo_exists():
+                    self.after(16, lambda: step(i + 1))
         step()
 
     def set_current_level(self, idx):
