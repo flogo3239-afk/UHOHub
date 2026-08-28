@@ -13832,13 +13832,85 @@ Antworte STRENG in folgendem JSON-Format (ohne Markdown Backticks darum herum):
         prev_ids = {m_info.get("id") for m_info in prev_test.values() if isinstance(m_info, dict) and m_info.get("id")}
         used_in_suite = set(prev_ids)
 
+        candidates_by_cat = {}
+        candidates_summary = {}
+
         for cat in categories:
             # Skill-specific adjustment based on player's score in that skillset
             cat_score = scores.get(cat, 65)
             offset = (cat_score - 65) * 0.015
             target_sr = round(max(3.8, min(8.8, base_sr + offset)), 1)
+
+            # Query candidate maps from database
+            cat_cands = []
+            if BEATMAP_SQLITE_DB_PATH:
+                raw_cands = sqlite_query_maps(
+                    skill=cat,
+                    sr_min=round(target_sr - 0.7, 2),
+                    sr_max=round(target_sr + 0.7, 2),
+                    exclude_ids=used_in_suite,
+                    limit=15,
+                    order_by="playcount DESC"
+                )
+                for c in raw_cands:
+                    if c.get("id") and c.get("id") not in used_in_suite:
+                        cat_cands.append(c)
+                        if len(cat_cands) >= 4:
+                            break
             
-            chosen = pick_dynamic_map_for_skill(cat, target_sr, exclude_ids=used_in_suite)
+            # Fallback if SQLite query returned few maps
+            if len(cat_cands) < 2:
+                for _ in range(3):
+                    m_dyn = pick_dynamic_map_for_skill(cat, target_sr, exclude_ids=used_in_suite)
+                    if m_dyn and m_dyn.get("id") and m_dyn not in cat_cands:
+                        cat_cands.append(m_dyn)
+
+            if not cat_cands:
+                cat_cands = [pick_dynamic_map_for_skill(cat, target_sr, exclude_ids=used_in_suite)]
+
+            candidates_by_cat[cat] = cat_cands
+            candidates_summary[cat] = [
+                {"id": m["id"], "name": m.get("name", "Unknown"), "sr": round(m.get("sr", target_sr), 2), "bpm": m.get("bpm", 180)}
+                for m in cat_cands
+            ]
+
+        # Call Gemini AI to pick the single best benchmark map for each skillset
+        ai_chosen_map_ids = {}
+        if getattr(self, "gemini_key", ""):
+            try:
+                gemini_prompt = (
+                    f"Du bist der offizielle osu! Benchmark Coach.\n"
+                    f"Wähle für diesen Spieler (osu! Rang: #{u_rank}, PP: {u_pp}, Basis-SR: {base_sr}★) für jedes der 8 Skillsets die EINE am besten geeignete Benchmark-Test-Map aus den folgenden Kandidaten:\n\n"
+                    f"Kandidaten-Pool pro Skillset:\n{json.dumps(candidates_summary, ensure_ascii=False, indent=2)}\n\n"
+                    f"WICHTIG: Antworte AUSSCHLIESSLICH als valides JSON-Objekt im Format:\n"
+                    f'{{"Consistency": <beatmap_id>, "Speed": <beatmap_id>, "Aim": <beatmap_id>, "Stamina": <beatmap_id>, "Tech": <beatmap_id>, "Reading": <beatmap_id>, "Streams": <beatmap_id>, "Precision": <beatmap_id>}}'
+                )
+                ai_resp = self.call_gemini_api(
+                    prompt=gemini_prompt,
+                    system_prompt="Du bist der osu! Benchmark Head-Coach. Antworte ausschließlich mit dem geforderten JSON-Objekt.",
+                    temperature=0.3,
+                    max_tokens=350
+                )
+                if ai_resp:
+                    ai_parsed = safe_parse_ai_json(ai_resp)
+                    if isinstance(ai_parsed, dict):
+                        ai_chosen_map_ids = ai_parsed
+            except Exception:
+                pass
+
+        for cat in categories:
+            chosen = None
+            target_bid = ai_chosen_map_ids.get(cat)
+            if target_bid:
+                # Find matching candidate
+                for m in candidates_by_cat[cat]:
+                    if str(m.get("id")) == str(target_bid):
+                        chosen = m
+                        break
+            
+            if not chosen:
+                chosen = candidates_by_cat[cat][0]
+
             used_in_suite.add(chosen["id"])
             test_suite[cat] = chosen
 
