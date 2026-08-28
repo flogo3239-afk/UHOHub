@@ -126,9 +126,10 @@ def safe_div(numerator, denominator, default=0.0):
             return float(default)
         num = float(numerator)
         den = float(denominator)
-        if den == 0.0 or math.isnan(den) or math.isnan(num) or math.isinf(den) or math.isinf(num):
+        res = num / den
+        if math.isinf(res) or math.isnan(res):
             return float(default)
-        return num / den
+        return res
     except (ValueError, TypeError, ZeroDivisionError, OverflowError):
         return float(default)
 
@@ -178,20 +179,21 @@ def safe_ui_dispatch(widget_or_root, callback, *args, **kwargs):
     except Exception:
         pass
 
-def safe_parse_ai_json(raw_text, default=None):
+_DEFAULT_SENTINEL = object()
+
+def safe_parse_ai_json(raw_text, default=_DEFAULT_SENTINEL):
     """Extracts and parses JSON object or list from AI text responses with markdown, code blocks, or preamble."""
-    if default is None:
-        default = {}
+    fallback = {} if default is _DEFAULT_SENTINEL else default
     if raw_text is None:
-        return default
+        return fallback
     if not isinstance(raw_text, str):
         if isinstance(raw_text, (dict, list)):
             return raw_text
-        return default
+        return fallback
 
     cleaned = raw_text.strip()
     if not cleaned:
-        return default
+        return fallback
 
     # Fast path: direct JSON
     try:
@@ -231,7 +233,7 @@ def safe_parse_ai_json(raw_text, default=None):
             except Exception:
                 pass
 
-    return default
+    return fallback
 
 def _find_resource_file(filename):
     """Find a resource file across all candidate directories."""
@@ -582,6 +584,512 @@ def classify_map(m):
     cats = [k for k, v in fp.items() if v >= 0.40]
     return cats if cats else ['Consistency', 'Aim']
 
+# =============================================================================
+# 8-SKILLSET DYNAMIC BOT STAT ENGINE & SCOREV2 TOURNAMENT SIMULATOR 2.0
+# =============================================================================
+ALL_8_SKILLS = ["Consistency", "Speed", "Aim", "Stamina", "Tech", "Reading", "Streams", "Precision"]
+TIER_POINT_POOLS = {"Rookie": 160, "Challenger": 240, "Pro": 400, "Legend": 640}
+
+GERMAN_OSU_NAMES = [
+    "WhiteFox_DE", "RheinJumper", "KaiserAim", "BavariaStream", "AlpenSpeed",
+    "BlitzTech", "SchwarzwaldHD", "Manticore_de", "SternStaub", "NeoVortex",
+    "SturmRhythmus", "Eisbaer_osu", "ShadowEcho", "KiraStream", "ChronoDrift",
+    "Valkyrie_DE", "AetherAim", "SilberPfeil", "DonauBeat", "ZenithPulse",
+    "NordLicht_osu", "HarzRider", "Edelweiss_Aim", "RuhrPott_God", "BerlinExpress",
+    "Phantasm_DE", "ViperStream", "EchoBlade", "MeisterTap", "FrostBite_de",
+    "Tornado_DE", "SchattenWolf", "Phoenix_DACH", "NovaStrike", "RhythmusKomet",
+    "Hyperion_de", "AeroSync", "Blitzschlag", "Starlight_DE", "KometenSchweif"
+]
+
+def generate_8skill_profile(tier_name: str) -> tuple[dict[str, int], list[str], list[str]]:
+    """
+    Generates an 8-skill radar profile enforcing the strict Base-10 Rule (all skills >= 10),
+    exact tier point pool budgets (Rookie: 160, Challenger: 240, Pro: 400, Legend: 640),
+    and maximum 100 points cap per skill.
+    Returns (stats_dict, top2_strengths, bot2_weaknesses).
+    """
+    normalized_tier = "Challenger"
+    tier_str = str(tier_name or "Challenger").lower()
+    for k in TIER_POINT_POOLS:
+        if k.lower() in tier_str:
+            normalized_tier = k
+            break
+
+    n = len(ALL_8_SKILLS)
+    base_stat = 10
+    target_sum = TIER_POINT_POOLS.get(normalized_tier, 240)
+    stats = [base_stat] * n
+    remaining_pool = target_sum - (base_stat * n)
+
+    strengths = random.sample(range(n), 2)
+    remaining_indices = [i for i in range(n) if i not in strengths]
+    weaknesses = random.sample(remaining_indices, 2)
+
+    weights = [1.0] * n
+    for s in strengths:
+        weights[s] = random.uniform(2.2, 3.8)
+    for w in weaknesses:
+        weights[w] = random.uniform(0.3, 0.6)
+
+    while remaining_pool > 0:
+        eligible = [i for i in range(n) if stats[i] < 100]
+        if not eligible:
+            break
+        elig_weights = [weights[i] for i in eligible]
+        tot_w = sum(elig_weights)
+        if tot_w <= 0:
+            step_each = max(1, remaining_pool // len(eligible))
+            for i in eligible:
+                add = min(step_each, 100 - stats[i], remaining_pool)
+                stats[i] += add
+                remaining_pool -= add
+                if remaining_pool <= 0:
+                    break
+            continue
+
+        chunk = min(remaining_pool, max(1, remaining_pool // 4))
+        r = random.uniform(0, tot_w)
+        cum = 0.0
+        chosen = eligible[-1]
+        for i, idx in enumerate(eligible):
+            cum += elig_weights[i]
+            if r <= cum:
+                chosen = idx
+                break
+
+        add = min(chunk, 100 - stats[chosen])
+        if add == 0:
+            add = min(1, 100 - stats[chosen])
+        stats[chosen] += add
+        remaining_pool -= add
+
+    for _ in range(remaining_pool):
+        eligible = [i for i in range(n) if stats[i] < 100]
+        if eligible:
+            idx = random.choice(eligible)
+            stats[idx] += 1
+            remaining_pool -= 1
+
+    res = {ALL_8_SKILLS[i]: stats[i] for i in range(n)}
+    sorted_skills = sorted(res.items(), key=lambda x: x[1], reverse=True)
+    top2 = [sorted_skills[0][0], sorted_skills[1][0]]
+    bot2 = [sorted_skills[-1][0], sorted_skills[-2][0]]
+    return res, top2, bot2
+
+def calculate_bot_scorev2(bot_stats: dict, map_meta: dict) -> dict:
+    """
+    Dynamically computes realistic bot ScoreV2 performance (0 to 1,000,000)
+    matching bot skillset against map demands (SR, BPM, Length, CS, AR, OD).
+    Resilient to empty, missing, or corrupt inputs.
+    """
+    if not isinstance(bot_stats, dict) or not bot_stats:
+        bot_stats = {k: 50 for k in ALL_8_SKILLS}
+    if not isinstance(map_meta, dict):
+        map_meta = {}
+
+    clean_stats = {}
+    for k in ALL_8_SKILLS:
+        try:
+            clean_stats[k] = float(bot_stats.get(k, 10) or 10)
+        except Exception:
+            clean_stats[k] = 10.0
+
+    try: sr = float(map_meta.get("sr", 6.0) or 6.0)
+    except Exception: sr = 6.0
+    if math.isnan(sr) or math.isinf(sr): sr = 6.0
+
+    try: bpm = float(map_meta.get("bpm", 180.0) or 180.0)
+    except Exception: bpm = 180.0
+    if math.isnan(bpm) or math.isinf(bpm): bpm = 180.0
+
+    try: length = float(map_meta.get("len", 150) or 150)
+    except Exception: length = 150.0
+    if math.isnan(length) or math.isinf(length) or length < 0: length = 150.0
+
+    try: cs = float(map_meta.get("cs", 4.0) or 4.0)
+    except Exception: cs = 4.0
+    if math.isnan(cs) or math.isinf(cs): cs = 4.0
+
+    try: ar = float(map_meta.get("ar", 9.0) or 9.0)
+    except Exception: ar = 9.0
+
+    try: od = float(map_meta.get("od", 8.5) or 8.5)
+    except Exception: od = 8.5
+
+    weights = map_meta.get("weights")
+    if not weights or not isinstance(weights, dict):
+        try:
+            fp = compute_map_pattern_fingerprint(map_meta)
+            tot_fp = sum(fp.values())
+            if tot_fp > 0:
+                weights = {k: fp.get(k, 0.0) / tot_fp for k in ALL_8_SKILLS}
+            else:
+                weights = {k: 0.125 for k in ALL_8_SKILLS}
+        except Exception:
+            weights = {k: 0.125 for k in ALL_8_SKILLS}
+
+    effective_skill = sum(clean_stats.get(k, 10.0) * float(weights.get(k, 0.125)) for k in ALL_8_SKILLS)
+    cons_stat = clean_stats.get("Consistency", 10.0)
+
+    # 1. Map Demand
+    map_demand = 15.0 + ((sr - 4.5) / 4.0) * 75.0
+    if bpm > 220:
+        map_demand += (bpm - 220) * 0.15 * (1.0 - (clean_stats.get("Speed", 10.0) / 100.0))
+    if cs > 4.5:
+        map_demand += (cs - 4.5) * 10.0 * (1.0 - (clean_stats.get("Precision", 10.0) / 100.0))
+    if length > 200:
+        map_demand += ((length - 200) / 60.0) * 5.0 * (1.0 - (clean_stats.get("Stamina", 10.0) / 100.0))
+
+    skill_ratio = effective_skill / max(5.0, map_demand)
+
+    # 2. Accuracy Sigmoid
+    acc_midpoint = 94.0 + 5.5 / (1.0 + math.exp(-3.5 * (skill_ratio - 0.9)))
+    acc_std = max(0.15, 1.2 - (effective_skill / 100.0) * 0.6 - (cons_stat / 100.0) * 0.4)
+    sim_acc = max(70.0, min(99.95, random.gauss(acc_midpoint, acc_std)))
+
+    # 3. Hit Objects & Miss Count (Poisson)
+    drain_density = max(2.8, min(6.0, (bpm / 60.0) * 1.1 + (sr * 0.25)))
+    total_objects = max(50, int(length * drain_density))
+
+    if skill_ratio >= 1.15:
+        lambda_miss = max(0.0, 0.2 - (cons_stat / 500.0))
+    elif skill_ratio >= 0.95:
+        lambda_miss = max(0.0, (1.2 - skill_ratio) * 6.0 * (1.0 - cons_stat / 150.0))
+    else:
+        lambda_miss = (1.0 - skill_ratio) * 18.0 * (1.5 - cons_stat / 100.0)
+
+    # Poisson draw
+    l_val = math.exp(-min(max(0.0, lambda_miss), 700.0))
+    k = 0
+    p = 1.0
+    while p > l_val:
+        k += 1
+        p *= random.random()
+    sim_misses = max(0, k - 1)
+
+    # 4. Combo Ratio Model
+    if sim_misses == 0:
+        combo_ratio = 1.0
+    else:
+        base_split = 1.0 / (sim_misses + 1)
+        cons_factor = 0.5 + 0.5 * (cons_stat / 100.0)
+        choke_luck = random.uniform(0.7, 1.3)
+        combo_ratio = min(0.94, max(0.10, base_split * (1.2 + cons_factor) * choke_luck))
+
+    # 5. ScoreV2 Calculation
+    score_combo = 700000.0 * (combo_ratio ** 0.5)
+    score_acc = 300000.0 * ((sim_acc / 100.0) ** 4.0)
+    total_scorev2 = int(round(score_combo + score_acc))
+    total_scorev2 = max(0, min(1000000, total_scorev2))
+
+    return {
+        "scorev2": total_scorev2,
+        "acc": round(sim_acc, 2),
+        "misses": sim_misses,
+        "combo_ratio": round(combo_ratio, 3),
+        "effective_skill": round(effective_skill, 1),
+        "map_demand": round(map_demand, 1),
+        "ratio": round(skill_ratio, 2)
+    }
+
+def generate_tactical_scouting_dossier(player_name: str, stats: dict[str, int], tier_name: str) -> dict:
+    """Generates a structured tactical scouting dossier with choke danger badges and signature slots."""
+    sorted_skills = sorted(stats.items(), key=lambda x: x[1], reverse=True)
+    top1, top2 = sorted_skills[0][0], sorted_skills[1][0]
+    bot1, bot2 = sorted_skills[-1][0], sorted_skills[-2][0]
+
+    cons = stats.get("Consistency", 50)
+    if cons < 30:
+        choke_text = "🚨 Nervöser Choker (Neigt zu Sudden Breaks bei Drucksituationen / Tiebreakern)"
+        choke_badge = "Choke-Gefahr: Hoch"
+        choke_color = "#FF5252"
+    elif cons < 60:
+        choke_text = "⚠️ Durchschnittliche Nervenstärke (Stabiler Rundenspieler mit gelegentlichen Combo-Drops)"
+        choke_badge = "Choke-Gefahr: Mittel"
+        choke_color = "#FFA726"
+    elif cons < 85:
+        choke_text = "🛡️ Solider Match-Anchor (Hohe Combo-Konstanz, verlässlicher Scorer)"
+        choke_badge = "Choke-Gefahr: Gering"
+        choke_color = "#00E676"
+    else:
+        choke_text = "💎 Eiserne Match-Nerven (Legendäre Clutch-Resistenz, verlässliche FC-Maschine)"
+        choke_badge = "Choke-Gefahr: Minimal"
+        choke_color = "#00E5FF"
+
+    slot_map = {
+        "Speed": ["DT1", "DT2"],
+        "Precision": ["HR1", "HR2"],
+        "Streams": ["NM4", "NM5"],
+        "Tech": ["NM6", "FM2"],
+        "Reading": ["HD1", "HD2"],
+        "Aim": ["NM1", "NM2"],
+        "Stamina": ["NM3", "TB"],
+        "Consistency": ["NM1", "TB"]
+    }
+    sig_slots = list(set(slot_map.get(top1, ["NM1"]) + slot_map.get(top2, ["NM2"])))[:3]
+
+    return {
+        "name": player_name,
+        "tier": tier_name,
+        "top_strengths": [top1, top2],
+        "top_weaknesses": [bot1, bot2],
+        "signature_slots": sig_slots,
+        "choke_tendency": choke_text,
+        "choke_badge": choke_badge,
+        "choke_color": choke_color,
+        "stats": stats
+    }
+
+def generate_team_roster(team_size: int, tier_name: str, player_username: str = "Spieler") -> dict:
+    """Generates rosters for player team and opponent team based on team size (1 to 4)."""
+    valid_size = max(1, min(4, int(team_size or 1)))
+    needed_names = valid_size * 2
+    sampled_names = random.sample(GERMAN_OSU_NAMES, min(len(GERMAN_OSU_NAMES), max(8, needed_names)))
+
+    player_team = []
+    user_stats, _, _ = generate_8skill_profile(tier_name)
+    player_team.append(generate_tactical_scouting_dossier(player_username, user_stats, tier_name))
+
+    for i in range(valid_size - 1):
+        tm_name = sampled_names[i]
+        tm_stats, _, _ = generate_8skill_profile(tier_name)
+        player_team.append(generate_tactical_scouting_dossier(tm_name, tm_stats, tier_name))
+
+    opponent_team = []
+    for i in range(valid_size):
+        opp_name = sampled_names[valid_size - 1 + i]
+        opp_stats, _, _ = generate_8skill_profile(tier_name)
+        opponent_team.append(generate_tactical_scouting_dossier(opp_name, opp_stats, tier_name))
+
+    return {
+        "team_size": valid_size,
+        "player_team": player_team,
+        "opponent_team": opponent_team
+    }
+
+def aggregate_round_scores(player_scores: list[int], opponent_scores: list[int]) -> dict:
+    """Aggregates round scores and computes victory status and winning margin."""
+    p_total = sum(int(s or 0) for s in (player_scores or []))
+    o_total = sum(int(s or 0) for s in (opponent_scores or []))
+    margin = abs(p_total - o_total)
+
+    if p_total > o_total:
+        winner = "player_team"
+    elif o_total > p_total:
+        winner = "opponent_team"
+    else:
+        winner = "draw"
+
+    return {
+        "player_team_total": p_total,
+        "opponent_team_total": o_total,
+        "winner": winner,
+        "margin": margin
+    }
+
+def evaluate_scouting_guess(player_top2: list[str], player_bot2: list[str], true_top2: list[str], true_bot2: list[str]) -> dict:
+    """Calculates guessing challenge accuracy and verdict."""
+    s_matches = len(set(player_top2 or []).intersection(set(true_top2 or [])))
+    w_matches = len(set(player_bot2 or []).intersection(set(true_bot2 or [])))
+    correct_count = s_matches + w_matches
+    acc_pct = (correct_count / 4.0) * 100.0
+
+    if correct_count == 4:
+        title = "🏆 Meister-Scout"
+        desc = "Perfekte Analyse! Du hast das gesamte Gegnerprofil glasklar durchschaut."
+    elif correct_count == 3:
+        title = "🥇 Experte"
+        desc = "Hervorragende Beobachtungsgabe! Nahezu alle Stärken/Schwächen richtig deduziert."
+    elif correct_count == 2:
+        title = "🥈 Solider Analyst"
+        desc = "Gute Ansätze! Du hast die Hauptgefahren erkannt, wurdest aber in Details überrascht."
+    elif correct_count == 1:
+        title = "🥉 Aufmerksamer Neuling"
+        desc = "Teilweise erkannt. Der Gegner konnte seine wahren Stärken geschickt verschleiern."
+    else:
+        title = "🔍 Getäuschter Stratege"
+        desc = "Komplett geblendet! Der Gegner hat dich taktisch vollkommen überrascht."
+
+    return {
+        "accuracy_pct": acc_pct,
+        "correct_count": correct_count,
+        "verdict_title": title,
+        "verdict_desc": desc
+    }
+
+def generate_offline_heuristic_debrief(match_summary: dict, true_profile: dict, guess_eval: dict) -> str:
+    """Generates German caster match debriefing report without external API."""
+    if not isinstance(match_summary, dict): match_summary = {}
+    if not isinstance(true_profile, dict): true_profile = {}
+    if not isinstance(guess_eval, dict): guess_eval = {}
+
+    acc_pct = guess_eval.get("accuracy_pct", 0.0)
+    true_str = ", ".join(true_profile.get("top_strengths", ["Aim", "Speed"]))
+    true_weak = ", ".join(true_profile.get("top_weaknesses", ["Reading", "Stamina"]))
+    p_score = match_summary.get("player_score", 0)
+    b_score = match_summary.get("bot_score", 0)
+    badge = match_summary.get("badge", "OWC")
+    div = match_summary.get("division", "Grand Finals")
+    v_title = guess_eval.get("verdict_title", "Scout")
+
+    winner_txt = "Sieg für dein Team!" if p_score > b_score else "Knappe Niederlage."
+
+    report = f"""🎙️ OFFIZIELLER CASTER-BERICHT ({badge} {div})
+============================================================
+Endstand: {p_score} : {b_score} • {winner_txt}
+
+🎯 SCOUTING-ANALYSE ({v_title} - {acc_pct:.0f}% Genauigkeit):
+• Echte Stärken des Gegners: {true_str}
+• Echte Schwächen des Gegners: {true_weak}
+• Dein Scouting-Ergebnis: Du hast {guess_eval.get('correct_count', 0)} von 4 Attributen exakt deduziert.
+
+♟️ BAN/PICK- & DRAFT-BEWERTUNG (Draft-Note: {'A+' if acc_pct >= 75 else 'B'}):
+• Taktischer Ban-Impact: Deine Bans haben das Match maßgeblich beeinflusst.
+• Pick-Ausnutzung: Das Ausnutzen der gegnerischen Schwächen ({true_weak}) war der Schlüssel zu deinen Rundengewinnen.
+
+📈 COACHING-EMPFEHLUNG FÜR DIE NÄCHSTE RUNDE:
+1. Halte deine Map-Picks weiterhin fokussiert auf deine Kernkompetenzen (Aim / Speed).
+2. Nutze den UHO Hub KI-Skill-Tester, um Choke-Gefahren auf High-Pressure-Tiebreakern weiter zu minimieren!
+"""
+    return report
+
+def generate_strategic_debrief(match_summary: dict, true_profile: dict, guess_eval: dict, api_key: str = None) -> str:
+    """Generates German caster match debriefing report via Gemini AI or offline fallback."""
+    if not api_key:
+        return generate_offline_heuristic_debrief(match_summary, true_profile, guess_eval)
+
+    prompt = f"""Du bist der offizielle deutsche osu! World Cup Chef-Caster und Taktik-Analyst.
+Ein hochklassiges Turniermatch wurde soeben beendet:
+
+=== MATCH-DATEN ===
+Turnier: {match_summary.get('tournament', 'OWC')} ({match_summary.get('division', 'Grand Finals')})
+Endstand: {match_summary.get('player_score', 0)} : {match_summary.get('bot_score', 0)}
+
+=== WAHRER GEGNER-SKILL-RADAR ===
+Echte Top-2 Stärken: {', '.join(true_profile.get('top_strengths', []))}
+Echte Top-2 Schwächen: {', '.join(true_profile.get('top_weaknesses', []))}
+
+=== SCOUTING-TIPPS DES SPIELERS ===
+Scouting-Genauigkeit: {guess_eval.get('accuracy_pct', 0.0):.0f}% ({guess_eval.get('correct_count', 0)}/4 Treffer - {guess_eval.get('verdict_title', '')})
+
+=== GESPIELTE RUNDEN & DRAFT-VERLAUF ===
+{chr(10).join(match_summary.get('history', []))}
+
+Erstelle einen packenden, hochprofessionellen Caster-Abschlussbericht auf Deutsch mit:
+1. 🎙️ CASTER-MATCH-HIGHLIGHTS
+2. 🎯 SCOUTING-URTEIL
+3. ♟️ DRAFT- & BAN/PICK-ANALYSE
+4. 📈 KONKRETER COACHING-TRAININGSPLAN"""
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}"
+        payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}}
+        r = requests.post(url, json=payload, timeout=12)
+        resp = r.json()
+        text = resp.get("candidates", [])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return generate_offline_heuristic_debrief(match_summary, true_profile, guess_eval)
+
+def draw_radar_polygon(canvas, skill_scores: dict[str, int], color_theme="cyan", is_hidden=False):
+    """Draws 8-axis radar chart with concentric rings, labels, and theme polygons on CTkCanvas or Canvas."""
+    try:
+        canvas.delete("all")
+        w = canvas.winfo_width() or 380
+        h = canvas.winfo_height() or 340
+        if w < 50: w = 380
+        if h < 50: h = 340
+        cx, cy = w / 2, h / 2
+        max_r = max(40, min(cx, cy) - 45)
+
+        categories = ALL_8_SKILLS
+        n = len(categories)
+
+        # Concentric background rings
+        for ring in [0.25, 0.5, 0.75, 1.0]:
+            r = max_r * ring
+            ring_pts = []
+            for i in range(n):
+                angle = (2 * math.pi / n) * i - (math.pi / 2)
+                ring_pts.extend([cx + r * math.cos(angle), cy + r * math.sin(angle)])
+            canvas.create_polygon(ring_pts, fill="", outline="#2e2e3f", width=1)
+
+        # Spokes and Labels
+        for i, cat in enumerate(categories):
+            angle = (2 * math.pi / n) * i - (math.pi / 2)
+            px = cx + max_r * math.cos(angle)
+            py = cy + max_r * math.sin(angle)
+            canvas.create_line(cx, cy, px, py, fill="#3a3a4e", dash=(2, 2))
+
+            lx = cx + (max_r + 24) * math.cos(angle)
+            ly = cy + (max_r + 24) * math.sin(angle)
+            score_val = "?" if is_hidden else str(skill_scores.get(cat, 10)) if isinstance(skill_scores, dict) else "10"
+            canvas.create_text(lx, ly, text=f"{cat}\n({score_val})", fill="#bbbbcc" if not is_hidden else "#666677",
+                               font=("Arial", 8, "bold"), justify="center")
+
+        if is_hidden:
+            canvas.create_text(cx, cy, text="❓\nVerdecktes\nProfil", fill="#555566", font=("Arial", 12, "bold"), justify="center")
+            return
+
+        themes = {
+            "cyan": {"outline": "#00E5FF", "fill": "#00BFA5", "dot": "#00E5FF"},
+            "green": {"outline": "#00E676", "fill": "#00C853", "dot": "#00E676"},
+            "purple": {"outline": "#E040FB", "fill": "#9C27B0", "dot": "#E040FB"}
+        }
+        cfg = themes.get(color_theme, themes["cyan"])
+
+        data_pts = []
+        for i, cat in enumerate(categories):
+            score = skill_scores.get(cat, 10) if isinstance(skill_scores, dict) else 10
+            r = max_r * (max(5, min(100, score)) / 100.0)
+            angle = (2 * math.pi / n) * i - (math.pi / 2)
+            data_pts.extend([cx + r * math.cos(angle), cy + r * math.sin(angle)])
+
+        canvas.create_polygon(data_pts, fill=cfg["fill"], outline=cfg["outline"], width=2, stipple="gray25")
+        for i in range(0, len(data_pts), 2):
+            x, y = data_pts[i], data_pts[i+1]
+            canvas.create_oval(x-4, y-4, x+4, y+4, fill=cfg["dot"], outline="#ffffff", width=1)
+    except Exception:
+        pass
+
+def evaluate_bot_map_affinity(stats: dict[str, int], map_meta: dict) -> float:
+    """Evaluates bot affinity score (0..100) for a given map slot."""
+    weights = map_meta.get("weights", {})
+    if not weights:
+        weights = {s: 0.125 for s in ALL_8_SKILLS}
+    return sum(stats.get(k, 10) * w for k, w in weights.items())
+
+def bot_select_action(pool: dict, bot_stats: dict, player_stats: dict, action_type: str) -> str:
+    """
+    Selects slot for protect, ban, or pick based on true stats and counter-drafting.
+    action_type in ['protect', 'ban', 'pick']
+    """
+    available_slots = [s for s, data in pool.items() if data.get("state") == "available" and s != "TB"]
+    if not available_slots:
+        return "TB" if "TB" in pool else list(pool.keys())[0]
+
+    scored_slots = []
+    for slot in available_slots:
+        map_meta = pool[slot]
+        bot_eval = evaluate_bot_map_affinity(bot_stats, map_meta)
+        player_eval = evaluate_bot_map_affinity(player_stats, map_meta) if player_stats else 50.0
+        delta = bot_eval - player_eval
+        scored_slots.append((slot, delta, bot_eval))
+
+    if action_type == "protect":
+        scored_slots.sort(key=lambda x: x[2], reverse=True)
+        return scored_slots[0][0]
+    elif action_type == "ban":
+        scored_slots.sort(key=lambda x: x[1])
+        return scored_slots[0][0]
+    elif action_type == "pick":
+        scored_slots.sort(key=lambda x: x[1], reverse=True)
+        return scored_slots[0][0]
+    return available_slots[0]
+
+
 def extract_replay_weakness_profile(deep_metrics, play_acc=100.0, play_combo=0, max_combo=0):
     """
     Analysiert Replay-Telemetrie und leitet gezielte Schwächen-Trainingsvektoren ab:
@@ -857,8 +1365,12 @@ def pick_dynamic_map_for_skill(category, target_sr, exclude_ids=None, mod=None, 
     
     return {
         'id': chosen.get('id', '0'),
+        'set_id': chosen.get('set_id', ''),
         'name': str(chosen.get('name', 'Unknown')) + mod_suffix,
         'raw_name': str(chosen.get('name', 'Unknown')),
+        'artist': chosen.get('artist', ''),
+        'title': chosen.get('title', ''),
+        'version': chosen.get('version', ''),
         'sr': eff_sr,
         'raw_sr': raw_sr,
         'year': chosen.get('year', 2024),
@@ -911,7 +1423,7 @@ def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
     """
     id_map = {}
     if top_plays and isinstance(top_plays, list):
-        bids = [str(p.get("beatmap_id", "")) for p in top_plays if p.get("beatmap_id")]
+        bids = [str(p.get("beatmap_id", "")) for p in top_plays if isinstance(p, dict) and p.get("beatmap_id")]
         with get_safe_sqlite_conn() as conn:
             if conn and bids:
                 placeholders = ",".join(["?"] * len(bids[:100]))
@@ -922,7 +1434,7 @@ def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
                 except Exception:
                     pass
     if not id_map:
-        id_map = {str(m.get('id', '')): float(m.get('sr', 5.0)) for m in (db or DYNAMIC_RANKED_MAPS_DB or [])}
+        id_map = {str(m.get('id', '')): float(m.get('sr', 5.0)) for m in (db or DYNAMIC_RANKED_MAPS_DB or []) if isinstance(m, dict)}
     
     u_rank = 0
     u_pp = 0.0
@@ -948,30 +1460,42 @@ def calculate_adaptive_topplay_difficulty(top_plays, user_info=None, db=None):
     weights = []
 
     for i, p in enumerate(top_plays[:50]):
-        bid = str(p.get("beatmap_id", ""))
-        mods = int(p.get("enabled_mods", 0) or 0)
-        h300 = int(p.get("count300", 0) or 0)
-        h100 = int(p.get("count100", 0) or 0)
-        h50 = int(p.get("count50", 0) or 0)
-        miss = int(p.get("countmiss", 0) or 0)
-        pp = float(p.get("pp", 0.0) or 0.0)
+        if not isinstance(p, dict):
+            continue
+        try:
+            bid = str(p.get("beatmap_id", "") or "")
+            mods = int(p.get("enabled_mods", 0) or 0)
+            h300 = int(p.get("count300", 0) or 0)
+            h100 = int(p.get("count100", 0) or 0)
+            h50 = int(p.get("count50", 0) or 0)
+            miss = int(p.get("countmiss", 0) or 0)
+            pp = float(p.get("pp", 0.0) or 0.0)
+        except (ValueError, TypeError):
+            bid = str(p.get("beatmap_id", "") or "") if isinstance(p, dict) else ""
+            mods = 0
+            h300, h100, h50, miss = 0, 0, 0, 0
+            pp = 0.0
+
         tot = h300 + h100 + h50 + miss
         acc = (safe_div(h300 * 300 + h100 * 100 + h50 * 50, tot * 300, 0.0) * 100.0) if tot > 0 else 0.0
 
         # Star Rating Resolution
-        if bid in id_map:
-            play_sr = float(id_map[bid])
-            if (mods & 64) or (mods & 512): # DT / NC
-                play_sr *= 1.40
-            elif (mods & 16): # HR
-                play_sr *= 1.06
-            elif (mods & 2): # EZ
-                play_sr *= 0.72
-            elif (mods & 256): # HT
-                play_sr *= 0.75
-        elif pp > 0:
-            play_sr = (pp ** 0.35) * 0.77
-        else:
+        try:
+            if bid in id_map:
+                play_sr = float(id_map[bid])
+                if (mods & 64) or (mods & 512): # DT / NC
+                    play_sr *= 1.40
+                elif (mods & 16): # HR
+                    play_sr *= 1.06
+                elif (mods & 2): # EZ
+                    play_sr *= 0.72
+                elif (mods & 256): # HT
+                    play_sr *= 0.75
+            elif pp > 0:
+                play_sr = (pp ** 0.35) * 0.77
+            else:
+                play_sr = default_rank_sr
+        except (ValueError, TypeError):
             play_sr = default_rank_sr
 
         play_sr = max(3.5, min(10.5, play_sr))
@@ -1123,15 +1647,61 @@ def get_hwid():
     raw = "-".join(hwid_components)
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]
 
+# Standard Tournament Slot Skillset Conventions (OWC / Corsace / Major Tournaments)
+DEFAULT_TOURNAMENT_SLOT_SKILLSETS = {
+    "NM1": ("Consistency", "All-Around Konstanz, Jumps & Stabilität. Standard-Eröffnungsmap.", "#3b8ed0"),
+    "NM2": ("Aim & Precision", "Präzises Flow Aim, kleine CS & Snaps.", "#3b8ed0"),
+    "NM3": ("Speed & Bursts", "Hohes Grundtempo (220+ BPM), Finger Speed & Bursts.", "#3b8ed0"),
+    "NM4": ("Tech & Reading", "Komplexe Slider-Shapes, unkonventionelle Rhythmen & Reading.", "#3b8ed0"),
+    "NM5": ("Finger Control", "Rhythmus-Wechsel (1/3, 1/4, 1/6 Snappings) & Alternate.", "#3b8ed0"),
+    "NM6": ("Stamina & High CS", "Lange Streams, hohe Ausdauerbelastung oder kleine CS.", "#3b8ed0"),
+    "HD1": ("Aim & Reading", "Reines Hidden Aim, Muscle-Memory & Notenpositionierung.", "#E91E63"),
+    "HD2": ("Tech & Flow", "SliderTech mit Hidden & präzise Slider-Geschwindigkeiten.", "#E91E63"),
+    "HD3": ("Speed & Control", "Hohes Tempo & Bursts mit Hidden.", "#E91E63"),
+    "HR1": ("Precision & Aim", "Sehr kleine CS (CS 5.2 - 6.5) & AR 10 Präzision.", "#F44336"),
+    "HR2": ("Consistency & Stamina", "Längere HR-Map mit Fokus auf Combo-Sicherheit & Nervenstärke.", "#F44336"),
+    "HR3": ("High AR & Tech", "Schnelle Übergänge, Flow Aim & hohe Lesegeschwindigkeit.", "#F44336"),
+    "DT1": ("Pure Speed & Bursts", "Hohes BPM-Tempo (250 - 280+ BPM) & schnelle Burst-Streams.", "#9C27B0"),
+    "DT2": ("Speed Aim & Jumps", "Schnelle Velocity-Jumps & snappy Aim bei hoher Geschwindigkeit.", "#9C27B0"),
+    "DT3": ("Finger Control & Alt", "Komplexe Rhythmen auf DoubleTime, Alternate & Finger Control.", "#9C27B0"),
+    "DT4": ("Stamina & Drain", "Lange DT-Maps mit hohem Ausdauer-Fokus & Drain.", "#9C27B0"),
+    "FM1": ("Consistency & Hybrid", "Ausgewogener All-Rounder Slot für HD, HR, EZ oder NM.", "#00E5FF"),
+    "FM2": ("Tech & Precision", "SliderTech / Präzisions-Map für Spezialisten (z. B. HDHR / HD).", "#00E5FF"),
+    "FM3": ("Speed & Alt", "Tempo- & Alternate-Fokus für FreeMod-Strategien.", "#00E5FF"),
+    "TB":  ("Tiebreaker All-Around", "Lange (4-6 Min) epische Final-Map, die alle Skills kombiniert.", "#FF9800"),
+    "EZ1": ("Reading & Density", "Easy Low AR Reading & Notendichte.", "#4CAF50"),
+    "FL1": ("Memory & Precision", "Flashlight Memorization & Auswendiglernen.", "#FFEB3B")
+}
+
+def get_slot_standard_skillset_name(slot):
+    """Returns the standard tournament skillset name for any pool slot (e.g. NM1 -> Consistency, HR2 -> Consistency & Stamina)."""
+    s = str(slot).upper().strip()
+    if s in DEFAULT_TOURNAMENT_SLOT_SKILLSETS:
+        return DEFAULT_TOURNAMENT_SLOT_SKILLSETS[s][0]
+    for pfx in ["NM", "HD", "HR", "DT", "FM", "TB", "EZ", "FL"]:
+        if s.startswith(pfx):
+            key = f"{pfx}1" if f"{pfx}1" in DEFAULT_TOURNAMENT_SLOT_SKILLSETS else pfx
+            if key in DEFAULT_TOURNAMENT_SLOT_SKILLSETS:
+                return DEFAULT_TOURNAMENT_SLOT_SKILLSETS[key][0]
+    return "All-Around"
+
 class BanchoRefereeBot:
-    """Automated osu! Bancho IRC Referee Bot: creates lobbies, sends in-game invites, sets maps/mods, broadcasts pools, handles in-game chat commands, and tracks outcomes."""
-    def __init__(self, username, irc_password, on_log=None, on_match_created=None, on_round_ended=None, on_chat_command=None):
+    """Automated osu! Bancho IRC Referee Bot: creates lobbies, enforces ScoreV2, sends in-game invites,
+    sets maps/mods, broadcasts pools, parses ScoreV2 match events, and handles in-game chat commands."""
+    def __init__(self, username, irc_password, on_log=None, on_match_created=None, on_round_ended=None,
+                 on_chat_command=None, on_player_score=None, on_map_changed=None, on_match_settings=None,
+                 on_player_joined=None, on_player_left=None):
         self.username = username
         self.irc_password = irc_password
         self.on_log = on_log or (lambda msg, col="#ffffff": None)
         self.on_match_created = on_match_created or (lambda match_id, channel: None)
         self.on_round_ended = on_round_ended or (lambda: None)
         self.on_chat_command = on_chat_command or (lambda sender, cmd, arg, full: None)
+        self.on_player_score = on_player_score or (lambda user, score, status, raw: None)
+        self.on_map_changed = on_map_changed or (lambda title, bid: None)
+        self.on_match_settings = on_match_settings or (lambda settings: None)
+        self.on_player_joined = on_player_joined or (lambda user, slot, team: None)
+        self.on_player_left = on_player_left or (lambda user: None)
         
         self.sock = None
         self.running = False
@@ -1142,19 +1712,29 @@ class BanchoRefereeBot:
         self.pending_lobby_name = "UHO Hub Match"
         self.pending_password = ""
 
-        # Host-Rotation Tracker
+        # Solo Referee & Host-Rotation State
+        self.is_solo_referee_mode = False
+        self.target_player_username = ""
+        self.team_size = 1
         self.is_host_rotation_mode = False
         self.host_queue = []
         self.current_host_idx = 0
 
     def log(self, text, color="#aaaaaa"):
+        try:
+            sys.stdout.buffer.write(f"[BanchoRefereeBot] {text}\n".encode("utf-8", errors="replace"))
+            sys.stdout.buffer.flush()
+        except Exception:
+            pass
         if self.on_log:
             try: self.on_log(text, color)
-            except: pass
+            except Exception:
+                pass
 
     def connect_and_host(self, lobby_name="UHO Hub Match", password="", host_rotation=False, initial_players=None):
         self.pending_lobby_name = lobby_name
         self.pending_password = password
+        self.is_solo_referee_mode = False
         self.is_host_rotation_mode = host_rotation
         self.host_queue = [p.strip().replace(" ", "_") for p in (initial_players or []) if p.strip()]
         self.current_host_idx = 0
@@ -1162,10 +1742,68 @@ class BanchoRefereeBot:
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
+        # 20-Sekunden Watchdog für Fehlerausgabe
+        def _watchdog_20s():
+            time.sleep(20)
+            if self.running and not self.match_id:
+                if not self.connected:
+                    self.log("❌ FEHLERCODE [ERR_IRC_TIMEOUT_20S]: Verbindung zu irc.ppy.sh nach 20 Sekunden fehlgeschlagen!", "#FF5252")
+                    self.log("👉 Mögliche Ursachen: Firewall/Antivirus blockiert IRC-Port 6667/6697 oder keine Internetverbindung.", "#FFA726")
+                else:
+                    self.log("❌ FEHLERCODE [ERR_BANCHO_NO_RESPONSE_20S]: Keine Antwort von BanchoBot auf '!mp make' nach 20 Sekunden!", "#FF5252")
+                    self.log("👉 Mögliche Ursachen: Falsches Server-Passwort (https://osu.ppy.sh/p/irc), Bancho überlastet oder Login ungültig.", "#FFA726")
+        threading.Thread(target=_watchdog_20s, daemon=True).start()
+
+    def connect_and_host_solo(self, lobby_name="UHO Hub Solo Tournament", player_username="", password="", team_size=1):
+        """Spawns an automated private ScoreV2 solo tournament lobby and invites the player."""
+        self.pending_lobby_name = lobby_name
+        self.pending_password = password
+        self.is_solo_referee_mode = True
+        self.target_player_username = player_username.strip().replace(" ", "_") if player_username else self.username
+        self.team_size = max(1, min(4, int(team_size or 1)))
+        self.is_host_rotation_mode = False
+        self.host_queue = []
+        self.current_host_idx = 0
+        self.running = True
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+
+        # 20-Sekunden Watchdog für Fehlerausgabe
+        def _watchdog_20s():
+            time.sleep(20)
+            if self.running and not self.match_id:
+                if not self.connected:
+                    self.log("❌ FEHLERCODE [ERR_IRC_TIMEOUT_20S]: Verbindung zu irc.ppy.sh nach 20 Sekunden fehlgeschlagen!", "#FF5252")
+                    self.log("👉 Mögliche Ursachen: Firewall/Antivirus blockiert IRC-Port 6667/6697 oder keine Internetverbindung.", "#FFA726")
+                else:
+                    self.log("❌ FEHLERCODE [ERR_BANCHO_NO_RESPONSE_20S]: Keine Antwort von BanchoBot auf '!mp make' nach 20 Sekunden!", "#FF5252")
+                    self.log("👉 Mögliche Ursachen: Falsches Server-Passwort (https://osu.ppy.sh/p/irc), Bancho überlastet oder Login ungültig.", "#FFA726")
+        threading.Thread(target=_watchdog_20s, daemon=True).start()
+
+    def setup_solo_room(self, player_username=None, password="", team_size=1):
+        """Configures ScoreV2, locks room slots, sets optional password, and dispatches in-game invite."""
+        target_u = player_username or self.target_player_username or self.username
+        def _bg():
+            time.sleep(0.8)
+            self.set_team_mode(team_size=team_size, scoremode=3) # ScoreV2 Mode
+            time.sleep(0.4)
+            self.lock_room()
+            if password:
+                time.sleep(0.3)
+                self.set_password(password)
+            if target_u:
+                time.sleep(0.5)
+                self.invite_player(target_u)
+                self._send_raw(f"PRIVMSG BanchoBot :!mp invite {target_u}")
+                self.log(f"✉️ Ingame-Einladung an '{target_u}' gesendet! Tippe in osu! '/join {self.channel}' oder klicke auf den Lobby-Button im UHO Hub.", "#00E676")
+            time.sleep(0.5)
+            self.send_channel_message("🏆 UHO Hub Solo-Turnier-Lobby initialisiert (ScoreV2 aktiv). Nutze !pick <slot> oder das UHO Hub UI!")
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _send_raw(self, line):
+        clean_line = str(line).replace("\r", "").replace("\n", "").strip()
         if self.sock and self.connected:
             try:
-                clean_line = str(line).replace("\r", "").replace("\n", "").strip()
                 if clean_line:
                     self.sock.sendall((clean_line + "\r\n").encode("utf-8"))
             except Exception as e:
@@ -1180,18 +1818,32 @@ class BanchoRefereeBot:
         self._send_raw(f"PRIVMSG {target} :{clean_cmd}")
 
     def send_channel_message(self, text):
-        if self.channel:
-            clean_text = str(text).replace("\r", "").replace("\n", "").strip()
-            if clean_text:
-                self._send_raw(f"PRIVMSG {self.channel} :{clean_text}")
+        clean_text = str(text).replace("\r", "").replace("\n", "").strip()
+        if self.channel and clean_text:
+            self._send_raw(f"PRIVMSG {self.channel} :{clean_text}")
 
     def invite_player(self, username):
         clean_u = str(username).replace("\r", "").replace("\n", "").strip().replace(" ", "_")
         if clean_u:
             self.send_mp(f"mp invite {clean_u}")
 
+    def lock_room(self):
+        self.send_mp("mp lock")
+
+    def unlock_room(self):
+        self.send_mp("mp unlock")
+
+    def set_password(self, password=""):
+        clean_pwd = str(password).replace("\r", "").replace("\n", "").strip()
+        self.send_mp(f"mp password {clean_pwd}" if clean_pwd else "mp password")
+
+    def set_size(self, size=2):
+        s = max(1, min(16, int(size)))
+        self.send_mp(f"mp size {s}")
+
     def set_map(self, beatmap_id, mods=None, enforce_nf=True):
-        self.send_mp(f"mp map {beatmap_id}")
+        clean_bid = int(beatmap_id) if str(beatmap_id).isdigit() else beatmap_id
+        self.send_mp(f"mp map {clean_bid} 0")
         time.sleep(0.3)
         if mods:
             m = str(mods).strip().upper()
@@ -1201,16 +1853,28 @@ class BanchoRefereeBot:
                 self.send_mp("mp mods NF" if enforce_nf else "mp mods None")
             elif m in ["TB", "TIEBREAKER"]:
                 self.send_mp("mp mods Freemod NF" if enforce_nf else "mp mods Freemod")
+            elif m in ["HD", "HIDDEN"]:
+                self.send_mp("mp mods HD NF" if enforce_nf else "mp mods HD")
+            elif m in ["HR", "HARDROCK"]:
+                self.send_mp("mp mods HR NF" if enforce_nf else "mp mods HR")
+            elif m in ["DT", "DOUBLETIME"]:
+                self.send_mp("mp mods DT NF" if enforce_nf else "mp mods DT")
+            elif m in ["EZ", "EASY"]:
+                self.send_mp("mp mods EZ NF" if enforce_nf else "mp mods EZ")
+            elif m in ["FL", "FLASHLIGHT"]:
+                self.send_mp("mp mods FL NF" if enforce_nf else "mp mods FL")
             else:
                 self.send_mp(f"mp mods {m} NF" if enforce_nf else f"mp mods {m}")
         else:
             self.send_mp("mp mods NF" if enforce_nf else "mp mods None")
 
-    def set_team_mode(self, team_size=1):
+    def set_team_mode(self, team_size=1, scoremode=3):
+        """Sets team and score mode on Bancho. scoremode: 0=Score, 1=Accuracy, 2=Combo, 3=ScoreV2."""
         if team_size <= 1:
-            self.send_mp("mp set 0 1 2") # Head-to-Head, ScoreV2, 2 Slots
+            self.send_mp(f"mp set 0 {scoremode} 2") # Head-to-Head, ScoreV2, 2 Slots
         else:
-            self.send_mp(f"mp set 2 1 {max(2, min(16, team_size * 2))}") # TeamVs, ScoreV2, N Slots
+            slots = max(2, min(16, int(team_size) * 2))
+            self.send_mp(f"mp set 2 {scoremode} {slots}") # TeamVs, ScoreV2, N Slots
 
     def start_countdown(self, seconds=10):
         self.send_mp(f"mp start {seconds}")
@@ -1257,7 +1921,7 @@ class BanchoRefereeBot:
                 self.send_channel_message(l)
 
             time.sleep(0.7)
-            self.send_channel_message("📌 Ingame-Befehle: !roll | !save <slot> | !ban <slot> | !pick <slot> | !maps | !score | !ready")
+            self.send_channel_message("📌 Ingame-Befehle: !roll | !save <slot> | !ban <slot> | !pick <slot> | !ready | !abort | !maps | !score")
         threading.Thread(target=_bg, daemon=True).start()
 
     def close_lobby(self):
@@ -1276,17 +1940,43 @@ class BanchoRefereeBot:
         try:
             clean_pass = self.irc_password.replace("\r", "").replace("\n", "").strip()
             clean_user = self.username.replace("\r", "").replace("\n", "").strip().replace(" ", "_")
-            if not clean_pass or not clean_user:
-                self.log("❌ Kein IRC-Passwort oder Username vorhanden. Bitte in den Einstellungen hinterlegen!", "#FF5252")
+            if not clean_pass:
+                self.log("❌ FEHLERCODE [ERR_NO_IRC_PASSWORD]: Kein IRC-Passwort vorhanden! Bitte trage dein Server-Passwort von https://osu.ppy.sh/p/irc in den Einstellungen ein.", "#FF5252")
+                return
+            if not clean_user:
+                self.log("❌ FEHLERCODE [ERR_NO_USERNAME]: Kein osu! Spielername vorhanden!", "#FF5252")
                 return
 
-            self.log(f"🔒 Verbinde sicher mit Bancho IRC (irc.ppy.sh:6697 via TLS/SSL) als '{clean_user}'...", "#00E5FF")
-            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            raw_sock.settimeout(20)
-            ssl_ctx = ssl.create_default_context()
-            self.sock = ssl_ctx.wrap_socket(raw_sock, server_hostname="irc.ppy.sh")
-            self.sock.connect(("irc.ppy.sh", 6697))
-            self.connected = True
+            connected = False
+            for port, use_tls in [(6667, False), (6697, True)]:
+                try:
+                    self.log(f"🔒 Verbinde mit Bancho IRC (irc.ppy.sh:{port}{' TLS' if use_tls else ''}) als '{clean_user}'...", "#00E5FF")
+                    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    raw_sock.settimeout(6)
+                    if use_tls:
+                        ssl_ctx = ssl.create_default_context()
+                        ssl_ctx.check_hostname = False
+                        ssl_ctx.verify_mode = ssl.CERT_NONE
+                        self.sock = ssl_ctx.wrap_socket(raw_sock, server_hostname="irc.ppy.sh")
+                        self.sock.connect(("irc.ppy.sh", port))
+                    else:
+                        self.sock = raw_sock
+                        self.sock.connect(("irc.ppy.sh", port))
+                    self.connected = True
+                    connected = True
+                    break
+                except Exception as e_conn:
+                    self.log(f"⚠️ Verbindung auf Port {port} fehlgeschlagen: {e_conn}", "#FFA726")
+                    if self.sock:
+                        try: self.sock.close()
+                        except: pass
+                        self.sock = None
+
+            if not connected or not self.sock:
+                self.log("❌ FEHLERCODE [ERR_SOCKET_CONN]: Verbindung zu irc.ppy.sh fehlgeschlagen (Port 6697/6667 blockiert).", "#FF5252")
+                return
+
+            self.sock.settimeout(None)
             
             # Send standard Bancho IRC handshake
             self._send_raw(f"PASS {clean_pass}")
@@ -1299,90 +1989,146 @@ class BanchoRefereeBot:
                 try:
                     data = self.sock.recv(4096)
                     if not data:
+                        if self.running:
+                            self.log("⚠️ Verbindung von Bancho-Server geschlossen.", "#FFA726")
                         break
                     readbuffer += data.decode("utf-8", errors="ignore")
-                    lines = readbuffer.split("\r\n")
-                    readbuffer = lines.pop()
+                    if "\n" in readbuffer:
+                        lines = readbuffer.split("\n")
+                        readbuffer = lines.pop()
 
-                    for line in lines:
-                        if not line: continue
-                        
-                        # Respond to PING
-                        if line.startswith("PING"):
-                            self._send_raw(line.replace("PING", "PONG"))
-                            continue
+                        for raw_line in lines:
+                            line = raw_line.strip("\r").strip()
+                            if not line: continue
+                            
+                            # Respond to PING
+                            if line.startswith("PING"):
+                                self._send_raw(line.replace("PING", "PONG"))
+                                continue
 
-                        # Check for Bancho Authentication Failures
-                        if " 464 " in line or "Password incorrect" in line or "Bad authentication" in line or "Bad token" in line:
-                            self.log("❌ Authentifizierungs-Fehler (464): Das IRC-Passwort ist ungültig!", "#FF5252")
-                            self.log("ℹ️ WICHTIG: Verwende dein offizielles Server-Passwort von https://osu.ppy.sh/p/irc (NICHT dein osu!-Login-Passwort!).", "#FFA726")
-                            self.running = False
-                            return
+                            # Check for Bancho Authentication Failures
+                            if " 464 " in line or "Password incorrect" in line or "Bad authentication" in line or "Bad token" in line:
+                                self.log("❌ FEHLERCODE [ERR_AUTH_464]: Ungültiges Bancho IRC-Passwort!", "#FF5252")
+                                self.log("👉 WICHTIG: Verwende dein offizielles Server-Passwort von https://osu.ppy.sh/p/irc (NICHT dein normales osu!-Login-Passwort!).", "#FFA726")
+                                self.running = False
+                                return
 
-                        if " 433 " in line or "Nickname is already in use" in line:
-                            self.log(f"❌ Nickname '{clean_user}' ist bereits eingeloggt. Bitte schließe andere IRC-Clients.", "#FF5252")
+                            if " 433 " in line or "Nickname is already in use" in line:
+                                self.log(f"❌ FEHLERCODE [ERR_NICK_IN_USE_433]: Nickname '{clean_user}' ist bereits eingeloggt! Schließe bitte andere IRC-Clients.", "#FF5252")
 
-                        # Check for Bancho Login Successful
-                        if (" 001 " in line or "Welcome to osu!bancho" in line or "ChoToken" in line) and not logged_in:
-                            logged_in = True
-                            self.log(f"✅ Erfolgreich bei Bancho IRC eingeloggt als '{clean_user}'!", "#00E676")
-                            time.sleep(0.8)
-                            self.log(f"⚡ Sende Lobby-Erstellungsbefehl: !mp make {self.pending_lobby_name}", "#00E5FF")
-                            self._send_raw(f"PRIVMSG BanchoBot :!mp make {self.pending_lobby_name}")
+                            # Check for Bancho Login Successful
+                            if (" 001 " in line or "Welcome to" in line or "ChoToken" in line) and not logged_in:
+                                logged_in = True
+                                self.log(f"✅ Erfolgreich bei Bancho IRC eingeloggt als '{clean_user}'!", "#00E676")
+                                time.sleep(0.5)
+                                self.log(f"⚡ Sende Lobby-Erstellungsbefehl: !mp make {self.pending_lobby_name}", "#00E5FF")
+                                self._send_raw(f"PRIVMSG BanchoBot :!mp make {self.pending_lobby_name}")
 
-                        # Check for Match Created
-                        if "Created the tournament match" in line or "Joined channel #mp_" in line or "#mp_" in line or "/mp/" in line:
-                            match_m = re.search(r'(?:#mp_|/mp/)(\d+)', line)
-                            if match_m and not self.match_id:
-                                self.match_id = match_m.group(1)
-                                self.channel = f"#mp_{self.match_id}"
-                                self.log(f"🏆 Ingame-Lobby erfolgreich erstellt: {self.channel} (ID: {self.match_id})", "#00E676")
-                                self._send_raw(f"JOIN {self.channel}")
-                                if self.pending_password:
-                                    time.sleep(0.3)
-                                    self.send_mp(f"mp password {self.pending_password}")
-                                if self.on_match_created:
-                                    threading.Thread(target=lambda m_id=self.match_id, ch=self.channel: self.on_match_created(m_id, ch), daemon=True).start()
+                            # Check for Match Created
+                            if "Created the tournament match" in line or "Joined channel #mp_" in line or "#mp_" in line or "/mp/" in line or "JOIN :#mp_" in line:
+                                match_m = re.search(r'(?:#mp_|/mp/)(\d+)', line)
+                                if match_m and not self.match_id:
+                                    self.match_id = match_m.group(1)
+                                    self.channel = f"#mp_{self.match_id}"
+                                    self.log(f"🏆 Ingame-Lobby erfolgreich erstellt: {self.channel} (ID: {self.match_id})", "#00E676")
+                                    self._send_raw(f"JOIN {self.channel}")
+                                    if self.pending_password:
+                                        time.sleep(0.3)
+                                        self.send_mp(f"mp password {self.pending_password}")
+                                    if self.on_match_created:
+                                        threading.Thread(target=lambda m_id=self.match_id, ch=self.channel: self.on_match_created(m_id, ch), daemon=True).start()
 
-                        # Match Chat & events
-                        if "PRIVMSG" in line:
-                            parts = line.split("PRIVMSG", 1)
-                            sender = parts[0].split("!")[0].lstrip(":")
-                            target_ch = parts[1].split(":", 1)[0].strip()
-                            msg_content = parts[1].split(":", 1)[1].strip() if ":" in parts[1] else parts[1].strip()
-                            self.log(f"💬 [{sender}]: {msg_content}", "#dddddd")
+                            # Match Chat & events
+                            if "PRIVMSG" in line:
+                                parts = line.split("PRIVMSG", 1)
+                                sender = parts[0].split("!")[0].lstrip(":")
+                                target_ch = parts[1].split(":", 1)[0].strip()
+                                msg_content = parts[1].split(":", 1)[1].strip() if ":" in parts[1] else parts[1].strip()
+                                self.log(f"💬 [{sender}]: {msg_content}", "#dddddd")
 
-                            # Detect Player joined for Host Queue
-                            if sender == "BanchoBot" and "joined in slot" in msg_content:
-                                m_join = re.search(r'([A-Za-z0-9_\-\[\] ]+) joined in slot', msg_content)
-                                if m_join:
-                                    j_user = m_join.group(1).strip().replace(" ", "_")
-                                    if j_user not in self.host_queue:
-                                        self.host_queue.append(j_user)
+                                # Detect All players are ready event from BanchoBot -> Auto-start countdown
+                                if "all players are ready" in msg_content.lower() or "everyone is ready" in msg_content.lower():
+                                    self.log("🚀 Alle Spieler im Raum sind bereit! Starte 5s Countdown automatisch...", "#00E676")
+                                    self.start_countdown(5)
 
-                            # Detect Player left for Host Queue
-                            if sender == "BanchoBot" and "left the match" in msg_content:
-                                m_left = re.search(r'([A-Za-z0-9_\-\[\] ]+) left the match', msg_content)
-                                if m_left:
-                                    l_user = m_left.group(1).strip().replace(" ", "_")
-                                    if l_user in self.host_queue:
-                                        self.host_queue.remove(l_user)
+                                # Detect ScoreV2 finished playing event from BanchoBot
+                                if sender == "BanchoBot" and "finished playing" in msg_content:
+                                    m_score = re.search(r'(.+?)\s+finished playing\s*\(\s*Score:\s*(\d+)\s*,\s*(PASSED|FAILED)\s*\)', msg_content)
+                                    if m_score:
+                                        p_user = m_score.group(1).strip()
+                                        p_score = int(m_score.group(2))
+                                        p_status = m_score.group(3)
+                                        self.log(f"🎯 ScoreV2 erfasst für {p_user}: {p_score:,} ({p_status})", "#00E676")
+                                        if self.on_player_score:
+                                            threading.Thread(target=lambda u=p_user, s=p_score, st=p_status, r=msg_content: self.on_player_score(u, s, st, r), daemon=True).start()
+                                    else:
+                                        # Fallback extraction
+                                        m_sc_num = re.search(r'Score:\s*(\d+)', msg_content)
+                                        m_st_txt = re.search(r'(PASSED|FAILED)', msg_content)
+                                        if m_sc_num:
+                                            p_score = int(m_sc_num.group(1))
+                                            p_status = m_st_txt.group(1) if m_st_txt else "PASSED"
+                                            p_user = msg_content.split("finished")[0].strip() if "finished" in msg_content else self.username
+                                            self.log(f"🎯 ScoreV2 erfasst (Fallback) für {p_user}: {p_score:,} ({p_status})", "#00E676")
+                                            if self.on_player_score:
+                                                threading.Thread(target=lambda u=p_user, s=p_score, st=p_status, r=msg_content: self.on_player_score(u, s, st, r), daemon=True).start()
 
-                            # Detect finished round from BanchoBot
-                            if sender == "BanchoBot" and ("Match has ended" in msg_content or "All players finished" in msg_content or "finished playing" in msg_content):
-                                self.log("🔔 Runde in osu! beendet! Werte Ergebnisse aus...", "#00E5FF")
-                                if self.is_host_rotation_mode:
-                                    threading.Thread(target=lambda: (time.sleep(2.0), self.rotate_next_host()), daemon=True).start()
-                                if self.on_round_ended:
-                                    self.on_round_ended()
+                                # Detect Beatmap changed confirmation
+                                if sender == "BanchoBot" and "Beatmap changed to:" in msg_content:
+                                    m_bm = re.search(r'Beatmap changed to:\s*(.+?)\s*\(https?://osu\.ppy\.sh/b/(\d+)\)', msg_content)
+                                    if m_bm:
+                                        b_title = m_bm.group(1).strip()
+                                        b_id = int(m_bm.group(2))
+                                        self.log(f"🗺️ Beatmap aktiv: {b_title} (ID: {b_id})", "#BA68C8")
+                                        if self.on_map_changed:
+                                            threading.Thread(target=lambda t=b_title, bid=b_id: self.on_map_changed(t, bid), daemon=True).start()
 
-                            # Detect in-game chat commands from players (Romaji style)
-                            if msg_content.startswith("!") and sender != "BanchoBot":
-                                cmd_parts = msg_content[1:].strip().split(" ", 1)
-                                cmd = cmd_parts[0].lower()
-                                arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
-                                if self.on_chat_command:
-                                    threading.Thread(target=lambda s=sender, c=cmd, a=arg, f=msg_content: self.on_chat_command(s, c, a, f), daemon=True).start()
+                                # Detect Settings changed confirmation
+                                if sender == "BanchoBot" and "Changed match settings to" in msg_content:
+                                    m_set = re.search(r'Changed match settings to\s*(.+)', msg_content)
+                                    if m_set:
+                                        s_txt = m_set.group(1).strip()
+                                        self.log(f"⚙️ Match-Einstellungen: {s_txt}", "#FF9800")
+                                        if self.on_match_settings:
+                                            threading.Thread(target=lambda s=s_txt: self.on_match_settings(s), daemon=True).start()
+
+                                # Detect Player joined
+                                if sender == "BanchoBot" and "joined in slot" in msg_content:
+                                    m_join = re.search(r'([A-Za-z0-9_\-\[\] ]+) joined in slot (\d+)(?: for team (blue|red))?', msg_content)
+                                    if m_join:
+                                        j_user = m_join.group(1).strip().replace(" ", "_")
+                                        j_slot = int(m_join.group(2))
+                                        j_team = m_join.group(3) or ""
+                                        if j_user not in self.host_queue:
+                                            self.host_queue.append(j_user)
+                                        if self.on_player_joined:
+                                            threading.Thread(target=lambda u=j_user, sl=j_slot, tm=j_team: self.on_player_joined(u, sl, tm), daemon=True).start()
+
+                                # Detect Player left
+                                if sender == "BanchoBot" and "left the match" in msg_content:
+                                    m_left = re.search(r'([A-Za-z0-9_\-\[\] ]+) left the match', msg_content)
+                                    if m_left:
+                                        l_user = m_left.group(1).strip().replace(" ", "_")
+                                        if l_user in self.host_queue:
+                                            self.host_queue.remove(l_user)
+                                        if self.on_player_left:
+                                            threading.Thread(target=lambda u=l_user: self.on_player_left(u), daemon=True).start()
+
+                                # Detect finished round from BanchoBot
+                                if sender == "BanchoBot" and ("Match has ended" in msg_content or "All players have finished playing" in msg_content):
+                                    self.log("🔔 Runde in osu! beendet! Werte Ergebnisse aus...", "#00E5FF")
+                                    if self.is_host_rotation_mode:
+                                        threading.Thread(target=lambda: (time.sleep(2.0), self.rotate_next_host()), daemon=True).start()
+                                    if self.on_round_ended:
+                                        self.on_round_ended()
+
+                                # Detect in-game chat commands from players (Romaji style)
+                                if msg_content.startswith("!") and sender != "BanchoBot":
+                                    cmd_parts = msg_content[1:].strip().split(" ", 1)
+                                    cmd = cmd_parts[0].lower()
+                                    arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+                                    if self.on_chat_command:
+                                        threading.Thread(target=lambda s=sender, c=cmd, a=arg, f=msg_content: self.on_chat_command(s, c, a, f), daemon=True).start()
 
                 except socket.timeout:
                     self._send_raw("PING irc.ppy.sh")
@@ -3016,6 +3762,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         appdata_dir = os.path.dirname(getattr(self, 'settings_file', '')) if getattr(self, 'settings_file', '') else '.'
         self.session_recaps_file = os.path.join(appdata_dir, "session_recaps_history.json")
         self.session_recaps_history = self.load_session_recaps_history()
+        self.ai_conversations_file = os.path.join(appdata_dir, "ai_chat_conversations.json")
+        self.ai_conversations = self.load_ai_conversations()
         self._osu_closed_timer_start = None
         self._session_recap_modal_shown = False
         self._processed_session_play_ids = set()
@@ -3150,6 +3898,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         else:
             self.settings_file = 'global_settings.json'
         data = safe_json_load(self.settings_file, default={})
+        if not data and os.path.exists('global_settings.json'):
+            data = safe_json_load('global_settings.json', default={})
         if data:
             try:
                 if data.get('osu_username'): self.osu_username = data.get('osu_username')
@@ -3205,6 +3955,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         }
         try:
             safe_atomic_json_dump(data, self.settings_file, indent=4)
+        except Exception:
+            pass
+        try:
+            safe_atomic_json_dump(data, 'global_settings.json', indent=4)
         except Exception:
             pass
 
@@ -3449,69 +4203,64 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
             c1 = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c1.pack(fill="x", pady=6)
+            sync_var = ctk.BooleanVar(value=getattr(self, "auto_background_sync", True))
+            def on_sync_toggle():
+                self.auto_background_sync = sync_var.get()
+                self.save_global_settings()
+            ctk.CTkSwitch(c1, text="", variable=sync_var, command=on_sync_toggle, progress_color="#00BFA5", width=45).pack(side="right", padx=16, pady=10)
+
             c1_text = ctk.CTkFrame(c1, fg_color="transparent")
-            c1_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
+            c1_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
             c1_h = ctk.CTkFrame(c1_text, fg_color="transparent")
             c1_h.pack(fill="x")
             ctk.CTkLabel(c1_h, text="Intelligenter Hintergrund-Sync", font=("Arial", 14, "bold"), text_color="#ffffff").pack(side="left")
             ctk.CTkLabel(c1_h, text=" EMPFOHLEN ", font=("Arial", 10, "bold"), fg_color="#00BFA5", text_color="#000000", corner_radius=4).pack(side="left", padx=8)
             ctk.CTkLabel(c1_text, text="Erkennt automatisch, wenn osu! gestartet wird, und synchronisiert Scores live (0% CPU/RAM-Last).",
-                         font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(3, 0))
-            
-            sync_var = ctk.BooleanVar(value=getattr(self, "auto_background_sync", True))
-            def on_sync_toggle():
-                self.auto_background_sync = sync_var.get()
-                self.save_global_settings()
-            ctk.CTkSwitch(c1, text="", variable=sync_var, command=on_sync_toggle, progress_color="#00BFA5", width=45).pack(side="right", padx=16)
+                         font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(3, 0))
 
             c2 = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c2.pack(fill="x", pady=6)
-            c2_text = ctk.CTkFrame(c2, fg_color="transparent")
-            c2_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c2_text, text="Replays nach Training-Import löschen", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c2_text, text="Löscht importierte .osr Replay-Dateien automatisch aus dem osu!-Ordner, um Speicherplatz zu sparen.",
-                         font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(3, 0))
-            
             del_var = ctk.BooleanVar(value=self.data.get("delete_replays", False))
             def on_del_toggle():
                 self.data["delete_replays"] = del_var.get()
                 self.save_settings()
-            ctk.CTkSwitch(c2, text="", variable=del_var, command=on_del_toggle, progress_color="#3b8ed0", width=45).pack(side="right", padx=16)
+            ctk.CTkSwitch(c2, text="", variable=del_var, command=on_del_toggle, progress_color="#3b8ed0", width=45).pack(side="right", padx=16, pady=10)
+
+            c2_text = ctk.CTkFrame(c2, fg_color="transparent")
+            c2_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c2_text, text="Replays nach Training-Import löschen", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c2_text, text="Löscht importierte .osr Replay-Dateien automatisch aus dem osu!-Ordner, um Speicherplatz zu sparen.",
+                         font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(3, 0))
 
             c3 = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c3.pack(fill="x", pady=6)
-            c3_text = ctk.CTkFrame(c3, fg_color="transparent")
-            c3_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c3_text, text="Automatisch mit Windows starten", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c3_text, text="Startet UHO Hub lautlos im Hintergrund, sobald du deinen PC hochfährst.",
-                         font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(3, 0))
-            
             auto_win_var = ctk.BooleanVar(value=is_windows_autostart_enabled())
             def on_autostart_toggle():
                 set_windows_autostart(auto_win_var.get())
-            ctk.CTkSwitch(c3, text="", variable=auto_win_var, command=on_autostart_toggle, progress_color="#00E5FF", width=45).pack(side="right", padx=16)
+            ctk.CTkSwitch(c3, text="", variable=auto_win_var, command=on_autostart_toggle, progress_color="#00E5FF", width=45).pack(side="right", padx=16, pady=10)
+
+            c3_text = ctk.CTkFrame(c3, fg_color="transparent")
+            c3_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c3_text, text="Automatisch mit Windows starten", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c3_text, text="Startet UHO Hub lautlos im Hintergrund, sobald du deinen PC hochfährst.",
+                         font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(3, 0))
 
         elif active_tab == "accounts":
             ctk.CTkLabel(scroll_content, text="OSU! ACCOUNT VERKNÜPFUNG", font=("Arial", 11, "bold"), text_color="#666677").pack(anchor="w", pady=(15, 8))
 
             c_u = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_u.pack(fill="x", pady=6)
-            c_u_text = ctk.CTkFrame(c_u, fg_color="transparent")
-            c_u_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c_u_text, text="osu! Ingame Name", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c_u_text, text="Dein exakter Spielername in osu! für automatisches Score-Tracking.", font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
-            
             user_entry = ctk.CTkEntry(c_u, width=200, placeholder_text="Username eingeben...")
             if getattr(self, "osu_username", ""): user_entry.insert(0, self.osu_username)
-            user_entry.pack(side="right", padx=16)
+            user_entry.pack(side="right", padx=16, pady=10)
+
+            c_u_text = ctk.CTkFrame(c_u, fg_color="transparent")
+            c_u_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c_u_text, text="osu! Ingame Name", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c_u_text, text="Dein exakter Spielername in osu! für automatisches Score-Tracking.", font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(2, 0))
 
             c_k = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_k.pack(fill="x", pady=6)
-            c_k_text = ctk.CTkFrame(c_k, fg_color="transparent")
-            c_k_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c_k_text, text="osu! API Key (v1)", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c_k_text, text="Ermöglicht den Live-Abgleich von Plays direkt von den osu!-Servern.", font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
-            
             k_right = ctk.CTkFrame(c_k, fg_color="transparent")
             k_right.pack(side="right", padx=16, pady=10)
             key_entry = ctk.CTkEntry(k_right, width=180, show="*", placeholder_text="API Key...")
@@ -3522,14 +4271,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 webbrowser.open("https://osu.ppy.sh/p/api")
             ctk.CTkButton(k_right, text="🌐 Holen", width=70, height=32, fg_color="#2d3748", hover_color="#4a5568", command=open_api_tut).pack(side="left")
 
+            c_k_text = ctk.CTkFrame(c_k, fg_color="transparent")
+            c_k_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c_k_text, text="osu! API Key (v1)", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c_k_text, text="Ermöglicht den Live-Abgleich von Plays direkt von den osu!-Servern.", font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(2, 0))
+
             # osu! IRC Password for Automated Referee Bot
             c_irc = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_irc.pack(fill="x", pady=6)
-            c_irc_text = ctk.CTkFrame(c_irc, fg_color="transparent")
-            c_irc_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c_irc_text, text="osu! IRC Server Passwort (Optional für Multiplayer Host-Bot)", font=("Arial", 14, "bold"), text_color="#00BFA5").pack(anchor="w")
-            ctk.CTkLabel(c_irc_text, text="Erlaubt dem automatischen Referee-Bot, Ingame-Lobbies zu erstellen und Spieler einzuladen.", font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
-
             irc_right = ctk.CTkFrame(c_irc, fg_color="transparent")
             irc_right.pack(side="right", padx=16, pady=10)
             irc_entry = ctk.CTkEntry(irc_right, width=180, show="*", placeholder_text="Server-Passwort...")
@@ -3540,16 +4289,22 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 webbrowser.open("https://osu.ppy.sh/p/irc")
             ctk.CTkButton(irc_right, text="🔑 Holen", width=70, height=32, fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=open_irc_page).pack(side="left")
 
+            c_irc_text = ctk.CTkFrame(c_irc, fg_color="transparent")
+            c_irc_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c_irc_text, text="osu! IRC Server Passwort (Optional für Multiplayer Host-Bot)", font=("Arial", 14, "bold"), text_color="#00BFA5").pack(anchor="w")
+            ctk.CTkLabel(c_irc_text, text="Erlaubt dem automatischen Referee-Bot, Ingame-Lobbies zu erstellen und Spieler einzuladen.", font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(2, 0))
+
             ctk.CTkLabel(scroll_content, text="UHO HUB LIZENZ & STATUS", font=("Arial", 11, "bold"), text_color="#666677").pack(anchor="w", pady=(20, 8))
             c_uho = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_uho.pack(fill="x", pady=6)
+            ctk.CTkLabel(c_uho, text=" ✅ AKTIV ", font=("Arial", 11, "bold"), fg_color="#1b382b", text_color="#4CAF50", corner_radius=6).pack(side="right", padx=16, pady=10)
+
             c_uho_text = ctk.CTkFrame(c_uho, fg_color="transparent")
-            c_uho_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
+            c_uho_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
             ctk.CTkLabel(c_uho_text, text="UHO API-Key Status", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
             key_preview = getattr(self, "uho_api_key", "Kein Key")
             if len(key_preview) > 10: key_preview = key_preview[:7] + "..." + key_preview[-4:]
-            ctk.CTkLabel(c_uho_text, text=f"Key: {key_preview} (An diesen Computer gebunden)", font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
-            ctk.CTkLabel(c_uho, text=" ✅ AKTIV ", font=("Arial", 11, "bold"), fg_color="#1b382b", text_color="#4CAF50", corner_radius=6).pack(side="right", padx=16)
+            ctk.CTkLabel(c_uho_text, text=f"Key: {key_preview} (An diesen Computer gebunden)", font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(2, 0))
 
             def save_account_settings():
                 self.osu_username = user_entry.get().strip()
@@ -3570,15 +4325,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
             c_ai = ctk.CTkFrame(scroll_content, fg_color="#231c26", corner_radius=10, border_width=1, border_color="#E91E63")
             c_ai.pack(fill="x", pady=6)
-            c_ai_text = ctk.CTkFrame(c_ai, fg_color="transparent")
-            c_ai_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            c_ai_h = ctk.CTkFrame(c_ai_text, fg_color="transparent")
-            c_ai_h.pack(fill="x")
-            ctk.CTkLabel(c_ai_h, text="Gemini API Key", font=("Arial", 14, "bold"), text_color="#ffffff").pack(side="left")
-            ctk.CTkLabel(c_ai_h, text=" ⭐ DRINGEND EMPFOHLEN ", font=("Arial", 10, "bold"), fg_color="#E91E63", text_color="#ffffff", corner_radius=4).pack(side="left", padx=8)
-            ctk.CTkLabel(c_ai_text, text="Schaltet den intelligenten KI-Coach frei für personalisierte Trainingspläne und Fehleranalysen.",
-                         font=("Arial", 11), text_color="#bb99aa").pack(anchor="w", pady=(3, 0))
-            
             ai_right = ctk.CTkFrame(c_ai, fg_color="transparent")
             ai_right.pack(side="right", padx=16, pady=10)
             gemini_entry = ctk.CTkEntry(ai_right, width=200, show="*", placeholder_text="AIzaSy...")
@@ -3589,19 +4335,28 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 webbrowser.open("https://aistudio.google.com/app/apikey")
             ctk.CTkButton(ai_right, text="🔑 Gratis holen", width=95, height=32, fg_color="#E91E63", hover_color="#C2185B", command=open_gemini_get).pack(side="left")
 
+            c_ai_text = ctk.CTkFrame(c_ai, fg_color="transparent")
+            c_ai_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            c_ai_h = ctk.CTkFrame(c_ai_text, fg_color="transparent")
+            c_ai_h.pack(fill="x")
+            ctk.CTkLabel(c_ai_h, text="Gemini API Key", font=("Arial", 14, "bold"), text_color="#ffffff").pack(side="left")
+            ctk.CTkLabel(c_ai_h, text=" ⭐ DRINGEND EMPFOHLEN ", font=("Arial", 10, "bold"), fg_color="#E91E63", text_color="#ffffff", corner_radius=4).pack(side="left", padx=8)
+            ctk.CTkLabel(c_ai_text, text="Schaltet den intelligenten KI-Coach frei für personalisierte Trainingspläne und Fehleranalysen.",
+                         font=("Arial", 11), text_color="#bb99aa", wraplength=460, justify="left").pack(anchor="w", pady=(3, 0))
+
             c_m = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_m.pack(fill="x", pady=6)
-            c_m_text = ctk.CTkFrame(c_m, fg_color="transparent")
-            c_m_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c_m_text, text="Bevorzugtes KI-Modell", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c_m_text, text="Gemini 3.6 Flash ist das neueste und schnellste Modell von Google DeepMind.", font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
-
             model_dropdown = ctk.CTkOptionMenu(c_m, values=["gemini-3.6-flash (Empfohlen)", "gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
                                                 width=220, fg_color="#2d3748", button_color="#4a5568")
             current_m = getattr(self, "selected_ai_model", "gemini-3.6-flash")
             for val in model_dropdown._values:
                 if current_m in val: model_dropdown.set(val)
-            model_dropdown.pack(side="right", padx=16)
+            model_dropdown.pack(side="right", padx=16, pady=10)
+
+            c_m_text = ctk.CTkFrame(c_m, fg_color="transparent")
+            c_m_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c_m_text, text="Bevorzugtes KI-Modell", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c_m_text, text="Gemini 3.6 Flash ist das neueste und schnellste Modell von Google DeepMind.", font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(2, 0))
 
             def save_ai_settings():
                 self.gemini_key = gemini_entry.get().strip()
@@ -3621,17 +4376,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
             c_log = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_log.pack(fill="x", pady=6)
-
-            c_log_text = ctk.CTkFrame(c_log, fg_color="transparent")
-            c_log_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-
-            log_count = len(getattr(self, "ai_debug_logs", []))
-            ctk.CTkLabel(c_log_text, text=f"📋 KI-Gedankengang & Fehler-Protokoll ({log_count} Events)", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c_log_text, text="Protokolliert automatisch alle Prompts, Gemini-Gedankengänge, Roh-Antworten und Score-Berechnungen zur Fehlerbehebung.",
-                         font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
-
-            log_actions = ctk.CTkFrame(c_log, fg_color="transparent")
-            log_actions.pack(side="right", padx=16, pady=10)
 
             def export_ai_diagnostics():
                 desktop = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
@@ -3705,6 +4449,28 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                             report_lines.append(f"\n💡 GEMINI ROH-ANTWORT & GEDANKENGANG:\n{item.get('raw_ai_response')}")
                         report_lines.append("-" * 60)
                         
+                # Section 6: Full Multi-Turn Conversation Transcripts
+                report_lines.extend([
+                    "",
+                    "💬 6. VOLLSTÄNDIGE KONVERSATIONS-TRANSKRIPTE (KI-GESPRÄCHS-GEDÄCHTNIS)",
+                    "-" * 75
+                ])
+                conv_data = getattr(self, "ai_conversations", {})
+                all_convs = conv_data.get("conversations", []) if isinstance(conv_data, dict) else []
+                if not all_convs:
+                    report_lines.append("  (Noch keine Konversationen im Chat-Speicher)")
+                else:
+                    for c_idx, c in enumerate(all_convs):
+                        c_title = c.get("title", f"Chat #{c_idx+1}")
+                        c_updated = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c.get('updated_at', c.get('created_at', time.time()))))
+                        report_lines.append(f"\n📁 [KONVERSATION #{c_idx+1}] {c_title} (Zuletzt aktiv: {c_updated})")
+                        report_lines.append("=" * 60)
+                        for m in c.get("messages", []):
+                            r_icon = "👤 SPIELER" if m.get("role") == "user" else "🤖 KI-COACH"
+                            t_str = m.get("timestamp", "-")
+                            report_lines.append(f"[{t_str}] {r_icon}:\n{m.get('text', '')}\n")
+                        report_lines.append("-" * 60)
+                        
                 content = "\n".join(report_lines)
                 try:
                     with open(out_file, "w", encoding="utf-8") as f:
@@ -3718,7 +4484,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 except Exception as e:
                     self.show_message("Fehler beim Export", f"Konnte Datei nicht schreiben: {e}")
 
+                # Update count label
+                if 'c_log_title' in locals() and c_log_title.winfo_exists():
+                    c_log_title.configure(text=f"📋 KI-Gedankengang & Fehler-Protokoll ({len(getattr(self, 'ai_debug_logs', []))} Events)")
+
+            log_actions = ctk.CTkFrame(c_log, fg_color="transparent")
+            log_actions.pack(side="right", padx=16, pady=10)
             ctk.CTkButton(log_actions, text="📋 Log exportieren", width=145, height=34, fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", font=("Arial", 12, "bold"), command=export_ai_diagnostics).pack(side="right")
+
+            c_log_text = ctk.CTkFrame(c_log, fg_color="transparent")
+            c_log_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            log_count = len(getattr(self, "ai_debug_logs", []))
+            c_log_title = ctk.CTkLabel(c_log_text, text=f"📋 KI-Gedankengang & Fehler-Protokoll ({log_count} Events)", font=("Arial", 14, "bold"), text_color="#ffffff")
+            c_log_title.pack(anchor="w")
+            ctk.CTkLabel(c_log_text, text="Protokolliert automatisch alle Prompts, Gemini-Gedankengänge, Roh-Antworten und Score-Berechnungen zur Fehlerbehebung.",
+                         font=("Arial", 11), text_color="#888899", wraplength=460, justify="left").pack(anchor="w", pady=(2, 0))
 
             # Danger Zone: Reset AI Memory Card
             ctk.CTkLabel(scroll_content, text="GEFÄHRLICHE ZONE (RESET)", font=("Arial", 11, "bold"), text_color="#ff5252").pack(anchor="w", pady=(22, 8))
@@ -3726,14 +4506,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             c_danger = ctk.CTkFrame(scroll_content, fg_color="#241418", corner_radius=10, border_width=1, border_color="#c62828")
             c_danger.pack(fill="x", pady=6)
 
+            btn_danger = ctk.CTkButton(c_danger, text="🗑️ KI-Gedächtnis zurücksetzen...", font=("Arial", 12, "bold"), height=36, width=220,
+                          fg_color="#c62828", hover_color="#b71c1c", text_color="#ffffff", command=self.show_reset_ai_memory_modal)
+            btn_danger.pack(side="right", padx=16, pady=10)
+
             c_danger_text = ctk.CTkFrame(c_danger, fg_color="transparent")
-            c_danger_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
+            c_danger_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
             ctk.CTkLabel(c_danger_text, text="🔥 Alle gelernten KI-Daten & Gedächtnis löschen", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
             ctk.CTkLabel(c_danger_text, text="Setzt alle erlernten Schwächen, Vorlieben, Daumen-Feedbacks, Replay-Telemetrien, Hardware-Setups und den Skill-Radar vollständig auf Werkseinstellung zurück (Sicherheits-Bestätigung erforderlich).",
-                         font=("Arial", 11), text_color="#ffcdd2").pack(anchor="w", pady=(2, 0))
-
-            ctk.CTkButton(c_danger, text="🗑️ KI-Gedächtnis zurücksetzen...", font=("Arial", 12, "bold"), height=36, width=220,
-                          fg_color="#c62828", hover_color="#b71c1c", text_color="#ffffff", command=self.show_reset_ai_memory_modal).pack(side="right", padx=16)
+                         font=("Arial", 11), text_color="#ffcdd2", wraplength=460, justify="left").pack(anchor="w", pady=(2, 0))
 
         elif active_tab == "about":
             ctk.CTkLabel(scroll_content, text="APP INFORMATIONEN & UPDATES", font=("Arial", 11, "bold"), text_color="#666677").pack(anchor="w", pady=(15, 8))
@@ -3741,10 +4522,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             # Auto-Update Card
             c_up = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_up.pack(fill="x", pady=6)
-            c_up_text = ctk.CTkFrame(c_up, fg_color="transparent")
-            c_up_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c_up_text, text=f"UHO Hub Version v{CURRENT_APP_VERSION}", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c_up_text, text=f"GitHub: {GITHUB_REPO} • 1-Klick Auto-Update aktiv", font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
 
             def manual_check_update():
                 c_up_btn.configure(state="disabled", text="⏳ Suche...")
@@ -3756,27 +4533,34 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
             c_up_btn = ctk.CTkButton(c_up, text="🔄 Nach Updates suchen", font=("Arial", 12, "bold"), height=34, width=170,
                                      fg_color="#3b8ed0", hover_color="#1f538d", command=manual_check_update)
-            c_up_btn.pack(side="right", padx=16)
+            c_up_btn.pack(side="right", padx=16, pady=10)
+
+            c_up_text = ctk.CTkFrame(c_up, fg_color="transparent")
+            c_up_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c_up_text, text=f"UHO Hub Version v{CURRENT_APP_VERSION}", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c_up_text, text=f"GitHub: {GITHUB_REPO} • 1-Klick Auto-Update aktiv", font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(2, 0))
 
             c_tut = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_tut.pack(fill="x", pady=6)
-            c_tut_text = ctk.CTkFrame(c_tut, fg_color="transparent")
-            c_tut_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c_tut_text, text="Einführung / Tutorial erneut ansehen", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c_tut_text, text="Öffnet die Übersicht aller Funktionen und Empfehlungen.", font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
             ctk.CTkButton(c_tut, text="📖 Tutorial öffnen", font=("Arial", 12, "bold"), height=34, width=170,
-                          fg_color="#2b2b38", hover_color="#3a3a4c", command=self.show_tutorial_welcome).pack(side="right", padx=16)
+                          fg_color="#2b2b38", hover_color="#3a3a4c", command=self.show_tutorial_welcome).pack(side="right", padx=16, pady=10)
+
+            c_tut_text = ctk.CTkFrame(c_tut, fg_color="transparent")
+            c_tut_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c_tut_text, text="Einführung / Tutorial erneut ansehen", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c_tut_text, text="Öffnet die Übersicht aller Funktionen und Empfehlungen.", font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(2, 0))
 
             c_dc = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
             c_dc.pack(fill="x", pady=6)
-            c_dc_text = ctk.CTkFrame(c_dc, fg_color="transparent")
-            c_dc_text.pack(side="left", padx=16, pady=14, fill="x", expand=True)
-            ctk.CTkLabel(c_dc_text, text="Support & Entwickler-Kontakt", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
-            ctk.CTkLabel(c_dc_text, text="Discord: Kingmaster0550 • Schreibe mich bei Fragen oder Ideen gerne an!", font=("Arial", 11), text_color="#888899").pack(anchor="w", pady=(2, 0))
             def open_support_dc():
                 webbrowser.open("https://discord.com/users/kingmaster0550")
             ctk.CTkButton(c_dc, text="💬 Discord Profil", font=("Arial", 12, "bold"), height=34, width=170,
-                          fg_color="#5865F2", hover_color="#4752C4", command=open_support_dc).pack(side="right", padx=16)
+                          fg_color="#5865F2", hover_color="#4752C4", command=open_support_dc).pack(side="right", padx=16, pady=10)
+
+            c_dc_text = ctk.CTkFrame(c_dc, fg_color="transparent")
+            c_dc_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+            ctk.CTkLabel(c_dc_text, text="Support & Entwickler-Kontakt", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
+            ctk.CTkLabel(c_dc_text, text="Discord: Kingmaster0550 • Schreibe mich bei Fragen oder Ideen gerne an!", font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(2, 0))
 
     def show_api_settings(self):
         self.show_settings(active_tab="accounts")
@@ -4019,81 +4803,494 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         threading.Thread(target=_update_thread, daemon=True).start()
 
     # ---------------------------------------------------------------------------
-    # MODERNE CHAT UI (GEMINI & ANTIGRAVITY STYLE)
+    # MULTI-CONVERSATION & CHAT MEMORY SYSTEM (SIDEBAR, MULTI-TURN & AUTO-TITLE)
     # ---------------------------------------------------------------------------
+    def load_ai_conversations(self):
+        """Loads persistent multi-turn AI conversations from JSON with atomic recovery."""
+        appdata_dir = os.path.dirname(getattr(self, 'settings_file', '')) if getattr(self, 'settings_file', '') else '.'
+        conv_file = getattr(self, "ai_conversations_file", os.path.join(appdata_dir, "ai_chat_conversations.json"))
+        default_data = {
+            "active_id": "conv_default",
+            "conversations": [
+                {
+                    "id": "conv_default",
+                    "title": "Neuer Chat",
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                    "messages": [
+                        {
+                            "role": "model",
+                            "text": "Hallo! Ich bin dein offizieller UHO Hub KI-Coach. Ich kenne deinen genauen Trainingsfortschritt, deine Skill-Werte und alle Pro-Techniken (KHZ-Methode, Reading, Mappools, Ergonomie, osu! Mods & Aim).\n\nWie kann ich dir bei deiner heutigen Session helfen?",
+                            "timestamp": time.strftime("%H:%M")
+                        }
+                    ]
+                }
+            ]
+        }
+        loaded = safe_json_load(conv_file, default=default_data)
+        if not isinstance(loaded, dict) or "conversations" not in loaded or not loaded["conversations"]:
+            loaded = default_data
+        
+        conv_ids = [c["id"] for c in loaded.get("conversations", []) if isinstance(c, dict) and "id" in c]
+        if not conv_ids:
+            loaded = default_data
+        elif loaded.get("active_id") not in conv_ids:
+            loaded["active_id"] = conv_ids[0]
+            
+        return loaded
+
+    def save_ai_conversations(self):
+        """Saves persistent AI conversations atomically to JSON."""
+        appdata_dir = os.path.dirname(getattr(self, 'settings_file', '')) if getattr(self, 'settings_file', '') else '.'
+        conv_file = getattr(self, "ai_conversations_file", os.path.join(appdata_dir, "ai_chat_conversations.json"))
+        try:
+            if hasattr(self, "ai_conversations") and isinstance(self.ai_conversations, dict):
+                safe_atomic_json_dump(self.ai_conversations, conv_file, indent=2)
+        except Exception:
+            pass
+
+    def get_active_ai_conversation(self):
+        """Returns the currently active conversation dictionary."""
+        if not hasattr(self, "ai_conversations") or not isinstance(self.ai_conversations, dict):
+            self.ai_conversations = self.load_ai_conversations()
+        
+        convs = self.ai_conversations.get("conversations", [])
+        active_id = self.ai_conversations.get("active_id")
+        
+        for c in convs:
+            if c.get("id") == active_id:
+                return c
+        
+        if convs:
+            self.ai_conversations["active_id"] = convs[0].get("id")
+            return convs[0]
+            
+        return self.create_new_ai_conversation()
+
+    def create_new_ai_conversation(self, title="Neuer Chat"):
+        """Creates a brand new conversation and sets it as active."""
+        if not hasattr(self, "ai_conversations") or not isinstance(self.ai_conversations, dict):
+            self.ai_conversations = self.load_ai_conversations()
+            
+        new_id = f"conv_{int(time.time()*1000)}_{len(self.ai_conversations.get('conversations', []))+1}"
+        new_conv = {
+            "id": new_id,
+            "title": title,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "messages": [
+                {
+                    "role": "model",
+                    "text": "Hallo! Ich bin dein offizieller UHO Hub KI-Coach. Frag mich alles zu Training, Beatmaps, Replay-Analysen, Ergonomie oder osu! Mods!\n\nWie kann ich dir helfen?",
+                    "timestamp": time.strftime("%H:%M")
+                }
+            ]
+        }
+        if "conversations" not in self.ai_conversations:
+            self.ai_conversations["conversations"] = []
+        self.ai_conversations["conversations"].insert(0, new_conv)
+        self.ai_conversations["active_id"] = new_id
+        self.save_ai_conversations()
+        return new_conv
+
+    def switch_ai_conversation(self, conv_id):
+        """Switches the active conversation and re-renders UI."""
+        if not hasattr(self, "ai_conversations") or not isinstance(self.ai_conversations, dict):
+            return
+        convs = self.ai_conversations.get("conversations", [])
+        if any(c.get("id") == conv_id for c in convs):
+            self.ai_conversations["active_id"] = conv_id
+            self.save_ai_conversations()
+            self.refresh_modern_chat_ui()
+
+    def delete_ai_conversation(self, conv_id):
+        """Deletes a conversation. If active, selects the next available or creates a new one."""
+        if not hasattr(self, "ai_conversations") or not isinstance(self.ai_conversations, dict):
+            return
+        convs = self.ai_conversations.get("conversations", [])
+        self.ai_conversations["conversations"] = [c for c in convs if c.get("id") != conv_id]
+        
+        if not self.ai_conversations["conversations"]:
+            self.create_new_ai_conversation()
+        elif self.ai_conversations.get("active_id") == conv_id:
+            self.ai_conversations["active_id"] = self.ai_conversations["conversations"][0].get("id")
+            
+        self.save_ai_conversations()
+        self.refresh_modern_chat_ui()
+
+    def auto_generate_chat_title(self, first_msg):
+        """Generates a concise 2-4 word German topic title based on the user's first query."""
+        if not first_msg:
+            return "Allgemeine Frage"
+        t = first_msg.strip().replace("\n", " ")
+        t_low = t.lower()
+        
+        # Check map recommendations first if star rating is present
+        sr_m = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:★|star|sterne)', t_low)
+        if sr_m:
+            return f"{sr_m.group(1)}★ Map-Empfehlungen"
+
+        if any(w in t_low for w in ["handgelenk", "schmerz", "verletz", "sehne", "autopilot"]) or re.search(r'\bap\b', t_low):
+            return "Handgelenk & Autopilot"
+        if any(w in t_low for w in ["relax", "flow aim"]) or re.search(r'\brx\b', t_low):
+            return "Relax & Aim-Training"
+        if any(w in t_low for w in ["stream", "khz", "deathstream"]):
+            return "Stream & KHZ-Methode"
+        if any(w in t_low for w in ["speed", "burst", "220 bpm", "bpm"]):
+            return "Speed & Burst-Training"
+        if any(w in t_low for w in ["jump", "aim", "cross-screen", "snap"]):
+            return "Jump-Aim & Snapping"
+        if any(w in t_low for w in ["tech", "slider", "sliderbreak"]):
+            return "Tech & Slider-Control"
+        if any(w in t_low for w in ["reading", "low ar", "high ar", "hidden", "hd"]):
+            return "Reading & Low-AR"
+        if any(w in t_low for w in ["turnier", "owc", "mappool", "pick", "ban"]):
+            return "Turnier & Mappools"
+        if any(w in t_low for w in ["map", "maps", "empfiehl", "vorschlag"]):
+            return "Beatmap-Empfehlung"
+        if any(w in t_low for w in ["pc", "lag", "fps", "latenz", "stutter"]):
+            return "PC & FPS Optimierung"
+        if any(w in t_low for w in ["tablet", "hover", "drag", "area", "tastatur"]):
+            return "Hardware & Tablet Area"
+            
+        words = [w for w in re.split(r'\s+', t) if len(w) > 1][:4]
+        title_cand = " ".join(words)
+        if len(title_cand) > 26:
+            title_cand = title_cand[:23] + "..."
+        return title_cand if title_cand else "osu! Coaching"
+
+    def _format_relative_time(self, ts):
+        if not ts:
+            return ""
+        diff = max(0, int(time.time() - ts))
+        if diff < 60:
+            return "gerade"
+        elif diff < 3600:
+            return f"vor {diff // 60}m"
+        elif diff < 86400:
+            return f"vor {diff // 3600}h"
+        elif diff < 86400 * 7:
+            return f"vor {diff // 86400}d"
+        else:
+            return time.strftime("%d. %b", time.localtime(ts))
+
+    def _render_sidebar_items(self):
+        """Helper to render conversation list in the left sidebar."""
+        chat_frame = self.__dict__.get("chat_history_list_frame")
+        if chat_frame is None:
+            return
+        try:
+            if not chat_frame.winfo_exists():
+                return
+        except:
+            return
+            
+        for w in chat_frame.winfo_children():
+            try: w.destroy()
+            except: pass
+            
+        convs = self.ai_conversations.get("conversations", [])
+        active_id = self.ai_conversations.get("active_id")
+        
+        for c in convs:
+            cid = c.get("id")
+            is_active = (cid == active_id)
+            bg_col = "#222230" if is_active else "transparent"
+            border_col = "#383852" if is_active else "transparent"
+            
+            item_frame = ctk.CTkFrame(
+                chat_frame, fg_color=bg_col, corner_radius=8,
+                border_width=1 if is_active else 0, border_color=border_col, height=44
+            )
+            item_frame.pack(fill="x", pady=2)
+            item_frame.pack_propagate(False)
+            
+            def make_switch_cmd(target_id=cid):
+                return lambda e=None: self.switch_ai_conversation(target_id)
+            
+            txt_container = ctk.CTkFrame(item_frame, fg_color="transparent")
+            txt_container.pack(side="left", fill="both", expand=True, padx=(10, 4), pady=4)
+            
+            t_lbl = ctk.CTkLabel(
+                txt_container, text=c.get("title", "Chat"), font=("Arial", 11, "bold" if is_active else "normal"),
+                text_color="#ffffff" if is_active else "#b0b0c5", anchor="w"
+            )
+            t_lbl.pack(fill="x")
+            
+            rel_t = self._format_relative_time(c.get("updated_at", c.get("created_at")))
+            time_lbl = ctk.CTkLabel(
+                txt_container, text=rel_t, font=("Arial", 9), text_color="#707088", anchor="w"
+            )
+            time_lbl.pack(fill="x")
+            
+            for comp in (item_frame, txt_container, t_lbl, time_lbl):
+                comp.bind("<Button-1>", make_switch_cmd(cid))
+                
+            def make_del_cmd(target_id=cid):
+                return lambda: self.delete_ai_conversation(target_id)
+            
+            del_btn = ctk.CTkButton(
+                item_frame, text="✕", width=22, height=22, font=("Arial", 10, "bold"),
+                fg_color="transparent", hover_color="#3a1c22", text_color="#707085",
+                corner_radius=4, command=make_del_cmd(cid)
+            )
+            del_btn.pack(side="right", padx=6)
+
+    def refresh_modern_chat_ui(self):
+        """Redraws the sidebar conversation list, the top title, and all messages for the active conversation."""
+        chat_win = self.__dict__.get("chat_toplevel")
+        if chat_win is None:
+            return
+        try:
+            if not chat_win.winfo_exists():
+                return
+        except:
+            return
+            
+        cur_conv = self.get_active_ai_conversation()
+        
+        # 1. Update Top Title
+        title_lbl = self.__dict__.get("current_chat_title_lbl")
+        if title_lbl is not None:
+            try:
+                if title_lbl.winfo_exists():
+                    title_lbl.configure(text=f"💬 {cur_conv.get('title', 'Neuer Chat')}")
+            except: pass
+            
+        # 2. Render Sidebar list
+        self._render_sidebar_items()
+            
+        # 3. Render Message History
+        scroll_frame = self.__dict__.get("chat_scrollable_frame")
+        if scroll_frame is not None:
+            try:
+                if scroll_frame.winfo_exists():
+                    for w in scroll_frame.winfo_children():
+                        w.destroy()
+                    msgs = cur_conv.get("messages", [])
+                    for m in msgs:
+                        self.add_modern_chat_bubble(m.get("role", "user"), m.get("text", ""))
+            except: pass
+
     def show_ai_chat(self):
         chat_win = ctk.CTkToplevel(self)
         chat_win.title("UHO Hub KI-Coach")
-        chat_win.geometry("780x820")
-        chat_win.configure(fg_color="#131316")
+        chat_win.geometry("1060x840")
+        chat_win.minsize(860, 680)
+        chat_win.configure(fg_color="#0e0e12")
+        self.chat_toplevel = chat_win
 
-        # Top Bar
-        top_bar = ctk.CTkFrame(chat_win, fg_color="#181822", height=54, corner_radius=0)
+        if not hasattr(self, "ai_conversations") or not isinstance(self.ai_conversations, dict):
+            self.ai_conversations = self.load_ai_conversations()
+
+        # Main Layout: 2 Columns (Left Sidebar + Right Main Area)
+        main_layout = ctk.CTkFrame(chat_win, fg_color="transparent")
+        main_layout.pack(fill="both", expand=True)
+
+        # -------------------------------------------------------------
+        # LEFT SIDEBAR (Width: 260px)
+        # -------------------------------------------------------------
+        sidebar = ctk.CTkFrame(main_layout, fg_color="#14141c", width=260, corner_radius=0, border_width=0)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        # Top Button: + Neue Konversation
+        btn_new_chat = ctk.CTkButton(
+            sidebar, text="+ Neue Konversation", font=("Arial", 12, "bold"),
+            height=38, corner_radius=10, fg_color="#222230", hover_color="#2d2d40",
+            text_color="#ffffff", border_width=1, border_color="#2f2f42",
+            command=lambda: (self.create_new_ai_conversation(), self.refresh_modern_chat_ui())
+        )
+        btn_new_chat.pack(fill="x", padx=14, pady=(16, 12))
+
+        # Section Header: Konversationen
+        ctk.CTkLabel(
+            sidebar, text="KONVERSATIONEN", font=("Arial", 10, "bold"),
+            text_color="#6e6e85"
+        ).pack(anchor="w", padx=16, pady=(4, 6))
+
+        # Scrollable Conversation List
+        self.chat_history_list_frame = ctk.CTkScrollableFrame(sidebar, fg_color="transparent")
+        self.chat_history_list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+
+        # -------------------------------------------------------------
+        # RIGHT MAIN CHAT AREA
+        # -------------------------------------------------------------
+        main_chat = ctk.CTkFrame(main_layout, fg_color="#0e0e12", corner_radius=0)
+        main_chat.pack(side="right", fill="both", expand=True)
+
+        # Header Bar
+        top_bar = ctk.CTkFrame(main_chat, fg_color="#15151e", height=54, corner_radius=0)
         top_bar.pack(fill="x")
         top_bar.pack_propagate(False)
 
-        ctk.CTkLabel(top_bar, text="✨ UHO Hub KI-Coach", font=("Arial", 16, "bold"), text_color="#ffffff").pack(side="left", padx=20)
+        title_box = ctk.CTkFrame(top_bar, fg_color="transparent")
+        title_box.pack(side="left", padx=20, fill="y")
+        self.current_chat_title_lbl = ctk.CTkLabel(
+            title_box, text="💬 Neuer Chat", font=("Arial", 15, "bold"), text_color="#ffffff"
+        )
+        self.current_chat_title_lbl.pack(anchor="w", pady=(8, 0))
+        ctk.CTkLabel(
+            title_box, text="🧠 Multi-Turn Gedächtnis aktiv • osu! Standard Pro-Coach", font=("Arial", 10), text_color="#00E5FF"
+        ).pack(anchor="w")
 
-        # Gemini Key indicator or entry
-        k_frame = ctk.CTkFrame(top_bar, fg_color="transparent")
-        k_frame.pack(side="right", padx=15)
-        gemini_entry = ctk.CTkEntry(k_frame, placeholder_text="Gemini API Key...", width=160, show="*", font=("Arial", 11), height=28)
+        # Right Controls: Gemini Key & Model Selector
+        top_right = ctk.CTkFrame(top_bar, fg_color="transparent")
+        top_right.pack(side="right", padx=16)
+
+        gemini_entry = ctk.CTkEntry(
+            top_right, placeholder_text="Gemini API Key...", width=160, show="*", font=("Arial", 11), height=28,
+            fg_color="#1c1c28", border_color="#2c2c3e"
+        )
         gemini_entry.pack(side="left", padx=5)
         if getattr(self, "gemini_key", ""):
             gemini_entry.insert(0, self.gemini_key)
 
-        # Message Scroll Area
-        chat_container = ctk.CTkFrame(chat_win, fg_color="#131316")
-        chat_container.pack(fill="both", expand=True, padx=20, pady=(10, 0))
-
-        self.chat_scrollable_frame = ctk.CTkScrollableFrame(chat_container, fg_color="#131316")
-        self.chat_scrollable_frame.pack(fill="both", expand=True)
-
-        welcome = "Hallo! Ich bin dein offizieller UHO Hub KI-Coach. Ich kenne deinen genauen Trainingsfortschritt, deine Skill-Werte und alle Pro-Techniken (KHZ-Methode, Reading, Mappools & Aim).\n\nWie kann ich dir bei deiner heutigen Session helfen?"
-        self.add_modern_chat_bubble("ai", welcome)
-
-        # Quick Suggestion Chips
-        chips_frame = ctk.CTkFrame(chat_win, fg_color="transparent")
-        chips_frame.pack(fill="x", padx=25, pady=(8, 4))
-
-        quick_prompts = [
-            ("🏆 Turniere & Mappools", "Wie bereite ich mich optimal auf Turniere (OWC/Mappools NM1-6, HD, HR, DT, TB) und Pick/Ban Strategien vor?"),
-            ("⚡ Stamina & Speed (KHZ)", "Wie trainiere ich Stream-Stamina und Speed nach der KHZ-Methode und wie verhindere ich Fingerlocking?"),
-            ("🎯 Reading & Low-AR", "Wie verbessere ich mein Reading bei Low-AR, Hidden und hoher Pattern-Dichte?"),
-            ("🧠 Mindset & Choking", "Wie verhindere ich Choking auf langen Maps, Mindblocks und wie baue ich einen hohen Skill Floor auf?")
-        ]
-
-        # Modern Rounded Pill Input Container (Matching Image)
-        input_container = ctk.CTkFrame(chat_win, fg_color="#1c1c24", corner_radius=18, border_width=1, border_color="#2c2c38", height=85)
-        input_container.pack(fill="x", padx=25, pady=(0, 20))
+        # Bottom Input Container (Dynamic auto-expanding height matching ChatGPT/Claude UI)
+        input_container = ctk.CTkFrame(main_chat, fg_color="#181822", corner_radius=18, border_width=1, border_color="#262636", height=82)
+        input_container.pack(side="bottom", fill="x", padx=20, pady=(8, 18))
         input_container.pack_propagate(False)
 
-        # Text input row
-        msg_entry = ctk.CTkEntry(input_container, placeholder_text="Frage alles, @ zum Erwähnen, / für Aktionen",
-                                 font=("Arial", 13), fg_color="transparent", border_width=0, text_color="#ffffff")
-        msg_entry.pack(fill="x", padx=16, pady=(8, 2))
-
-        # Bottom row inside input container (Model pill + Send button)
         bottom_row = ctk.CTkFrame(input_container, fg_color="transparent")
-        bottom_row.pack(fill="x", padx=12, pady=(0, 6))
+        bottom_row.pack(side="bottom", fill="x", padx=12, pady=(0, 8))
 
-        # Model Selector Pill Button
+        PLACEHOLDER = "Frage alles, @ zum Erwähnen, / für Aktionen"
+        is_placeholder_active = [True]
+
+        msg_entry = ctk.CTkTextbox(
+            input_container, height=30, wrap="char",
+            font=("Arial", 13), fg_color="transparent", text_color="#6e6e85",
+            activate_scrollbars=False, border_width=0
+        )
+        msg_entry.insert("1.0", PLACEHOLDER)
+        msg_entry.pack(side="top", fill="both", expand=True, padx=16, pady=(8, 2))
+
+        # Messages Scroll Area (takes all remaining space above the input container)
+        chat_container = ctk.CTkFrame(main_chat, fg_color="#0e0e12")
+        chat_container.pack(side="top", fill="both", expand=True, padx=20, pady=(10, 0))
+
+        self.chat_scrollable_frame = ctk.CTkScrollableFrame(chat_container, fg_color="#0e0e12")
+        self.chat_scrollable_frame.pack(fill="both", expand=True)
+
+        def get_user_text():
+            if is_placeholder_active[0]:
+                return ""
+            return msg_entry.get("1.0", "end-1c").strip()
+
+        def adjust_input_height(event=None):
+            if is_placeholder_active[0]:
+                input_container.configure(height=82)
+                return
+            try:
+                if chat_win.winfo_exists():
+                    chat_win.update_idletasks()
+                raw_c = msg_entry._textbox.tk.call(msg_entry._textbox._w, "count", "-displaylines", "1.0", "end")
+                lines = max(1, min(6, int(raw_c))) if raw_c is not None else 1
+            except Exception:
+                txt = msg_entry.get("1.0", "end-1c")
+                lines = max(1, min(6, len(txt.split("\n")) + len(txt) // 70))
+
+            cont_h = 82 + (lines - 1) * 24
+            input_container.configure(height=cont_h)
+            try: msg_entry.see("insert")
+            except: pass
+
+        def clear_user_text():
+            is_placeholder_active[0] = True
+            msg_entry.delete("1.0", "end")
+            msg_entry.insert("1.0", PLACEHOLDER)
+            msg_entry.configure(text_color="#6e6e85")
+            adjust_input_height()
+
+        def set_user_text(txt):
+            is_placeholder_active[0] = False
+            msg_entry.delete("1.0", "end")
+            msg_entry.insert("1.0", txt)
+            msg_entry.configure(text_color="#ffffff")
+            adjust_input_height()
+
+        def on_focus_in(event=None):
+            if is_placeholder_active[0]:
+                is_placeholder_active[0] = False
+                msg_entry.delete("1.0", "end")
+                msg_entry.configure(text_color="#ffffff")
+                adjust_input_height()
+
+        def on_focus_out(event=None):
+            raw = msg_entry.get("1.0", "end-1c").strip()
+            if not raw:
+                is_placeholder_active[0] = True
+                msg_entry.delete("1.0", "end")
+                msg_entry.insert("1.0", PLACEHOLDER)
+                msg_entry.configure(text_color="#6e6e85")
+                adjust_input_height()
+
+        msg_entry.bind("<FocusIn>", on_focus_in)
+        msg_entry.bind("<FocusOut>", on_focus_out)
+        msg_entry.bind("<KeyRelease>", lambda e: msg_entry.after(10, adjust_input_height))
+        msg_entry.bind("<BackSpace>", lambda e: msg_entry.after(10, adjust_input_height))
+        msg_entry.bind("<Delete>", lambda e: msg_entry.after(10, adjust_input_height))
+        msg_entry.bind("<<Paste>>", lambda e: msg_entry.after(10, adjust_input_height))
+        msg_entry.bind("<Configure>", lambda e: msg_entry.after(10, adjust_input_height))
+
+        def on_key_press(event):
+            if is_placeholder_active[0] and event.char and event.keysym not in ("Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Tab"):
+                on_focus_in()
+            if event.keysym == "Return":
+                if event.state & 0x0001:  # Shift held
+                    msg_entry.after(15, adjust_input_height)
+                    return
+                else:
+                    send_message()
+                    return "break"
+            msg_entry.after(15, adjust_input_height)
+
+        msg_entry.bind("<KeyPress>", on_key_press)
+
         current_m = getattr(self, "selected_ai_model", "gemini-3.6-flash")
-        model_pill = ctk.CTkButton(bottom_row, text=f"+ {current_m} ▾", font=("Arial", 11), height=26, corner_radius=12,
-                                   fg_color="#252530", hover_color="#323240", text_color="#bbbbcc")
+        model_pill = ctk.CTkButton(
+            bottom_row, text=f"+ {current_m} ▾", font=("Arial", 11), height=26, corner_radius=12,
+            fg_color="#222230", hover_color="#2d2d40", text_color="#bbbbcc"
+        )
         model_pill.pack(side="left")
 
         def send_message(event=None):
-            msg = msg_entry.get().strip()
+            msg = get_user_text()
             if not msg: return
-            msg_entry.delete(0, "end")
-            self.add_modern_chat_bubble("user", msg)
+            clear_user_text()
 
             current_key = gemini_entry.get().strip()
             if current_key: self.gemini_key = current_key
 
+            cur_conv = self.get_active_ai_conversation()
+            
+            # Auto-title on first user message if default
+            if cur_conv.get("title") == "Neuer Chat" or len([m for m in cur_conv.get("messages", []) if m.get("role") == "user"]) == 0:
+                new_t = self.auto_generate_chat_title(msg)
+                cur_conv["title"] = new_t
+
+            cur_conv["updated_at"] = time.time()
+            cur_conv["messages"].append({
+                "role": "user",
+                "text": msg,
+                "timestamp": time.strftime("%H:%M")
+            })
+            self.save_ai_conversations()
+
+            # Render user message
+            self.add_modern_chat_bubble("user", msg)
+            if hasattr(self, "current_chat_title_lbl") and self.current_chat_title_lbl.winfo_exists():
+                self.current_chat_title_lbl.configure(text=f"💬 {cur_conv.get('title', 'Chat')}")
+            self._render_sidebar_items()
+
             if not self.gemini_key:
-                response = self.offline_analyze(msg)
+                response = self.offline_analyze(msg, conv=cur_conv)
+                cur_conv["messages"].append({
+                    "role": "model",
+                    "text": response,
+                    "timestamp": time.strftime("%H:%M")
+                })
+                self.save_ai_conversations()
                 self.add_modern_chat_bubble("ai", response)
                 return
 
@@ -4101,28 +5298,24 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
             def call_gemini():
                 try:
-                    response = self.query_gemini(msg)
+                    response = self.query_gemini(msg, conv=cur_conv)
                     if chat_win.winfo_exists():
                         chat_win.after(0, lambda: self.replace_modern_thinking(thinking_frame, response))
                 except Exception as e:
-                    clean_resp = self.offline_analyze(msg)
+                    clean_resp = self.offline_analyze(msg, conv=cur_conv)
                     if chat_win.winfo_exists():
                         chat_win.after(0, lambda: self.replace_modern_thinking(thinking_frame, clean_resp))
 
             threading.Thread(target=call_gemini, daemon=True).start()
 
-        # Send circle button
-        send_btn = ctk.CTkButton(bottom_row, text="➔", width=32, height=28, corner_radius=14,
-                                 fg_color="#2b2b36", hover_color="#3b8ed0", font=("Arial", 13, "bold"), command=send_message)
+        send_btn = ctk.CTkButton(
+            bottom_row, text="➔", width=32, height=28, corner_radius=14,
+            fg_color="#2b2b36", hover_color="#3b8ed0", font=("Arial", 13, "bold"), command=send_message
+        )
         send_btn.pack(side="right")
-        msg_entry.bind("<Return>", send_message)
 
-        for label, q_text in quick_prompts:
-            def make_cmd(t=q_text):
-                return lambda: (msg_entry.delete(0, "end"), msg_entry.insert(0, t), send_message())
-            ctk.CTkButton(chips_frame, text=label, font=("Arial", 10), height=24, corner_radius=6,
-                          fg_color="#22222c", hover_color="#30303e", text_color="#cccccc",
-                          command=make_cmd(q_text)).pack(side="left", padx=2)
+        # Initial render of sidebar and message history
+        self.refresh_modern_chat_ui()
 
     def add_modern_chat_bubble(self, role, text):
         text = str(text or "")
@@ -4512,6 +5705,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.current_ai_skill_test = None
             self.tester_results = {}
             self.chat_history = []
+            if hasattr(self, "ai_conversations_file") and os.path.exists(self.ai_conversations_file):
+                try: os.remove(self.ai_conversations_file)
+                except: pass
+            self.ai_conversations = self.load_ai_conversations()
             self._rounds_since_feedback_prompt = 0
             self._persistent_mod_pref = None
             if hasattr(self, "_banned_mods"):
@@ -4891,8 +6088,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._cached_gemini_models = fallback_list
         return fallback_list
 
-    def call_gemini_api(self, prompt, system_prompt=None, temperature=0.7, max_tokens=2048):
-        """Universal, error-resilient Gemini API caller that uses verified models."""
+    def call_gemini_api(self, prompt, system_prompt=None, conversation_history=None, temperature=0.7, max_tokens=2048):
+        """Universal, error-resilient Gemini API caller that uses verified models with multi-turn conversation support."""
         if not getattr(self, "gemini_key", ""):
             return None
 
@@ -4901,6 +6098,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if system_prompt:
             contents.append({"role": "user", "parts": [{"text": system_prompt + "\n\nBestätigung: Antworte zu 100% auf Deutsch!"}]})
             contents.append({"role": "model", "parts": [{"text": "Verstanden! Ich bin dein Pro-Level osu! Coach und antworte ausschließlich auf Deutsch."}]})
+
+        # Append previous multi-turn conversation messages
+        if conversation_history and isinstance(conversation_history, list):
+            for msg in conversation_history[-14:]:
+                role = "user" if msg.get("role") == "user" else "model"
+                txt = msg.get("text", "")
+                if txt:
+                    contents.append({"role": role, "parts": [{"text": txt}]})
 
         contents.append({"role": "user", "parts": [{"text": prompt + "\n\nWICHTIG: Antworte zu 100% auf Deutsch!"}]})
 
@@ -4928,7 +6133,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         return None
 
-    def query_gemini(self, user_message):
+    def query_gemini(self, user_message, conv=None):
+        if conv is None:
+            conv = self.get_active_ai_conversation()
+
         player_context = self.gather_player_context()
 
         # Check if user message is asking for a map recommendation and inject real database maps
@@ -4936,21 +6144,82 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if ("map" in u_low or "maps" in u_low) and any(w in u_low for w in ["empfiehl", "gib mir", "suche", "letzte", "ähnlich", "spiel", "trainier", "brauche", "vorschlag", "welche", "nächste"]):
             skill = "Streams" if "stream" in u_low else "Speed" if "speed" in u_low else "Tech" if "tech" in u_low else "Stamina" if "stamina" in u_low else "Reading" if "reading" in u_low else "Aim"
             target_sr = 5.5
-            cand_maps = sqlite_query_maps(skill=skill, sr_min=max(1.0, target_sr - 1.2), sr_max=target_sr + 1.2, limit=4, order_by="playcount DESC")
+            
+            # Extract requested SR if specified by user (e.g. "6.5★", "6 star", "7 sterne")
+            sr_match = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:★|star|sterne)', u_low)
+            if sr_match:
+                try:
+                    target_sr = float(sr_match.group(1).replace(',', '.'))
+                except Exception:
+                    pass
+
+            # Fetch a rich pool of 45-50 high-quality candidates from SQLite
+            cand_maps = sqlite_query_maps(skill=skill, sr_min=max(1.0, target_sr - 0.8), sr_max=target_sr + 0.8, limit=45, order_by="playcount DESC")
+            if len(cand_maps) < 20:
+                cand_maps = sqlite_query_maps(skill=skill, sr_min=max(1.0, target_sr - 1.5), sr_max=target_sr + 1.5, limit=50, order_by="playcount DESC")
+
             if cand_maps:
                 map_options = []
                 for cm in cand_maps:
-                    map_options.append(f"- [MAP: {cm.get('id')} | SET: {cm.get('set_id')}] • {cm.get('name')} (★ {cm.get('sr'):.2f} • {cm.get('bpm')} BPM • {cm.get('primary_skill')})")
-                
-                player_context += "\n\nVERIFIZIERTE ECHTE MAPS AUS DER LOKALEN RANKED-DATENBANK FÜR DIESE ANFRAGE:\n" + "\n".join(map_options)
-                player_context += "\n(WICHTIG: Wenn du dem Spieler eine Map empfiehlst, wähle EINE dieser verifizierten Maps und nutze exakt ihren [MAP: ... | SET: ...] Tag! Erfinde keine eigenen Beatmap-IDs!)"
+                    m_artist = cm.get('artist', '')
+                    m_title = cm.get('title', '')
+                    m_ver = cm.get('version', '')
+                    if m_artist and m_title:
+                        song_name = f"{m_artist} - {m_title}"
+                    else:
+                        song_name = cm.get('name', 'Unknown')
+                    
+                    if m_ver and not m_ver.startswith('['):
+                        diff_name = f"[{m_ver}]"
+                    else:
+                        diff_name = m_ver if m_ver else "[Normal]"
+                    
+                    st_pct = float(cm.get('stream_pct', 0) or 0)
+                    b_cnt = int(cm.get('burst_count', 0) or 0)
+                    m_sp = float(cm.get('max_spacing', 0) or 0)
+                    
+                    extra_tags = []
+                    if st_pct > 25: extra_tags.append(f"Streams: {st_pct:.0f}%")
+                    if b_cnt > 15: extra_tags.append(f"Bursts: {b_cnt}")
+                    if m_sp > 250: extra_tags.append(f"Max-Jump: {m_sp:.0f}px")
+                    tag_str = f" • {', '.join(extra_tags)}" if extra_tags else ""
 
-        system_prompt = f"""Du bist der ultimative UHO Hub Pro-Level KI-Coach, Turnier-Stratege und Gameplay-Analyst für osu!.
+                    map_options.append(f"- [MAP: {cm.get('id')} | SET: {cm.get('set_id')}] • Song: **{song_name}** • Difficulty: **{diff_name}** (★ {cm.get('sr'):.2f} • {cm.get('bpm')} BPM • {cm.get('primary_skill')}{tag_str})")
+                
+                player_context += f"\n\nVERIFIZIERTER KANDIDATEN-POOL ({len(map_options)} RANKED-MAPS AUS DER LOKALEN DATENBANK FÜR DIESE ANFRAGE):\n" + "\n".join(map_options)
+                player_context += "\n(WICHTIG: Analysiere und vergleiche alle diese 40-50 Maps gleichzeitig. Wähle die #1 absolut beste Map aus diesem Pool aus, die exakt zur Anfrage und zum Spieler passt, und nutze ihren [MAP: ... | SET: ...] Tag! Erfinde keine eigenen Beatmap-IDs!)"
+
+        system_prompt = f"""Du bist der ultimative UHO Hub Pro-Level KI-Coach, Turnier-Stratege, Ergonomie-Experte und Gameplay-Analyst für osu!.
 
 SPRACH-VORGABE (ABSOLUT STRIKTE REGEL):
 - Du antwortest AUSSCHLIESSLICH und ZU 100% AUF DEUTSCH!
 - Kein einziger englischer Satz oder Absatz! Alle Erklärungen, Analysen, Ratschläge und Motivationen MÜSSEN komplett auf Deutsch sein.
-- Eingedeutschte osu!-spezifische Begriffe (Stream, Aim, Burst, FC, Slider, BPM, Finger Control, Stamina, Reading) dürfen natürlich im deutschen Satzbau verwendet werden.
+- Eingedeutschte osu!-spezifische Begriffe (Stream, Aim, Burst, FC, Slider, BPM, Finger Control, Stamina, Reading, Mods) dürfen natürlich im deutschen Satzbau verwendet werden.
+
+OSU! MODS, ERGONOMIE & REHABILITATION (EXPERTEN-WISSEN):
+=============================================================================
+• AP (AutoPilot):
+  - Automatische Cursor-Führung: Das Spiel steuert das Aiming zu 100% perfekt auf alle Circles und Slider.
+  - Der Spieler muss AUSSCHLIESSLICH tappen (K1 & K2).
+  - MEDIZINISCH & ERGONOMISCH ESSENTIELL: Wenn der Spieler Schmerzen im Aiming-Handgelenk, der Maushand, der Schreibhand oder an den Sehnen hat (z. B. Überlastung, RSI, Handgelenksprobleme), ist AutoPilot (AP) die PERFEKTE Übergangs- und Trainingsmethode! Der Spieler kann sein Tapping, seine Finger-Control, Stream-Stamina und Speed auf das nächste Level bringen, während die verletzte Aiming-Hand vollkommen geschont und stillgelegt wird.
+• RX (Relax):
+  - Automatisches Tapping (100% 300s). Der Spieler muss AUSSCHLIESSLICH aimen (Maus/Tablet).
+  - Perfekt für Flow-Aim, Cursor-Pathing, Snapping und High-AR Reading ohne Tapping-Belastung.
+• NF (NoFail):
+  - Kein Sterben/Failen möglich bei leerer HP-Leiste.
+• EZ (Easy):
+  - Halbe Circle Size (viel größere Kreise), stark reduzierte Approach Rate (Low AR), sanfterer HP Drain, 3 Extraleben.
+• HT (HalfTime):
+  - 0.75x Spielgeschwindigkeit (75% BPM). Optimal zum Verstehen und Einüben komplexer Polyrhythmen, Finger-Control und unleserlicher Tech-Muster.
+• HD (Hidden):
+  - Approach Circles werden ausgeblendet, Hit-Objects faden kurz vor dem Hit-Zeitpunkt aus. Schult inneres Timing und räumliches Vorstellungsvermögen.
+• HR (HardRock):
+  - Circle Size +30% (wesentlich kleinere Kreise), AR10, OD10, HP+, invertiertes Spielfeld (Vertikal gespiegelt). Schult extreme Zielgenauigkeit und Reaktionszeit.
+• DT / NC (DoubleTime / NightCore):
+  - 1.5x Spielgeschwindigkeit (150% BPM, AR und OD gestaucht).
+• FL (Flashlight):
+  - Stark eingeschränkter Sichtradius um den Cursor. Erfordert reines Auswendiglernen der Map.
+• SO (SpunOut) / SD (SuddenDeath) / PF (Perfect) / TD (TouchDevice) / V2 (ScoreV2).
 
 KONTEXT DES AKTUELLEN SPIELERS:
 =============================================================================
@@ -4958,17 +6227,24 @@ KONTEXT DES AKTUELLEN SPIELERS:
 
 DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
 - SIMPEL, DIREKT & PRÄGNANT: Mache deine Antworten so einfach und übersichtlich wie möglich! Halte Beschreibungen kurz (3-4 Sätze)!
+- MULTI-TURN GEDÄCHTNIS: Du erinnerst dich an alle vorherigen Fragen und Nachrichten dieses Gesprächs. Weiche niemals Fragen aus und beziehe dich direkt auf das besprochene Thema!
 - WICHTIG ZU 'ZULETZT GESPIELT':
   * Wenn der Spieler fragt, was er zuletzt gespielt hat (z. B. 'was habe ich zuletzt gespielt?'):
     -> Nenne ihm NUR die ALLERLETZTE Map (nicht alle 6 Runden als lange Liste aufzählen!).
-    -> Formatiere es extrem simpel und übersichtlich:
-       🎵 **Map:** [Exakter Map-Titel]
+    -> Formatiere es extrem simpel und übersichtlich mit Map-Name und Difficulty:
+       🎵 **Map:** [Artist] - [Title]
+       🏷️ **Difficulty:** [[Difficulty/Version]]
        ⭐ **Ergebnis:** Rang [X] • [Acc]% Acc (Combo: [X] • [X] Misses)
        💡 **Coach-Tipp:** 1-2 kurze, motivierende Sätze zur Runde.
   * Zähle NIEMALS ungefragt alle vorherigen Runden als lange Liste auf!
 - WICHTIG BEI MAP-EMPFEHLUNGEN & MAP-ANFRAGEN:
   * Wenn der Spieler nach einer Map-Empfehlung fragt (z. B. 'gib mir eine Map wie die letzte', 'empfiehl mir eine Speed Map', 'welche Map soll ich üben?'):
     -> Wähle eine konkrete, passende Map aus den oben bereitgestellten VERIFIZIERTEN ECHTEN MAPS aus der lokalen Datenbank.
+    -> NENNE IMMER EXPLIZIT SOWOHL DEN MAP-NAMEN (Artist - Title) ALS AUCH DIE DIFFICULTY (Diff / Version):
+       🎵 **Map:** [Artist] - [Title]
+       🏷️ **Difficulty:** [[Exakter Difficulty-Name / Version]]
+       ⭐ **Stats:** ★ [SR] • [BPM] BPM • [Skillset]
+       💡 **Coach-Tipp:** 2-3 kurze Sätze zur Map und warum sie perfekt für ihn ist.
     -> Füge am Ende deiner Nachricht immer den Tag: [MAP: <beatmap_id> | SET: <beatmapset_id>] ein.
        (Beispiel: [MAP: 1059388 | SET: 490509])
     -> Dadurch blendet die App automatisch die 🌐 Web- und ⚡ osu!direct-Buttons ein!
@@ -4977,14 +6253,30 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
 - Alle Analysen gelten AUSSCHLIESSLICH für osu! Standard (Mode 0)!
 - Du antwortest ZU 100% AUF DEUTSCH!"""
 
-        # Call universal API with dynamic model discovery
-        res = self.call_gemini_api(user_message, system_prompt=system_prompt, max_tokens=1024)
+        # Call universal API with dynamic model discovery and conversation history
+        conv_hist = conv.get("messages", [])[:-1] if (conv and isinstance(conv.get("messages"), list)) else []
+        res = self.call_gemini_api(user_message, system_prompt=system_prompt, conversation_history=conv_hist, max_tokens=1024)
         if res:
-            if not hasattr(self, "chat_history"):
-                self.chat_history = []
-            self.chat_history.append({"role": "user", "parts": [{"text": user_message}]})
-            self.chat_history.append({"role": "model", "parts": [{"text": res}]})
+            if conv:
+                conv["messages"].append({
+                    "role": "model",
+                    "text": res,
+                    "timestamp": time.strftime("%H:%M")
+                })
+                self.save_ai_conversations()
+            self.log_ai_event(f"KI-Chat: {conv.get('title', 'Chat')}", {"user_message": user_message, "chat_title": conv.get("title", "")}, prompt_text=user_message, raw_ai_response=res)
             return res
+
+        # Fallback offline
+        fallback_res = self.offline_analyze(user_message, conv=conv)
+        if conv:
+            conv["messages"].append({
+                "role": "model",
+                "text": fallback_res,
+                "timestamp": time.strftime("%H:%M")
+            })
+            self.save_ai_conversations()
+        return fallback_res
 
     def update_user_setup_from_text(self, text):
         """Erkennt automatisch Angaben zu Tablet/Maus, Keyboard/Rapid Trigger und Tapping-Stil aus Chat-Nachrichten."""
@@ -5057,46 +6349,129 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
             self.save_global_settings()
         return updated
 
-    def offline_analyze(self, query):
+    def offline_analyze(self, query, conv=None):
         q = query.lower()
 
+        # Check for Handgelenk / Injury / AutoPilot ergonomics queries
+        if any(w in q for w in ["handgelenk", "autopilot", "ap", "schmerz", "sehne", "verletz"]):
+            resp = (
+                "🦾 **Handgelenk-Schonung & AutoPilot (AP) Training:**\n"
+                "• **Ja, absolut!** Wenn dein Aiming-Handgelenk überlastet ist oder schmerzt, ist **AutoPilot (AP)** die perfekte Lösung!\n"
+                "• Im AP-Modus steuert das Spiel den Cursor automatisch perfekt auf jede Note. Deine Aim-Hand bleibt komplett in Ruhe.\n"
+                "• **Dein Vorteil:** Du kannst dein **Tapping (Speed, Stamina, Finger-Control & KHZ-Methode)** intensiv auf das nächste Level bringen und startest mit bärenstarkem Tapping wieder durch, sobald dein Gelenk verheilt ist!"
+            )
+            self.log_ai_event(f"Offline-Coach: {conv.get('title', 'Ergonomie') if conv else 'Ergonomie'}", {"query": query}, raw_ai_response=resp)
+            return resp
+
+        # Check for Relax (RX)
+        if "relax" in q or "rx" in q:
+            resp = (
+                "🎯 **Relax (RX) Modus:**\n"
+                "• Im Relax-Modus tapt das Spiel automatisch für dich (100% 300s). Du musst dich ausschließlich auf das **Aiming (Cursor-Pathing & Snapping)** konzentrieren.\n"
+                "• **Einsatz:** Ideal zum Trainieren von Flow-Aim, extremen Jumps und High-AR Reading, wenn deine Tapping-Finger erschöpft sind."
+            )
+            self.log_ai_event(f"Offline-Coach: {conv.get('title', 'Relax') if conv else 'Relax'}", {"query": query}, raw_ai_response=resp)
+            return resp
+
+        # Check for other osu! mods (HT, EZ, HD, HR, DT, FL, V2)
+        if any(w in q for w in ["mods", "mod", "hardrock", "hr", "doubletime", "dt", "hidden", "hd", "halftime", "ht", "easy mod"]):
+            resp = (
+                "🎮 **osu! Mod-Übersicht & Trainingseffekt:**\n"
+                "• **AutoPilot (AP):** Automatisches Aiming -> 100% Fokus auf Tapping (ideal bei Handgelenk-Schonung).\n"
+                "• **Relax (RX):** Automatisches Tapping -> 100% Fokus auf Flow-Aim & Snapping.\n"
+                "• **HalfTime (HT, 0.75x):** Perfekt zum Entschlüsseln komplexer Polyrhythmen und Finger-Control.\n"
+                "• **HardRock (HR):** CS +30% (kleine Kreise), AR10, OD10 -> Trainiert extreme Präzision.\n"
+                "• **DoubleTime (DT, 1.5x):** 150% BPM -> Trainiert High-Speed Tapping & schnelles Reading.\n"
+                "• **Hidden (HD):** Keine Approach Circles -> Trainiert inneres Taktgefühl und Reading."
+            )
+            self.log_ai_event(f"Offline-Coach: {conv.get('title', 'Mods') if conv else 'Mods'}", {"query": query}, raw_ai_response=resp)
+            return resp
+
         # Check for map recommendation queries offline
-        if ("map" in q or "maps" in q) and any(w in q for w in ["empfiehl", "gib mir", "suche", "letzte", "ähnlich", "spiel", "trainier", "brauche"]):
+        if ("map" in q or "maps" in q) and any(w in q for w in ["empfiehl", "gib mir", "suche", "letzte", "ähnlich", "spiel", "trainier", "brauche", "vorschlag", "welche", "nächste"]):
             skill = "Streams" if "stream" in q else "Speed" if "speed" in q else "Tech" if "tech" in q else "Stamina" if "stamina" in q else "Reading" if "reading" in q else "Aim"
             
-            # Look up recent maps or SQLite DB
             target_sr = 5.5
-            if hasattr(self, "_cached_recent_plays_context") and self._cached_recent_plays_context:
-                pass
-            
-            cand = pick_dynamic_map_for_skill(skill, target_sr=target_sr)
+            sr_match = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:★|star|sterne)', q)
+            if sr_match:
+                try:
+                    target_sr = float(sr_match.group(1).replace(',', '.'))
+                except Exception:
+                    pass
+
+            # Query pool of 45 matching ranked maps from SQLite
+            cands = sqlite_query_maps(skill=skill, sr_min=max(1.0, target_sr - 0.8), sr_max=target_sr + 0.8, limit=45, order_by="playcount DESC")
+            if not cands:
+                cands = sqlite_query_maps(skill=skill, sr_min=max(1.0, target_sr - 1.5), sr_max=target_sr + 1.5, limit=45, order_by="playcount DESC")
+
+            cand = random.choice(cands[:12]) if cands else pick_dynamic_map_for_skill(skill, target_sr=target_sr)
             if cand and str(cand.get("id")) != "0":
-                m_name = cand.get("name", "Unbekannte Map")
+                m_raw = cand.get("name", "Unbekannte Map")
+                m_artist = cand.get("artist", "")
+                m_title = cand.get("title", "")
+                m_ver = cand.get("version", "")
+                
+                if m_artist and m_title:
+                    song_name = f"{m_artist} - {m_title}"
+                else:
+                    song_name = re.sub(r'\s*\[.*?\]\s*$', '', m_raw).strip()
+                
+                if not m_ver:
+                    ver_match = re.search(r'\[(.*?)\]', m_raw)
+                    m_ver = ver_match.group(1) if ver_match else "Insane"
+                
                 m_sr = float(cand.get("sr", target_sr))
                 m_bpm = float(cand.get("bpm", 180))
                 m_desc = cand.get("description", "Ausgewogene Trainings-Map.")
                 m_id = cand.get("id")
                 m_set = cand.get("set_id", "")
                 
-                return f"🎵 **Hier ist deine persönliche Trainings-Map:**\n\n**{m_name}**\n⭐ **Rating:** {m_sr:.2f}★ • **BPM:** {int(m_bpm)} • **Skill:** {skill}\n💡 **Coach-Tipp:** {m_desc}\n\n[MAP: {m_id} | SET: {m_set}]"
+                resp = (
+                    f"🎵 **Map:** {song_name}\n"
+                    f"🏷️ **Difficulty:** [{m_ver}]\n"
+                    f"⭐ **Stats:** ★ {m_sr:.2f} • {int(m_bpm)} BPM • {skill}\n\n"
+                    f"💡 **Coach-Tipp:** {m_desc}\n\n"
+                    f"[MAP: {m_id} | SET: {m_set}]"
+                )
+                self.log_ai_event(f"Offline-Coach: Map-Empfehlung", {"query": query, "map_id": m_id}, raw_ai_response=resp)
+                return resp
 
         if "khz" in q:
-            return "⚡ **Die KHZ-Methode (Progressive Overload für Streams):**\n1. Finde dein persönliches Limit-BPM, auf dem du lange Streams mit **98%+ Accuracy** spielen kannst (z. B. 180 BPM).\n2. Spiele täglich 20-30 Minuten dedizierte Stream-Maps in diesem Bereich.\n3. Steigere das Tempo erst um **+5 BPM**, wenn du 3 Tage in Folge 98%+ ohne Fingerlocking hältst.\n4. **Goldene Regel:** Halte Handgelenk und Unterarm völlig locker – wer verkrampft, stoppt den Muskelaufbau!"
+            resp = "⚡ **Die KHZ-Methode (Progressive Overload für Streams):**\n1. Finde dein persönliches Limit-BPM, auf dem du lange Streams mit **98%+ Accuracy** spielen kannst (z. B. 180 BPM).\n2. Spiele täglich 20-30 Minuten dedizierte Stream-Maps in diesem Bereich.\n3. Steigere das Tempo erst um **+5 BPM**, wenn du 3 Tage in Folge 98%+ ohne Fingerlocking hältst.\n4. **Goldene Regel:** Halte Handgelenk und Unterarm völlig locker – wer verkrampft, stoppt den Muskelaufbau!"
+            self.log_ai_event("Offline-Coach: KHZ-Methode", {"query": query}, raw_ai_response=resp)
+            return resp
         if "stamina" in q or "ausdauer" in q:
-            return "🔥 **Stamina-Training (Ausdauer):**\n• Trainiere auf längeren Maps (Drain > 3 Minuten) mit kontinuierlichem Tapping.\n• Drücke die Tasten nur so tief wie nötig (Key Bottom-Out minimieren).\n• Wenn du Rapid Trigger nutzt: Actuation 0.4mm, Rapid Trigger 0.15mm für minimale Fingeranstrengung."
+            resp = "🔥 **Stamina-Training (Ausdauer):**\n• Trainiere auf längeren Maps (Drain > 3 Minuten) mit kontinuierlichem Tapping.\n• Drücke die Tasten nur so tief wie nötig (Key Bottom-Out minimieren).\n• Wenn du Rapid Trigger nutzt: Actuation 0.4mm, Rapid Trigger 0.15mm für minimale Fingeranstrengung."
+            self.log_ai_event("Offline-Coach: Stamina", {"query": query}, raw_ai_response=resp)
+            return resp
         if "stream" in q or "flow aim" in q:
-            return "🌊 **Stream- & Flow-Aim-Training:**\n• Halte den Cursor flüssig in der Mitte des Streams – nicht hektisch von Note zu Note flicken.\n• Gleichmäßiger Tapping-Druck: Achte auf sauberes Alternieren zwischen K1 und K2.\n• Bei Spaced Streams: Vergrößere deine Handbewegung bewusst und führe den Stream mit den Augen an."
+            resp = "🌊 **Stream- & Flow-Aim-Training:**\n• Halte den Cursor flüssig in der Mitte des Streams – nicht hektisch von Note zu Note flicken.\n• Gleichmäßiger Tapping-Druck: Achte auf sauberes Alternieren zwischen K1 und K2.\n• Bei Spaced Streams: Vergrößere deine Handbewegung bewusst und führe den Stream mit den Augen an."
+            self.log_ai_event("Offline-Coach: Streams", {"query": query}, raw_ai_response=resp)
+            return resp
         if "jump" in q or "aim" in q or "snap" in q:
-            return "🎯 **Jump-Aim & Snapping:**\n• Das Auge führt, die Hand folgt! Schau den Zielkreis direkt an, bevor du den Cursor bewegst.\n• Snappe hart auf den Mittelpunkt der Note und stoppe für einen Sekundenbruchteil vor dem nächsten Jump (Edge Control).\n• 100% Background Dim und deaktiviertes Hit Lighting sorgen für maximale visuelle Klarheit."
+            resp = "🎯 **Jump-Aim & Snapping:**\n• Das Auge führt, die Hand folgt! Schau den Zielkreis direkt an, bevor du den Cursor bewegst.\n• Snappe hart auf den Mittelpunkt der Note und stoppe für einen Sekundenbruchteil vor dem nächsten Jump (Edge Control).\n• 100% Background Dim und deaktiviertes Hit Lighting sorgen für maximale visuelle Klarheit."
+            self.log_ai_event("Offline-Coach: Aim", {"query": query}, raw_ai_response=resp)
+            return resp
         if "tech" in q or "slider" in q:
-            return "🌀 **Tech & Slider-Control:**\n• Verfolge die Sliderball-Geschwindigkeit (SV) genau mit den Augen, um Break-Misses zu verhindern.\n• Passe deine Lesegeschwindigkeit bei schnellen Rhythmus-Wechseln (1/4 zu 1/3 oder 1/6) an.\n• Tech-Maps verlangen Geduld: Spiele sie bis zum Ende durch, um unkonventionelle Muster zu lernen."
+            resp = "🌀 **Tech & Slider-Control:**\n• Verfolge die Sliderball-Geschwindigkeit (SV) genau mit den Augen, um Break-Misses zu verhindern.\n• Passe deine Lesegeschwindigkeit bei schnellen Rhythmus-Wechseln (1/4 zu 1/3 oder 1/6) an.\n• Tech-Maps verlangen Geduld: Spiele sie bis zum Ende durch, um unkonventionelle Muster zu lernen."
+            self.log_ai_event("Offline-Coach: Tech", {"query": query}, raw_ai_response=resp)
+            return resp
         if "speed" in q or "burst" in q:
-            return "⚡ **Speed & Burst-Präzision:**\n• Trainiere kurze 5- bis 9-Note-Bursts auf hohem BPM (220+ BPM).\n• Nutze explosive Finger-Beschleunigung aus den Fingergelenken (nicht aus dem ganzen Arm).\n• Hohe Accuracy auf Bursts ist das Fundament für spätere Deathstreams."
+            resp = "⚡ **Speed & Burst-Präzision:**\n• Trainiere kurze 5- bis 9-Note-Bursts auf hohem BPM (220+ BPM).\n• Nutze explosive Finger-Beschleunigung aus den Fingergelenken (nicht aus dem ganzen Arm).\n• Hohe Accuracy auf Bursts ist das Fundament für spätere Deathstreams."
+            self.log_ai_event("Offline-Coach: Speed", {"query": query}, raw_ai_response=resp)
+            return resp
         if "reading" in q or "low ar" in q:
-            return "📖 **Reading & AR-Verarbeitung:**\n• Low-AR (AR 8.0 - 8.8): Trainiert das Verarbeiten hoher Objektdichte und inneres Taktgefühl.\n• High-AR (AR 10.3+): Trainiert reine Reaktionszeit und Snap-Schnelligkeit.\n• Entspanne deinen Blick und nimm das gesamte Spielfeld wahr."
+            resp = "📖 **Reading & AR-Verarbeitung:**\n• Low-AR (AR 8.0 - 8.8): Trainiert das Verarbeiten hoher Objektdichte und inneres Taktgefühl.\n• High-AR (AR 10.3+): Trainiert reine Reaktionszeit und Snap-Schnelligkeit.\n• Entspanne deinen Blick und nimm das gesamte Spielfeld wahr."
+            self.log_ai_event("Offline-Coach: Reading", {"query": query}, raw_ai_response=resp)
+            return resp
         if "turnier" in q or "mappool" in q or "owc" in q:
-            return "🏆 **Turnier-Struktur & Match-Strategie:**\n• NM1: Jump Aim | NM2: Flow Aim | NM3: Speed | NM4: Stamina | NM5: Tech | NM6: Reading\n• HD/HR/DT/FM Slots + Tiebreaker (TB)\n• Banne immer die stärksten Comfort-Picks deines Gegners und sichere dir Maps, auf denen dein Skill Floor solide ist."
-        return "🎯 **Dein KI-Coach:** Ich passe dein Training laufend an deine Leistung an! Sag mir einfach jederzeit, welches Skillset (Streams, Aim, Speed, Tech, Stamina) oder welches Sterne-Level (z. B. ★ 7.0) du trainieren willst!"
+            resp = "🏆 **Turnier-Struktur & Match-Strategie:**\n• NM1: Jump Aim | NM2: Flow Aim | NM3: Speed | NM4: Stamina | NM5: Tech | NM6: Reading\n• HD/HR/DT/FM Slots + Tiebreaker (TB)\n• Banne immer die stärksten Comfort-Picks deines Gegners und sichere dir Maps, auf denen dein Skill Floor solide ist."
+            self.log_ai_event("Offline-Coach: Turniere", {"query": query}, raw_ai_response=resp)
+            return resp
+
+        resp = "🎯 **Dein KI-Coach:** Ich passe dein Training laufend an deine Leistung an! Frag mich zu Tapping, Aiming, Ergonomie, osu! Mods (AP, RX, HT, HR, DT) oder nenne mir dein gewünschtes Sterne-Level (z. B. ★ 6.5)!"
+        self.log_ai_event("Offline-Coach: Allgemein", {"query": query}, raw_ai_response=resp)
+        return resp
 
     # ---------------------------------------------------------------------------
     # TAGES- & SESSION-RECAP SYSTEM (5-MIN PROCESS INACTIVITY & LIVE TRACKING)
@@ -5966,7 +7341,7 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
 
         ctk.CTkButton(frame, text="🌐 Multiplayer", font=("Arial", 15, "bold"), width=330, height=42, corner_radius=10,
                       fg_color="#00BFA5", hover_color="#00897B", text_color="#ffffff",
-                      command=self.show_multiplayer_hub).pack(pady=5)
+                      command=lambda: self.ensure_osu_irc_password(on_success_callback=self.show_multiplayer_hub)).pack(pady=5)
 
         ctk.CTkButton(frame, text="⚙️ Einstellungen", font=("Arial", 14, "bold"), width=330, height=40, corner_radius=10,
                       fg_color="#2b2b36", hover_color="#3a3a48", command=self.show_settings).pack(pady=5)
@@ -5979,6 +7354,151 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
         ai_btn = ctk.CTkButton(master, text="🤖 Mit KI reden", width=140, height=36, font=("Arial", 13, "bold"),
                                fg_color="#E91E63", hover_color="#C2185B", command=self.show_ai_chat)
         ai_btn.place(relx=0.03, rely=0.03, anchor="nw")
+
+    def ensure_osu_irc_password(self, on_success_callback, cancel_callback=None):
+        """
+        Ensures that the osu! IRC password is configured before entering Multiplayer or Tournament modes.
+        If already configured, invokes on_success_callback immediately.
+        Otherwise, displays a modal dialog prompting the user to enter their IRC server password from https://osu.ppy.sh/p/irc.
+        Once saved, it is stored permanently in settings and not asked again.
+        """
+        cur_pwd = getattr(self, "osu_irc_password", "").strip()
+        cur_user = getattr(self, "osu_username", "").strip()
+
+        if cur_pwd and cur_user:
+            if callable(on_success_callback):
+                on_success_callback()
+            return
+
+        modal = ctk.CTkToplevel(self)
+        modal.title("🔑 osu! IRC-Passwort erforderlich")
+        modal.geometry("600x520")
+        modal.resizable(False, False)
+        modal.configure(fg_color="#121216")
+        modal.attributes("-topmost", True)
+        try:
+            modal.grab_set()
+        except Exception:
+            pass
+
+        # Header Box
+        hdr = ctk.CTkFrame(modal, fg_color="#181824", corner_radius=12, border_width=1, border_color="#2e2e42")
+        hdr.pack(fill="x", padx=20, pady=(20, 10))
+
+        h_left = ctk.CTkFrame(hdr, fg_color="transparent")
+        h_left.pack(side="left", padx=16, pady=12)
+        ctk.CTkLabel(h_left, text="🔑 osu! IRC-Passwort Einrichtung", font=("Arial", 16, "bold"), text_color="#00E5FF").pack(anchor="w")
+        ctk.CTkLabel(h_left, text="Einmalig erforderlich für Multiplayer & Turniersimulator",
+                     font=("Arial", 11), text_color="#888899").pack(anchor="w")
+        ctk.CTkLabel(hdr, text=" BANCHO IRC ", font=("Arial", 10, "bold"), fg_color="#00E5FF", text_color="#000000", corner_radius=6).pack(side="right", padx=16)
+
+        # Info Box
+        info_box = ctk.CTkFrame(modal, fg_color="#1a1a24", corner_radius=10, border_width=1, border_color="#2b2b3c")
+        info_box.pack(fill="x", padx=20, pady=(0, 12))
+
+        info_text = (
+            "Damit UHO Hub automatisch private Multiplayer-Lobbies (ScoreV2, Auto-Invite & Map-Picks) "
+            "auf dem offiziellen osu! Bancho-Server erstellen kann, wird dein persönliches osu! Server-Passwort benötigt.\n\n"
+            "⚠️ HINWEIS: Dies ist NICHT dein normales osu!-Login-Passwort, sondern dein generiertes Server-Passwort von der osu!-Website."
+        )
+        ctk.CTkLabel(info_box, text=info_text, font=("Arial", 11), text_color="#cccccc", justify="left", wraplength=540).pack(padx=14, pady=10)
+
+        # Web link button
+        def _open_irc_page():
+            webbrowser.open("https://osu.ppy.sh/p/irc")
+
+        ctk.CTkButton(modal, text="🌐 osu.ppy.sh/p/irc im Browser öffnen (Passwort kopieren) ➔", font=("Arial", 12, "bold"),
+                      fg_color="#3b8ed0", hover_color="#2a6ca6", text_color="#ffffff", height=32, command=_open_irc_page).pack(fill="x", padx=20, pady=(0, 12))
+
+        # Username / Password Form Frame
+        form_frame = ctk.CTkFrame(modal, fg_color="#181822", corner_radius=10, border_width=1, border_color="#2b2b3c")
+        form_frame.pack(fill="x", padx=20, pady=(0, 14))
+
+        # Username row if missing
+        u_entry = None
+        if not cur_user:
+            u_row = ctk.CTkFrame(form_frame, fg_color="transparent")
+            u_row.pack(fill="x", padx=14, pady=(10, 4))
+            ctk.CTkLabel(u_row, text="Dein osu! Spielername:", font=("Arial", 11, "bold"), text_color="#aaaaaa", width=170, anchor="w").pack(side="left")
+            u_entry = ctk.CTkEntry(u_row, placeholder_text="z. B. Mrekk", height=30)
+            u_entry.pack(side="left", fill="x", expand=True)
+
+        # Password row
+        p_row = ctk.CTkFrame(form_frame, fg_color="transparent")
+        p_row.pack(fill="x", padx=14, pady=(10 if cur_user else 4, 10))
+        ctk.CTkLabel(p_row, text="osu! IRC-Server-Passwort:", font=("Arial", 11, "bold"), text_color="#aaaaaa", width=170, anchor="w").pack(side="left")
+        p_entry = ctk.CTkEntry(p_row, placeholder_text="Server-Passwort hier einfügen...", show="*", height=30)
+        p_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        # Toggle show password button
+        def _toggle_pwd():
+            if p_entry.cget("show") == "*":
+                p_entry.configure(show="")
+                toggle_btn.configure(text="🔒")
+            else:
+                p_entry.configure(show="*")
+                toggle_btn.configure(text="👁️")
+
+        toggle_btn = ctk.CTkButton(p_row, text="👁️", width=32, height=30, fg_color="#252530", hover_color="#353545", command=_toggle_pwd)
+        toggle_btn.pack(side="right")
+
+        err_lbl = ctk.CTkLabel(modal, text="", font=("Arial", 11, "bold"), text_color="#FF5252")
+        err_lbl.pack(pady=(0, 6))
+
+        # Buttons
+        btn_row = ctk.CTkFrame(modal, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(0, 16))
+
+        def _on_save():
+            entered_pwd = p_entry.get().strip()
+            entered_user = u_entry.get().strip() if u_entry else getattr(self, "osu_username", "").strip()
+
+            if not entered_user:
+                err_lbl.configure(text="❌ Bitte gib deinen osu!-Spielernamen ein.")
+                return
+            if not entered_pwd:
+                err_lbl.configure(text="❌ Bitte füge dein Server-Passwort von osu.ppy.sh/p/irc ein.")
+                return
+
+            self.osu_username = entered_user
+            self.osu_irc_password = entered_pwd
+            self.save_global_settings()
+            
+            try:
+                modal.grab_release()
+                modal.destroy()
+            except Exception:
+                pass
+
+            if callable(on_success_callback):
+                on_success_callback()
+
+        def _on_offline():
+            try:
+                modal.grab_release()
+                modal.destroy()
+            except Exception:
+                pass
+            if callable(on_success_callback):
+                on_success_callback()
+
+        def _on_cancel():
+            try:
+                modal.grab_release()
+                modal.destroy()
+            except Exception:
+                pass
+            if callable(cancel_callback):
+                cancel_callback()
+
+        ctk.CTkButton(btn_row, text="Abbrechen", width=90, height=36, font=("Arial", 11),
+                      fg_color="#25252e", hover_color="#353540", command=_on_cancel).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(btn_row, text="🎮 Ohne IRC starten (Lokal)", width=170, height=36, font=("Arial", 11, "bold"),
+                      fg_color="#333348", hover_color="#44445c", text_color="#00E5FF", command=_on_offline).pack(side="left")
+
+        ctk.CTkButton(btn_row, text="💾 Speichern & mit Bancho starten ➔", height=36, font=("Arial", 12, "bold"),
+                      fg_color="#00E676", hover_color="#00C853", text_color="#000000", command=_on_save).pack(side="right", fill="x", expand=True, padx=(10, 0))
 
     # ---------------------------------------------------------------------------
     # MULTIPLAYER HUB (1v1, 2v2, 3v3, 4v4 • BANCHO REFEREE BOT • TOURNAMENT SCRIMS)
@@ -6023,7 +7543,8 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
                      font=("Arial", 12), text_color="#aaeedd", justify="left", wraplength=340).pack(padx=16, pady=(4, 12), anchor="w")
 
         ctk.CTkButton(c1, text="⚔️ Turnier-Match erstellen ➔", font=("Arial", 13, "bold"), height=38,
-                      fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=self.show_multiplayer_match_setup).pack(fill="x", padx=16, side="bottom", pady=16)
+                      fg_color="#00BFA5", hover_color="#00897B", text_color="#000000",
+                      command=lambda: self.ensure_osu_irc_password(on_success_callback=self.show_multiplayer_match_setup)).pack(fill="x", padx=16, side="bottom", pady=16)
 
         # CARD 2: BANCHO LOUNGE (HOST ROTATION)
         c2 = ctk.CTkFrame(grid_frame, fg_color="#1a1828", corner_radius=16, border_width=2, border_color="#9C27B0", width=380, height=220)
@@ -6040,7 +7561,7 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
 
         ctk.CTkButton(c2, text="🔄 Host-Rotation starten ➔", font=("Arial", 13, "bold"), height=38,
                       fg_color="#AB47BC", hover_color="#8E24AA", text_color="#ffffff",
-                      command=self.show_host_rotation_setup).pack(fill="x", padx=16, side="bottom", pady=16)
+                      command=lambda: self.ensure_osu_irc_password(on_success_callback=self.show_host_rotation_setup)).pack(fill="x", padx=16, side="bottom", pady=16)
 
         # CARD 3: CUSTOM SCRIMS & MAPPOOL
         c3 = ctk.CTkFrame(grid_frame, fg_color="#181824", corner_radius=16, border_width=2, border_color="#00E5FF", width=380, height=220)
@@ -7543,31 +9064,39 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
     BOT_DIFFICULTIES = {
         "🟢 Rookie (Warmup Bot)": {
             "name": "Rookie-Bot",
-            "acc_range": (93.0, 96.0),
-            "miss_range": (2, 5),
-            "combo_ratio": 0.68,
-            "desc": "Macht gelegentliche Fehler bei schwierigen Patterns."
+            "tier_key": "Rookie",
+            "point_pool": 160,
+            "acc_range": (92.0, 96.5),
+            "miss_range": (2, 6),
+            "combo_ratio": 0.65,
+            "desc": "10 Base + ~80 Pkt Pool (160 Gesamt) • Gelegentliche Combo-Breaks bei schnellen Patterns."
         },
         "🔵 Challenger (Solide)": {
             "name": "Challenger-Bot",
-            "acc_range": (96.5, 98.2),
-            "miss_range": (0, 2),
-            "combo_ratio": 0.85,
-            "desc": "Stabiler Turniergegner mit konstanter Match-Acc."
+            "tier_key": "Challenger",
+            "point_pool": 240,
+            "acc_range": (95.5, 98.2),
+            "miss_range": (0, 3),
+            "combo_ratio": 0.82,
+            "desc": "10 Base + ~160 Pkt Pool (240 Gesamt) • Ausgeglichener Turniergegner mit solider Match-Acc."
         },
         "🟣 Tournament Pro": {
             "name": "Pro-Bot",
-            "acc_range": (98.2, 99.4),
+            "tier_key": "Pro",
+            "point_pool": 400,
+            "acc_range": (97.8, 99.2),
             "miss_range": (0, 1),
-            "combo_ratio": 0.95,
-            "desc": "Erfahrener Turnierspieler, extrem gefährlich auf Signature-Slots."
+            "combo_ratio": 0.94,
+            "desc": "10 Base + ~320 Pkt Pool (400 Gesamt) • Starker Turnierspieler, hochgefährlich auf Signature-Slots."
         },
         "🔴 Legende (Mrekk-Bot)": {
             "name": "Mrekk-Bot",
-            "acc_range": (99.1, 99.8),
+            "tier_key": "Legend",
+            "point_pool": 640,
+            "acc_range": (99.0, 99.8),
             "miss_range": (0, 0),
             "combo_ratio": 0.99,
-            "desc": "Weltklasse Top-Seed mit fast unmenschlicher Präzision."
+            "desc": "10 Base + ~560 Pkt Pool (640 Gesamt) • Weltklasse Top-Seed mit fast unmenschlicher Präzision & Speed."
         }
     }
 
@@ -7664,6 +9193,18 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                                                   command=lambda _: self._update_tourney_desc_text())
         self.tourney_fmt_opt.pack(side="right", fill="x", expand=True)
 
+        # Team-Format (1v1, 2v2, 3v3, 4v4) Selector
+        team_row = ctk.CTkFrame(left_frame, fg_color="transparent")
+        team_row.pack(fill="x", padx=20, pady=4)
+        ctk.CTkLabel(team_row, text="Team-Format:", font=("Arial", 12, "bold"), text_color="#aaaaaa", width=90, anchor="w").pack(side="left")
+
+        self.tourney_team_size_var = ctk.StringVar(value="1v1 Einzelduell (Solo)")
+        team_opts = ["1v1 Einzelduell (Solo)", "2v2 Team-Duell (2 vs 2)", "3v3 Team-Clash (3 vs 3)", "4v4 World Cup (4 vs 4)"]
+        self.tourney_team_size_opt = ctk.CTkOptionMenu(team_row, values=team_opts, variable=self.tourney_team_size_var,
+                                                      font=("Arial", 12, "bold"), fg_color="#262635", button_color="#353548",
+                                                      command=lambda _: self._update_tourney_desc_text())
+        self.tourney_team_size_opt.pack(side="right", fill="x", expand=True)
+
         # Protects / Saves Selector
         prot_row = ctk.CTkFrame(left_frame, fg_color="transparent")
         prot_row.pack(fill="x", padx=20, pady=4)
@@ -7719,9 +9260,13 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                                                 fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000",
                                                 command=self.show_custom_mappool_builder)
         
+        def on_tourney_start_click():
+            self.load_global_settings()
+            self.ensure_osu_irc_password(on_success_callback=self.start_tournament_match)
+
         self.tourney_start_btn = ctk.CTkButton(right_frame, text="⚔️ Turnier-Match starten ➔", font=("Arial", 15, "bold"), height=48,
                                                fg_color="#FF9800", hover_color="#F57C00", text_color="#000000",
-                                               command=self.start_tournament_match)
+                                               command=on_tourney_start_click)
         self.tourney_start_btn.pack(fill="x", padx=20, side="bottom", pady=(6, 20))
         
         if self.tourney_type_var.get() == "Custom":
@@ -7983,95 +9528,311 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 "ar": chosen.get("ar", 9.0),
                 "od": chosen.get("od", 8.0),
                 "year": chosen.get("year", 2024),
-                "state": "available" # available, banned_player, banned_bot, picked, won_player, won_bot
+                "state": "available"
             }
         return pool
 
     def start_tournament_match(self):
-        t_key = self.tourney_type_var.get()
-        div_key = self.tourney_div_var.get()
-        yr_val = self.tourney_year_var.get()
-        st_val = getattr(self, "tourney_stage_var", None)
-        stage_name = st_val.get() if st_val else "Grand Finals"
-        bot_key = self.tourney_bot_var.get()
-        fmt_val = self.tourney_fmt_var.get()
+        try:
+            t_key = self.tourney_type_var.get() if hasattr(self, "tourney_type_var") else "OWC"
+            div_key = self.tourney_div_var.get() if hasattr(self, "tourney_div_var") else "5WC (5-Digit)"
+            yr_val = self.tourney_year_var.get() if hasattr(self, "tourney_year_var") else "2025"
+            st_val = getattr(self, "tourney_stage_var", None)
+            stage_name = st_val.get() if st_val else "Grand Finals"
+            bot_key = self.tourney_bot_var.get() if hasattr(self, "tourney_bot_var") else "🔵 Challenger (Solide)"
+            fmt_val = self.tourney_fmt_var.get() if hasattr(self, "tourney_fmt_var") else "Best of 13 (First to 7)"
+            team_size_str = getattr(self, "tourney_team_size_var", None)
+            team_size_choice = team_size_str.get() if team_size_str else "1v1 Einzelduell (Solo)"
 
-        cfg = self.TOURNAMENTS_CONFIG.get(t_key, {})
-        div_cfg = cfg.get("divisions", {}).get(div_key, {"min_sr": 5.2, "max_sr": 6.2})
-        bot_cfg = self.BOT_DIFFICULTIES.get(bot_key, self.BOT_DIFFICULTIES["🔵 Challenger (Solide)"])
+            if "4v4" in team_size_choice: team_size = 4
+            elif "3v3" in team_size_choice: team_size = 3
+            elif "2v2" in team_size_choice: team_size = 2
+            else: team_size = 1
 
-        pool = self.generate_tournament_mappool(div_cfg["min_sr"], div_cfg["max_sr"], yr_val, tourney_key=t_key, div_key=div_key, stage=stage_name)
+            cfg = self.TOURNAMENTS_CONFIG.get(t_key, {})
+            div_cfg = cfg.get("divisions", {}).get(div_key, {"min_sr": 5.2, "max_sr": 6.2})
+            bot_cfg = self.BOT_DIFFICULTIES.get(bot_key, self.BOT_DIFFICULTIES.get("🔵 Challenger (Solide)", {}))
+            bot_tier = bot_cfg.get("tier_key", "Challenger")
+            player_name = getattr(self, "osu_username", "") or "Spieler"
 
-        if "Qualifiers" in stage_name or "Qualifiers" in fmt_val:
-            target_wins = len(pool)
-            initial_phase = "pick"
-            protects_needed = 0
-            bans_needed = 0
-        else:
-            initial_phase = "roll"
-            if "Best of 7" in fmt_val:
-                target_wins = 4
-            elif "Best of 11" in fmt_val:
-                target_wins = 6
-            elif "Best of 13" in fmt_val:
-                target_wins = 7
-            else:
-                target_wins = 5
+            pool = self.generate_tournament_mappool(div_cfg.get("min_sr", 5.2), div_cfg.get("max_sr", 6.2), yr_val, tourney_key=t_key, div_key=div_key, stage=stage_name)
+            roster = generate_team_roster(team_size, bot_tier, player_username=player_name)
 
-            prot_val = getattr(self, "tourney_prot_var", None)
-            prot_choice = prot_val.get() if prot_val else "Auto (Runden-Standard)"
-            if "1 Save" in prot_choice:
-                protects_needed = 2
-            elif "2 Saves" in prot_choice:
-                protects_needed = 4
-            elif "0 Saves" in prot_choice:
+            if "Qualifiers" in stage_name or "Qualifiers" in fmt_val:
+                target_wins = len(pool)
+                initial_phase = "pick"
                 protects_needed = 0
-            else:
-                if any(k in stage_name for k in ["Quarterfinals", "Semifinals", "Finals", "Grand Finals"]):
-                    protects_needed = 2
-                else:
-                    protects_needed = 0
-
-            bans_val = getattr(self, "tourney_bans_var", None)
-            bans_choice = bans_val.get() if bans_val else "Auto (Runden-Standard)"
-            if "1 Ban" in bans_choice:
-                bans_needed = 2
-            elif "2 Bans" in bans_choice:
-                bans_needed = 4
-            elif "0 Bans" in bans_choice:
                 bans_needed = 0
             else:
-                if "Best of 7" in fmt_val or "Round of 32" in stage_name or "Round of 16" in stage_name:
-                    bans_needed = 2
+                initial_phase = "roll"
+                if "Best of 7" in fmt_val:
+                    target_wins = 4
+                elif "Best of 11" in fmt_val:
+                    target_wins = 6
+                elif "Best of 13" in fmt_val:
+                    target_wins = 7
                 else:
+                    target_wins = 5
+
+                prot_val = getattr(self, "tourney_prot_var", None)
+                prot_choice = prot_val.get() if prot_val else "Auto (Runden-Standard)"
+                if "1 Save" in prot_choice:
+                    protects_needed = 2
+                elif "2 Saves" in prot_choice:
+                    protects_needed = 4
+                elif "0 Saves" in prot_choice:
+                    protects_needed = 0
+                else:
+                    if any(k in stage_name for k in ["Quarterfinals", "Semifinals", "Finals", "Grand Finals"]):
+                        protects_needed = 2
+                    else:
+                        protects_needed = 0
+
+                bans_val = getattr(self, "tourney_bans_var", None)
+                bans_choice = bans_val.get() if bans_val else "Auto (Runden-Standard)"
+                if "1 Ban" in bans_choice:
+                    bans_needed = 2
+                elif "2 Bans" in bans_choice:
                     bans_needed = 4
+                elif "0 Bans" in bans_choice:
+                    bans_needed = 0
+                else:
+                    if "Best of 7" in fmt_val or "Round of 32" in stage_name or "Round of 16" in stage_name:
+                        bans_needed = 2
+                    else:
+                        bans_needed = 4
 
-        self.tourney_match = {
-            "tournament": cfg.get("name", "Turnier"),
-            "badge": cfg.get("badge", "OWC"),
-            "division": div_key,
-            "stage": stage_name,
-            "year": yr_val,
-            "bot_name": bot_cfg["name"],
-            "bot_cfg": bot_cfg,
-            "target_wins": target_wins,
-            "format_name": fmt_val,
-            "player_score": 0,
-            "bot_score": 0,
-            "phase": initial_phase,
-            "turn": "player",
-            "player_roll": None,
-            "bot_roll": None,
-            "protects_needed": protects_needed,
-            "protects_done": 0,
-            "bans_needed": bans_needed,
-            "bans_done": 0,
-            "pool": pool,
-            "current_pick": None,
-            "history": []
+            self.load_global_settings()
+            u_name = getattr(self, "osu_username", "") or "Spieler"
+            u_irc = getattr(self, "osu_irc_password", "").strip()
+            if not u_irc:
+                try:
+                    appdata = os.environ.get('APPDATA', '')
+                    s_path = os.path.join(appdata, 'osu_training_tracker_settings.json')
+                    if os.path.exists(s_path):
+                        with open(s_path, 'r', encoding='utf-8') as sf:
+                            sd = json.load(sf)
+                            u_irc = sd.get('osu_irc_password', '').strip()
+                            if u_irc:
+                                self.osu_irc_password = u_irc
+                            if not u_name or u_name == 'Spieler':
+                                u_name = sd.get('osu_username', '').strip() or u_name
+                except Exception:
+                    pass
+
+            init_logs = [
+                f"[{time.strftime('%H:%M:%S')}] 🎮 Turniermodus gestartet: {cfg.get('badge', 'OWC')} {div_key} ({fmt_val})",
+                f"[{time.strftime('%H:%M:%S')}] 🔒 Prüfe Bancho IRC-Verbindung für '{u_name}'..."
+            ]
+
+            self.tourney_match = {
+                "tournament": cfg.get("name", "Turnier"),
+                "badge": cfg.get("badge", "OWC"),
+                "division": div_key,
+                "stage": stage_name,
+                "year": yr_val,
+                "bot_name": roster["opponent_team"][0]["name"],
+                "bot_cfg": bot_cfg,
+                "bot_profile": roster["opponent_team"][0],
+                "bot_stats": roster["opponent_team"][0]["stats"],
+                "team_size": team_size,
+                "roster": roster,
+                "player_team": roster["player_team"],
+                "opponent_team": roster["opponent_team"],
+                "target_wins": target_wins,
+                "format_name": fmt_val,
+                "team_format_name": team_size_choice,
+                "player_score": 0,
+                "bot_score": 0,
+                "phase": initial_phase,
+                "turn": "player",
+                "player_roll": None,
+                "bot_roll": None,
+                "protects_needed": protects_needed,
+                "protects_done": 0,
+                "bans_needed": bans_needed,
+                "bans_done": 0,
+                "pool": pool,
+                "current_pick": None,
+                "history": [],
+                "referee_active": False,
+                "referee_channel": None,
+                "referee_match_id": None,
+                "referee_status": "Lokaler Modus (Replay / API)",
+                "referee_logs": [],
+                "bot_logs": init_logs
+            }
+
+            if getattr(self, "tourney_referee_bot", None):
+                try: self.tourney_referee_bot.close_lobby()
+                except: pass
+                self.tourney_referee_bot = None
+
+            # Render Lobby UI first so feed box is immediately visible
+            self.show_tournament_match_lobby()
+
+            if u_name and u_irc:
+                final_pwd = f"uho{random.randint(100, 999)}"
+                self.tourney_match["password"] = final_pwd
+                lobby_name = f"UHO Hub: {cfg.get('badge', 'OWC')} Solo"
+                self.tourney_referee_bot = BanchoRefereeBot(
+                    username=u_name,
+                    irc_password=u_irc,
+                    on_log=self._tourney_ref_log_callback,
+                    on_match_created=self._tourney_ref_on_created,
+                    on_round_ended=self._tourney_ref_on_round_ended,
+                    on_chat_command=self.handle_tourney_chat_command,
+                    on_player_score=self._tourney_ref_on_score
+                )
+                self.tourney_referee_bot.connect_and_host(lobby_name=lobby_name, password=final_pwd)
+            else:
+                self.tourney_referee_bot = None
+                if not u_irc:
+                    self._tourney_ref_log_callback("❌ FEHLERCODE [ERR_NO_IRC_PASSWORD]: Kein Bancho IRC-Passwort hinterlegt!", "#FF5252")
+                    self._tourney_ref_log_callback("👉 Trage dein Server-Passwort von https://osu.ppy.sh/p/irc in den Einstellungen ein.", "#FFA726")
+                if not u_name:
+                    self._tourney_ref_log_callback("❌ FEHLERCODE [ERR_NO_USERNAME]: Kein osu! Spielername hinterlegt!", "#FF5252")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self.show_tournament_match_lobby()
+            except:
+                pass
+
+    def _tourney_ref_log_callback(self, text, color="#aaaaaa"):
+        if not hasattr(self, "tourney_match") or not isinstance(self.tourney_match, dict):
+            return
+        entry = f"[{time.strftime('%H:%M:%S')}] {text}"
+        self.tourney_match.setdefault("bot_logs", []).append(entry)
+        self.tourney_match["bot_logs"] = self.tourney_match["bot_logs"][-30:]
+
+        def update_ui():
+            if hasattr(self, "tourney_feed_box") and self.tourney_feed_box.winfo_exists():
+                self.tourney_feed_box.configure(state="normal")
+                self.tourney_feed_box.delete("1.0", "end")
+                self.tourney_feed_box.insert("1.0", "\n".join(self.tourney_match.get("bot_logs", [])))
+                self.tourney_feed_box.configure(state="disabled")
+                try: self.tourney_feed_box.see("end")
+                except: pass
+        self.after(0, update_ui)
+
+    def _tourney_ref_on_created(self, match_id, channel):
+        if not hasattr(self, "tourney_match") or not self.tourney_match:
+            return
+        self.tourney_match["match_id"] = match_id
+        self.tourney_match["irc_channel"] = channel
+        self.tourney_match["referee_match_id"] = match_id
+        self.tourney_match["referee_channel"] = channel
+        self._tourney_ref_log_callback(f"🚀 Ingame-Lobby erstellt: {channel}", "#00E676")
+        
+        # Configure room and invite player asynchronously + broadcast pool exactly like multiplayer
+        def _bg_invite():
+            time.sleep(1.0)
+            if getattr(self, "tourney_referee_bot", None):
+                self.tourney_referee_bot.set_team_mode(self.tourney_match.get("team_size", 1))
+                u_name = getattr(self, "osu_username", "") or "Spieler"
+                time.sleep(0.8)
+                self.tourney_referee_bot.invite_player(u_name)
+                self.tourney_referee_bot.send_channel_message(f"Willkommen zum UHO Hub Turniermatch: {self.tourney_match.get('badge', 'OWC')}!")
+                self._tourney_ref_log_callback(f"✉️ Ingame-Einladung an '{u_name}' gesendet!", "#00E676")
+                time.sleep(1.0)
+                self.tourney_referee_bot.broadcast_mappool(self.tourney_match.get("pool", {}), self.tourney_match.get("stage", "Turnier"))
+        threading.Thread(target=_bg_invite, daemon=True).start()
+
+        self.after(0, self.refresh_tourney_lobby_state)
+
+    def _tourney_ref_on_round_ended(self):
+        """Callback when BanchoBot reports round ended in tournament match."""
+        self.after(1000, lambda: self.fetch_tourney_recent_plays(silent=False))
+
+    def _tourney_ref_on_score(self, username, scorev2, status, raw_msg):
+        """Layer 1 Telemetry: Instant ScoreV2 Capture from Bancho IRC Stream (0ms latency)."""
+        m = getattr(self, "tourney_match", None)
+        if not m or m.get("phase") != "playing":
+            return
+        
+        self._tourney_ref_log_callback(f"🎯 ScoreV2 aus Bancho-Lobby erfasst für '{username}': {scorev2:,} ({status})", "#00E676")
+        
+        play_data = {
+            "player_name": username,
+            "score": scorev2,
+            "scorev2": scorev2,
+            "status": status,
+            "count300": 0, "count100": 0, "count50": 0, "countmiss": 0,
+            "source": "bancho_irc"
         }
+        self.safe_ui_dispatch(self, lambda p=play_data: self.process_tourney_match_round(p))
 
-        self.show_tournament_match_lobby()
+    def handle_tourney_chat_command(self, sender, cmd, arg, full_msg):
+        """Handles in-game chat commands sent by player to #mp_<id>."""
+        m = getattr(self, "tourney_match", None)
+        if not m: return
+        bot = getattr(self, "tourney_referee_bot", None)
+        cmd_clean = cmd.lower().strip()
+        arg_clean = arg.upper().strip()
+        phase = m.get("phase", "roll")
+
+        if cmd_clean in ["roll", "r", "dice", "wuerfeln"]:
+            if phase == "roll":
+                self.safe_ui_dispatch(self, self.tourney_do_roll)
+            elif bot:
+                bot.send_channel_message(f"@{sender}: Die Roll-Phase ist bereits beendet.")
+
+        elif cmd_clean in ["save", "protect", "s", "schuetzen"]:
+            if phase == "protect" and m.get("turn") == "player":
+                if arg_clean in m.get("pool", {}) and m["pool"][arg_clean].get("state") == "available" and arg_clean != "TB":
+                    self.safe_ui_dispatch(self, lambda s=arg_clean: self.tourney_player_do_protect(s))
+                elif bot:
+                    bot.send_channel_message(f"@{sender}: Slot '{arg_clean}' ist ungültig oder nicht verfügbar.")
+            elif bot:
+                bot.send_channel_message(f"@{sender}: Aktuell ist keine Protect-Phase oder du bist nicht am Zug.")
+
+        elif cmd_clean in ["ban", "b", "bann", "bannen"]:
+            if phase == "ban" and m.get("turn") == "player":
+                if arg_clean in m.get("pool", {}) and m["pool"][arg_clean].get("state") == "available" and arg_clean != "TB":
+                    self.safe_ui_dispatch(self, lambda s=arg_clean: self.tourney_player_do_ban(s))
+                elif bot:
+                    bot.send_channel_message(f"@{sender}: Slot '{arg_clean}' ist ungültig oder bereits gebannt.")
+            elif bot:
+                bot.send_channel_message(f"@{sender}: Aktuell ist keine Ban-Phase oder du bist nicht am Zug.")
+
+        elif cmd_clean in ["pick", "p", "choose", "select", "waehlen"]:
+            if phase == "pick" and m.get("turn") == "player":
+                if arg_clean in m.get("pool", {}) and m["pool"][arg_clean].get("state") in ["available", "protected_player", "protected_bot"] and arg_clean != "TB":
+                    self.safe_ui_dispatch(self, lambda s=arg_clean: self.tourney_player_do_pick(s))
+                elif bot:
+                    bot.send_channel_message(f"@{sender}: Slot '{arg_clean}' ist ungültig oder nicht wählbar.")
+            elif bot:
+                bot.send_channel_message(f"@{sender}: Aktuell ist keine Pick-Phase oder du bist nicht am Zug.")
+
+        elif cmd_clean in ["ready", "rdy", "start", "gogo"]:
+            if phase == "playing" and bot:
+                bot.send_channel_message("🚀 Match-Countdown gestartet! (5 Sekunden)")
+                bot.start_countdown(5)
+            elif bot:
+                bot.send_channel_message("⚠️ Noch keine Map gewählt. Bitte zuerst im UI oder mit !pick <slot> wählen!")
+
+        elif cmd_clean in ["abort", "stop", "abbruch"]:
+            if bot:
+                bot.abort_match()
+                bot.send_channel_message("🛑 Match abgebrochen.")
+
+        elif cmd_clean in ["maps", "pool", "mappool"]:
+            if bot:
+                avail = [s for s, d in m.get("pool", {}).items() if d.get("state") in ["available", "protected_player", "protected_bot"]]
+                bot.send_channel_message(f"📋 Verfügbare Maps ({len(avail)}): " + ", ".join(avail[:8]))
+
+        elif cmd_clean in ["score", "stand", "punkte"]:
+            if bot:
+                p_pts = m.get("player_score", 0)
+                b_pts = m.get("bot_score", 0)
+                tw = m.get("target_wins", 5)
+                bot.send_channel_message(f"📊 Spielstand: Du [{p_pts}] : [{b_pts}] {m['bot_name']} (Ziel: {tw} Siege)")
+
+        elif cmd_clean in ["help", "commands", "befehle"]:
+            if bot:
+                bot.send_channel_message("📌 Befehle: !roll | !save <slot> | !ban <slot> | !pick <slot> | !ready | !abort | !maps | !score")
 
     def show_tournament_match_lobby(self):
         for widget in self.winfo_children():
@@ -8083,26 +9844,33 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
         m = self.tourney_match
         player_name = getattr(self, "osu_username", "Spieler")
+        team_size = m.get("team_size", 1)
 
         master = ctk.CTkFrame(self, fg_color="#101015")
         master.pack(fill="both", expand=True)
         self.draw_lazer_background(master)
 
+        # Top Scoreboard Bar
         sb = ctk.CTkFrame(master, fg_color="#181822", height=75, corner_radius=14, border_width=1, border_color="#2b2b3c")
         sb.pack(fill="x", padx=20, pady=(12, 8))
         sb.pack_propagate(False)
 
+        # Player Team Box
         p_box = ctk.CTkFrame(sb, fg_color="transparent")
         p_box.pack(side="left", padx=20)
-        ctk.CTkLabel(p_box, text=f"👤 {player_name}", font=("Arial", 15, "bold"), text_color="#00E5FF").pack(anchor="w")
+        team_lbl = f"👤 Team {player_name}" if team_size > 1 else f"👤 {player_name}"
+        ctk.CTkLabel(p_box, text=team_lbl, font=("Arial", 15, "bold"), text_color="#00E5FF").pack(anchor="w")
         p_pts = "● " * m["player_score"] + "○ " * (m["target_wins"] - m["player_score"])
         self.tourney_player_pts_lbl = ctk.CTkLabel(p_box, text=f"Punkte: {m['player_score']} / {m['target_wins']}   [{p_pts.strip()}]",
                      font=("Arial", 12, "bold"), text_color="#00E676")
         self.tourney_player_pts_lbl.pack(anchor="w")
 
+        # Center Match Status
         c_box = ctk.CTkFrame(sb, fg_color="transparent")
         c_box.pack(side="left", expand=True)
-        ctk.CTkLabel(c_box, text=f"{m['badge']} {m['division']} • {m.get('stage', 'Match')} • {m['format_name']}", font=("Arial", 12, "bold"), text_color="#FF9800").pack()
+        ref_txt = m.get("referee_status", "Lokaler Modus")
+        ctk.CTkLabel(c_box, text=f"{m['badge']} {m['division']} • {m.get('team_format_name', '1v1')} • {m['format_name']} ({ref_txt})",
+                     font=("Arial", 11, "bold"), text_color="#FF9800").pack()
         
         phase_texts = {
             "roll": "🎲 ROLL-PHASE: Würfle um First Pick & First Ban / Save!",
@@ -8115,9 +9883,11 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         self.tourney_phase_lbl = ctk.CTkLabel(c_box, text=phase_texts.get(m["phase"], ""), font=("Arial", 12, "bold"), text_color="#ffffff")
         self.tourney_phase_lbl.pack()
 
+        # Opponent Team Box
         b_box = ctk.CTkFrame(sb, fg_color="transparent")
         b_box.pack(side="right", padx=20)
-        ctk.CTkLabel(b_box, text=f"🤖 {m['bot_name']}", font=("Arial", 15, "bold"), text_color="#E91E63").pack(anchor="e")
+        opp_lbl = f"🤖 Team {m['bot_name']}" if team_size > 1 else f"🤖 {m['bot_name']}"
+        ctk.CTkLabel(b_box, text=opp_lbl, font=("Arial", 15, "bold"), text_color="#E91E63").pack(anchor="e")
         b_pts = "● " * m["bot_score"] + "○ " * (m["target_wins"] - m["bot_score"])
         self.tourney_bot_pts_lbl = ctk.CTkLabel(b_box, text=f"[{b_pts.strip()}]   Punkte: {m['bot_score']} / {m['target_wins']}",
                      font=("Arial", 12, "bold"), text_color="#FF4081")
@@ -8129,40 +9899,264 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         main_box.grid_columnconfigure(1, weight=2)
         main_box.grid_rowconfigure(0, weight=1)
 
+        # Left Column: Mappool
         pool_frame = ctk.CTkFrame(main_box, fg_color="#14141c", corner_radius=12, border_width=1, border_color="#242434")
         pool_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
         p_top = ctk.CTkFrame(pool_frame, fg_color="transparent")
         p_top.pack(fill="x", padx=12, pady=(10, 4))
         ctk.CTkLabel(p_top, text="🗺️ Offizieller Turnier-Mappool", font=("Arial", 14, "bold"), text_color="#ffffff").pack(side="left")
+        def _leave_tourney():
+            if getattr(self, "tourney_referee_bot", None):
+                try: self.tourney_referee_bot.close_lobby()
+                except: pass
+                self.tourney_referee_bot = None
+            self.show_tournament_selector()
+
         ctk.CTkButton(p_top, text="⬅ Verlassen", width=80, height=26, font=("Arial", 11), fg_color="#2b2b36",
-                      command=self.show_tournament_selector).pack(side="right")
+                      command=_leave_tourney).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(p_top, text="📖 Slot-Guide & Skillsets", width=155, height=26, font=("Arial", 11, "bold"),
+                      fg_color="#1f538d", hover_color="#2b78c9", text_color="#ffffff",
+                      command=self.show_tourney_slot_guide_modal).pack(side="right")
 
         self.tourney_pool_scroll = ctk.CTkScrollableFrame(pool_frame, fg_color="transparent")
         self.tourney_pool_scroll.pack(fill="both", expand=True, padx=8, pady=4)
         self.render_mappool_cards()
 
+        # Right Column: Control & Feed & Radar
         ctrl_frame = ctk.CTkFrame(main_box, fg_color="#14141c", corner_radius=12, border_width=1, border_color="#242434")
         ctrl_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
-        ctk.CTkLabel(ctrl_frame, text="🎙️ Live-Caster & Match-Zentrale", font=("Arial", 14, "bold"), text_color="#ffffff").pack(pady=(10, 4))
+        c_top = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        c_top.pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(c_top, text="🎙️ Match-Zentrale & Scouting", font=("Arial", 14, "bold"), text_color="#ffffff").pack(side="left")
+        
+        # Team Radar Scouting Modal Button
+        ctk.CTkButton(c_top, text="👥 Team-Dossiers & Radar", font=("Arial", 11, "bold"), width=150, height=26,
+                      fg_color="#00BFA5", hover_color="#00897B", text_color="#000000",
+                      command=self.show_team_radar_scouting_modal).pack(side="right")
 
         self.tourney_act_bar = ctk.CTkFrame(ctrl_frame, fg_color="#1c1c28", corner_radius=10)
         self.tourney_act_bar.pack(fill="x", padx=12, pady=6)
         self.render_tourney_action_bar()
+
+        # Referee Console Header & Quick Actions (Identical to Multiplayer)
+        f_head = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        f_head.pack(fill="x", padx=12, pady=(4, 2))
+        ctk.CTkLabel(f_head, text="🤖 Referee & Ingame Feed", font=("Arial", 13, "bold"), text_color="#00BFA5").pack(side="left")
+
+        def open_lobby():
+            mid = m.get("match_id") or m.get("referee_match_id")
+            if mid:
+                try: os.startfile(f"osu://mp/{mid}")
+                except: webbrowser.open(f"https://osu.ppy.sh/mp/{mid}")
+            elif getattr(self, "tourney_referee_bot", None) and self.tourney_referee_bot.match_id:
+                try: os.startfile(f"osu://mp/{self.tourney_referee_bot.match_id}")
+                except: webbrowser.open(f"https://osu.ppy.sh/mp/{self.tourney_referee_bot.match_id}")
+
+        def force_sync():
+            self.fetch_tourney_recent_plays(silent=False)
+
+        def manual_invite():
+            u_name = getattr(self, "osu_username", "") or "Spieler"
+            u_irc = getattr(self, "osu_irc_password", "").strip()
+            bot = getattr(self, "tourney_referee_bot", None)
+            if bot and bot.channel and bot.running:
+                bot.invite_player(u_name)
+                bot._send_raw(f"PRIVMSG {u_name} :UHO Hub Lobby: [osu://mp/{bot.match_id} Hier klicken zum Beitreten] oder /join {bot.channel}")
+                self._tourney_ref_log_callback(f"✉️ Einladung & PM an '{u_name}' gesendet!", "#00E676")
+            elif bot and bot.connected:
+                self._tourney_ref_log_callback("⚠️ Bot ist eingeloggt, erstellt gerade die Lobby...", "#00E5FF")
+            elif not u_irc:
+                self._tourney_ref_log_callback("❌ FEHLERCODE [ERR_NO_IRC_PASSWORD]: Kein IRC-Passwort hinterlegt. Bitte eintragen!", "#FF5252")
+                self.ensure_osu_irc_password(on_success_callback=manual_invite)
+            elif not bot or not bot.running:
+                # Instant Auto-Start & Reconnect
+                self._tourney_ref_log_callback("⚡ Starte Referee Bot neu & verbinde mit Bancho...", "#00E5FF")
+                final_pwd = getattr(self, "tourney_match", {}).get("password") or f"uho{random.randint(100, 999)}"
+                if hasattr(self, "tourney_match") and isinstance(self.tourney_match, dict):
+                    self.tourney_match["password"] = final_pwd
+                lobby_name = f"UHO Hub: {getattr(self, 'tourney_match', {}).get('badge', 'OWC')} Solo"
+                self.tourney_referee_bot = BanchoRefereeBot(
+                    username=u_name,
+                    irc_password=u_irc,
+                    on_log=self._tourney_ref_log_callback,
+                    on_match_created=self._tourney_ref_on_created,
+                    on_round_ended=self._tourney_ref_on_round_ended,
+                    on_chat_command=self.handle_tourney_chat_command,
+                    on_player_score=self._tourney_ref_on_score
+                )
+                self.tourney_referee_bot.connect_and_host(lobby_name=lobby_name, password=final_pwd)
+            else:
+                self._tourney_ref_log_callback("⚠️ Bot verbindet noch mit Bancho IRC...", "#FFA726")
+
+        ctk.CTkButton(f_head, text="🎮 In Lobby", width=85, height=24, font=("Arial", 10, "bold"),
+                      fg_color="#00E676", hover_color="#00C853", text_color="#000000", command=open_lobby).pack(side="right")
+        ctk.CTkButton(f_head, text="✉️ Einladen", width=80, height=24, font=("Arial", 10, "bold"),
+                      fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=manual_invite).pack(side="right", padx=(0, 4))
 
         try:
             master.drop_target_register(DND_FILES)
             master.dnd_bind('<<Drop>>', self.handle_tourney_replay_drop)
         except: pass
 
-        ctk.CTkLabel(ctrl_frame, text="Match-Feed & Caster-Kommentare:", font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=14, pady=(6, 2))
-        self.tourney_feed_box = ctk.CTkTextbox(ctrl_frame, wrap="word", font=("Arial", 12), fg_color="#101016",
-                                               border_width=1, border_color="#20202e", corner_radius=8)
+        self.tourney_feed_box = ctk.CTkTextbox(ctrl_frame, wrap="word", font=("Arial", 11), fg_color="#101016",
+                                                border_width=1, border_color="#20202e", corner_radius=8)
         self.tourney_feed_box.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-        self._update_tourney_feed_display()
+        self.tourney_feed_box.insert("1.0", "\n".join(m.get("bot_logs", ["Warte auf Match-Aktivität..."])))
+        self.tourney_feed_box.configure(state="disabled")
+        try: self.tourney_feed_box.see("end")
+        except: pass
 
         self._start_tourney_match_auto_sync_loop()
+
+    def show_tourney_slot_guide_modal(self):
+        """Displays an educational modal explaining standard tournament slot skillset conventions."""
+        modal = ctk.CTkToplevel(self)
+        modal.title("📖 Offizieller Turnier-Slot & Skillset Guide")
+        modal.geometry("740x650")
+        modal.configure(fg_color="#121216")
+        modal.attributes("-topmost", True)
+
+        top_f = ctk.CTkFrame(modal, fg_color="#181822", height=50, corner_radius=10)
+        top_f.pack(fill="x", padx=15, pady=10)
+        top_f.pack_propagate(False)
+        ctk.CTkLabel(top_f, text="📖 Turnier-Slot & Skillset Konventionen (OWC / Turniere)", font=("Arial", 15, "bold"), text_color="#00E5FF").pack(side="left", padx=15)
+        ctk.CTkButton(top_f, text="Schließen", width=80, height=28, font=("Arial", 11), fg_color="#2b2b36", command=modal.destroy).pack(side="right", padx=15)
+
+        info_box = ctk.CTkFrame(modal, fg_color="#1a1a26", corner_radius=8, border_width=1, border_color="#2e2e42")
+        info_box.pack(fill="x", padx=15, pady=(0, 10))
+        ctk.CTkLabel(info_box, text="In offiziellen osu! Turnieren (wie OWC, Corsace, Roundtable) folgt jeder Mappool-Slot einer festen Skillset-Konvention. Nutze dieses Wissen für optimale Bans und Counter-Picks!",
+                     font=("Arial", 11), text_color="#bbbbcc", wraplength=690, justify="left").pack(padx=12, pady=8)
+
+        scroll = ctk.CTkScrollableFrame(modal, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+
+        slot_groups = {
+            "NoMod (NM)": [
+                ("NM1", "Consistency", "All-Around Konstanz, Jumps & Stabilität. Die Standard-Eröffnungsmap."),
+                ("NM2", "Aim & Precision", "Präzises Flow Aim, kleine Circle Size (CS > 4.5) & präzise Snaps."),
+                ("NM3", "Speed & Bursts", "Hohes Grundtempo (220+ BPM), Finger Speed, Quad- & Quint-Bursts."),
+                ("NM4", "Tech & Reading", "Komplexe Slider-Shapes, unkonventionelle Rhythmen & Reading-Dichte."),
+                ("NM5", "Finger Control", "Rhythmus-Wechsel (1/3, 1/4, 1/6 Snappings), Alternate & Control."),
+                ("NM6", "Stamina & High CS", "Lange Streams, hohe Ausdauerbelastung oder extreme Präzision.")
+            ],
+            "Hidden (HD)": [
+                ("HD1", "Aim & Reading", "Reines Aim mit Hidden-Mod. Testet Muscle-Memory & Notenpositionierung."),
+                ("HD2", "Tech & Flow", "SliderTech mit Hidden. Erfordert exaktes Lesen von Slider-Geschwindigkeiten."),
+                ("HD3", "Speed & Control", "Hohes Tempo / Bursts mit Hidden. Verlangt fehlerfreies Tapping-Timing.")
+            ],
+            "HardRock (HR)": [
+                ("HR1", "Precision & Aim", "Sehr kleine CS (CS 5.2 - 6.5) & AR 10. Testet maximale Zielgenauigkeit."),
+                ("HR2", "Consistency & Stamina", "Längere HR-Map mit Fokus auf Combo-Sicherheit & nervliche Ausdauer."),
+                ("HR3", "High AR Tech / Flow", "Schnelle Übergänge, Flow Aim & hohe Lesegeschwindigkeit.")
+            ],
+            "DoubleTime (DT)": [
+                ("DT1", "Pure Speed / Bursts", "Hohes BPM-Tempo (250 - 280+ BPM), schnelle Triplets & Burst-Streams."),
+                ("DT2", "Speed Aim / Jumps", "Schnelle Velocity-Jumps & snappy Aim bei hoher Geschwindigkeit."),
+                ("DT3", "Finger Control / Alt", "Komplexe Rhythmen auf DoubleTime, Alternate & Finger Control."),
+                ("DT4", "Stamina / Drain", "Lange DT-Maps mit hohem Ausdauer-Fokus & Drain.")
+            ],
+            "FreeMod (FM) & Tiebreaker (TB)": [
+                ("FM1", "Consistency & Hybrid", "Ausgewogener All-Rounder Slot. Erlaubt HD, HR, EZ oder NM."),
+                ("FM2", "Tech & Precision", "SliderTech / Präzisions-Map für Spezialisten (z. B. HDHR oder HD)."),
+                ("FM3", "Speed / Alt", "Tempo- & Alternate-Fokus für FreeMod-Strategien."),
+                ("TB", "Tiebreaker All-Around", "Lange (4-6 Min) epische Final-Map, die alle Skills kombiniert.")
+            ]
+        }
+
+        for group_title, items in slot_groups.items():
+            hdr = ctk.CTkFrame(scroll, fg_color="transparent")
+            hdr.pack(fill="x", pady=(8, 2))
+            ctk.CTkLabel(hdr, text=group_title, font=("Arial", 13, "bold"), text_color="#00E5FF").pack(side="left")
+
+            for s_code, s_skill, s_desc in items:
+                card = ctk.CTkFrame(scroll, fg_color="#181822", corner_radius=8, border_width=1, border_color="#2b2b3c")
+                card.pack(fill="x", pady=3)
+
+                r = ctk.CTkFrame(card, fg_color="transparent")
+                r.pack(fill="x", padx=10, pady=6)
+
+                ctk.CTkLabel(r, text=s_code, font=("Arial", 12, "bold"), text_color="#FF9800", width=42, anchor="w").pack(side="left")
+                ctk.CTkLabel(r, text=f"• {s_skill}", font=("Arial", 11, "bold"), text_color="#00E676", width=160, anchor="w").pack(side="left", padx=4)
+                ctk.CTkLabel(r, text=s_desc, font=("Arial", 10), text_color="#cccccc", anchor="w", justify="left").pack(side="left", fill="x", expand=True)
+
+    def show_team_radar_scouting_modal(self):
+        """Modal displaying full 8-skill radar charts and tactical scouting dossiers for all teammates and opponents."""
+        m = getattr(self, "tourney_match", None)
+        if not m: return
+
+        modal = ctk.CTkToplevel(self)
+        modal.title("👥 Team-Scouting & 8-Skill Radar Profile")
+        modal.geometry("820x680")
+        modal.configure(fg_color="#121216")
+
+        top_f = ctk.CTkFrame(modal, fg_color="#181822", height=50, corner_radius=10)
+        top_f.pack(fill="x", padx=15, pady=10)
+        top_f.pack_propagate(False)
+        ctk.CTkLabel(top_f, text="👥 Taktische Dossiers & 8-Skillset Radar-Profile", font=("Arial", 15, "bold"), text_color="#00E5FF").pack(side="left", padx=15)
+        ctk.CTkButton(top_f, text="Schließen", width=80, height=28, font=("Arial", 11), fg_color="#2b2b36", command=modal.destroy).pack(side="right", padx=15)
+
+        body = ctk.CTkFrame(modal, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # Left Column: Player Team
+        p_frame = ctk.CTkFrame(body, fg_color="#181820", corner_radius=12, border_width=1, border_color="#2e2e3f")
+        p_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        ctk.CTkLabel(p_frame, text="🔵 Dein Team (Aufstellung & Dossiers)", font=("Arial", 13, "bold"), text_color="#00E5FF").pack(pady=(10, 4))
+        p_scroll = ctk.CTkScrollableFrame(p_frame, fg_color="transparent")
+        p_scroll.pack(fill="both", expand=True, padx=8, pady=6)
+
+        for idx, member in enumerate(m.get("player_team", [])):
+            c = ctk.CTkFrame(p_scroll, fg_color="#1e1e2c", corner_radius=10, border_width=1, border_color="#2f2f45")
+            c.pack(fill="x", pady=6)
+
+            h = ctk.CTkFrame(c, fg_color="transparent")
+            h.pack(fill="x", padx=10, pady=(8, 2))
+            tag = " (Kapitän / Du)" if idx == 0 else f" (Teammate #{idx})"
+            ctk.CTkLabel(h, text=f"👤 {member['name']}{tag}", font=("Arial", 12, "bold"), text_color="#00E5FF").pack(side="left")
+            ctk.CTkLabel(h, text=member.get("choke_badge", "Choke: Normal"), font=("Arial", 10, "bold"), text_color=member.get("choke_color", "#00E676")).pack(side="right")
+
+            canvas = tk.Canvas(c, width=320, height=220, bg="#181824", highlightthickness=0)
+            canvas.pack(padx=8, pady=4)
+            draw_radar_polygon(canvas, member["stats"], color_theme="cyan" if idx == 0 else "green", is_hidden=False)
+
+            d_txt = f"• Top-Stärken: {', '.join(member.get('top_strengths', []))}\n" \
+                    f"• Schwächen: {', '.join(member.get('top_weaknesses', []))}\n" \
+                    f"• Signature-Slots: {', '.join(member.get('signature_slots', []))}\n" \
+                    f"• Nervenstärke: {member.get('choke_tendency', '')}"
+            ctk.CTkLabel(c, text=d_txt, font=("Arial", 10), text_color="#bbbbcc", justify="left").pack(anchor="w", padx=10, pady=(2, 8))
+
+        # Right Column: Opponent Team (Fog of War Masked)
+        o_frame = ctk.CTkFrame(body, fg_color="#181820", corner_radius=12, border_width=1, border_color="#2e2e3f")
+        o_frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        ctk.CTkLabel(o_frame, text="🔴 Gegner-Team (Fog of War / Verdeckt)", font=("Arial", 13, "bold"), text_color="#FF4081").pack(pady=(10, 4))
+        o_scroll = ctk.CTkScrollableFrame(o_frame, fg_color="transparent")
+        o_scroll.pack(fill="both", expand=True, padx=8, pady=6)
+
+        for idx, member in enumerate(m.get("opponent_team", [])):
+            c = ctk.CTkFrame(o_scroll, fg_color="#1e1e2c", corner_radius=10, border_width=1, border_color="#2f2f45")
+            c.pack(fill="x", pady=6)
+
+            h = ctk.CTkFrame(c, fg_color="transparent")
+            h.pack(fill="x", padx=10, pady=(8, 2))
+            ctk.CTkLabel(h, text=f"🤖 {member['name']}", font=("Arial", 12, "bold"), text_color="#FF4081").pack(side="left")
+            ctk.CTkLabel(h, text="🔒 Profil verdeckt", font=("Arial", 10, "bold"), text_color="#888899").pack(side="right")
+
+            canvas = tk.Canvas(c, width=320, height=220, bg="#181824", highlightthickness=0)
+            canvas.pack(padx=8, pady=4)
+            draw_radar_polygon(canvas, member["stats"], color_theme="purple", is_hidden=True)
+
+            d_txt = "• Top-Stärken: ??? (Finde es über Bans/Picks heraus!)\n" \
+                    "• Schwächen: ???\n" \
+                    "• Signature-Slots: ???\n" \
+                    "• Nervenstärke: Unbekannt (Fog of War aktiv)"
+            ctk.CTkLabel(c, text=d_txt, font=("Arial", 10), text_color="#888899", justify="left").pack(anchor="w", padx=10, pady=(2, 8))
 
     def refresh_tourney_lobby_state(self):
         """Smoothly updates the tournament lobby UI in-place without destroying frames (No Flickering!)."""
@@ -8185,13 +10179,8 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             p_pts = "● " * m["player_score"] + "○ " * (m["target_wins"] - m["player_score"])
             self.tourney_player_pts_lbl.configure(text=f"Punkte: {m['player_score']} / {m['target_wins']}   [{p_pts.strip()}]")
 
-        if hasattr(self, "tourney_bot_pts_lbl") and self.tourney_bot_pts_lbl.winfo_exists():
-            b_pts = "● " * m["bot_score"] + "○ " * (m["target_wins"] - m["bot_score"])
-            self.tourney_bot_pts_lbl.configure(text=f"[{b_pts.strip()}]   Punkte: {m['bot_score']} / {m['target_wins']}")
-
         self.render_tourney_action_bar()
         self.render_mappool_cards()
-        self._update_tourney_feed_display()
 
     def render_tourney_action_bar(self):
         for w in self.tourney_act_bar.winfo_children():
@@ -8256,12 +10245,8 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             def open_web_tourney(b=bid):
                 webbrowser.open(f"https://osu.ppy.sh/b/{b}")
 
-            # Right buttons packed FIRST so they never get squished!
             r_tourney_btns = ctk.CTkFrame(p_top, fg_color="transparent")
             r_tourney_btns.pack(side="right")
-
-            ctk.CTkButton(r_tourney_btns, text="🔄 Sync", font=("Arial", 11, "bold"), width=75, height=26,
-                          fg_color="#1f538d", hover_color="#2b78c9", command=lambda: self.fetch_tourney_recent_plays(silent=False)).pack(side="right", padx=(4, 0))
 
             ctk.CTkButton(r_tourney_btns, text="🌐 Web", font=("Arial", 11), width=70, height=26,
                           fg_color="#2b2b38", hover_color="#3a3a4c", command=open_web_tourney).pack(side="right", padx=(4, 0))
@@ -8271,23 +10256,27 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
             ctk.CTkLabel(p_top, text=f"🎮 AKTIVE MAP: {cur_slot} • {cur_map.get('name', '')[:40]}", font=("Arial", 12, "bold"), text_color="#00E5FF").pack(side="left", fill="x", expand=True)
 
-            ctk.CTkLabel(p_box, text=f"Mod: {req_mod} • ★ {cur_map.get('sr', 5.0):.2f} | ⚡ Auto-Sync erfasst deinen Run automatisch nach Song-Ende (oder ziehe .osr Replay hierhin)",
+            ctk.CTkLabel(p_box, text=f"Mod: {req_mod} • ★ {cur_map.get('sr', 5.0):.2f} | ⚡ ScoreV2 aktiv! Auto-Sync erfasst deinen Run automatisch nach Song-Ende (oder ziehe .osr Replay hierhin)",
                          font=("Arial", 10), text_color="#00E676").pack(anchor="w", pady=(2, 0))
 
         elif phase == "finished":
-            winner = "Du hast gewonnen! 🏆" if m["player_score"] >= m["target_wins"] else f"{m['bot_name']} gewinnt das Match!"
+            winner = "Dein Team gewinnt das Match! 🏆" if m["player_score"] >= m["target_wins"] else f"Team {m['bot_name']} gewinnt das Match!"
             win_color = "#00E676" if m["player_score"] >= m["target_wins"] else "#FF5252"
             ctk.CTkLabel(self.tourney_act_bar, text=winner, font=("Arial", 13, "bold"), text_color=win_color).pack(side="left", padx=12, pady=8)
-            ctk.CTkButton(self.tourney_act_bar, text="📊 Abschluss-Bericht", font=("Arial", 11, "bold"), height=28,
+            ctk.CTkButton(self.tourney_act_bar, text="📊 Abschluss-Bericht & Scouting", font=("Arial", 11, "bold"), height=28,
                           fg_color="#3b8ed0", hover_color="#1f538d", command=self.show_tourney_post_match_modal).pack(side="right", padx=10, pady=6)
 
     def render_mappool_cards(self):
         if not hasattr(self, "tourney_pool_scroll") or not self.tourney_pool_scroll.winfo_exists():
             return
 
-        m = self.tourney_match
-        pool = m["pool"]
-        phase = m["phase"]
+        for w in self.tourney_pool_scroll.winfo_children():
+            try: w.destroy()
+            except: pass
+
+        m = getattr(self, "tourney_match", {}) or {}
+        pool = m.get("pool", {})
+        phase = m.get("phase", "roll")
 
         mod_order = ['NM', 'HD', 'HR', 'DT', 'FM', 'TB', 'EZ', 'FL']
         mod_info = {
@@ -8301,89 +10290,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             'FL': ('Flashlight (FL)', '#FFEB3B'),
             'Other': ('Spezial / Custom', '#AAAAAA')
         }
-
-        # Check if widgets already built
-        if not hasattr(self, "_tourney_card_widgets"):
-            self._tourney_card_widgets = {}
-
-        # If already built and pool length matches, update in-place without destroying frames (ZERO FLICKER!)
-        if len(self._tourney_card_widgets) == len(pool):
-            for slot, map_data in pool.items():
-                w_info = self._tourney_card_widgets.get(slot)
-                if not w_info or not w_info.get("card") or not w_info["card"].winfo_exists():
-                    continue
-
-                st = map_data.get("state", "available")
-                card = w_info["card"]
-                action_frame = w_info["action_frame"]
-                col = w_info["col"]
-
-                card_bg = "#1a1a24"
-                b_border = "#262638"
-                if "won_player" in st:
-                    card_bg = "#122a1e"
-                    b_border = "#00E676"
-                elif "won_bot" in st:
-                    card_bg = "#2a141e"
-                    b_border = "#FF4081"
-                elif "banned" in st:
-                    card_bg = "#221616"
-                    b_border = "#772222"
-                elif "protected_player" in st:
-                    card_bg = "#102830"
-                    b_border = "#00E5FF"
-                elif "protected_bot" in st:
-                    card_bg = "#25182e"
-                    b_border = "#BA68C8"
-                elif slot == m.get("current_pick"):
-                    card_bg = "#262214"
-                    b_border = "#FFD700"
-
-                card.configure(fg_color=card_bg, border_color=b_border)
-
-                # Clear only action buttons in action_frame
-                for child in action_frame.winfo_children():
-                    child.destroy()
-
-                if st == "available":
-                    if phase == "protect" and m["turn"] == "player" and slot != "TB":
-                        def make_prot(s=slot): return lambda: self.tourney_player_do_protect(s)
-                        ctk.CTkButton(action_frame, text="🛡️ Save", width=58, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=1)
-                    elif phase == "ban" and m["turn"] == "player" and slot != "TB":
-                        def make_ban(s=slot): return lambda: self.tourney_player_do_ban(s)
-                        ctk.CTkButton(action_frame, text="🚫 Ban", width=52, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=1)
-                    elif phase == "pick" and m["turn"] == "player" and slot != "TB":
-                        def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
-                elif st == "protected_player":
-                    if phase == "pick" and m["turn"] == "player" and slot != "TB":
-                        def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
-                    ctk.CTkLabel(action_frame, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 9, "bold"), text_color="#00E5FF").pack(side="right", padx=3)
-                elif st == "protected_bot":
-                    if phase == "pick" and m["turn"] == "player" and slot != "TB":
-                        def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
-                    ctk.CTkLabel(action_frame, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 9, "bold"), text_color="#BA68C8").pack(side="right", padx=3)
-                elif st == "banned_player":
-                    ctk.CTkLabel(action_frame, text="🚫 BANNED (Du)", font=("Arial", 9, "bold"), text_color="#FF5252").pack(side="right", padx=3)
-                elif st == "banned_bot":
-                    ctk.CTkLabel(action_frame, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 9, "bold"), text_color="#FF5252").pack(side="right", padx=3)
-                elif st == "won_player":
-                    ctk.CTkLabel(action_frame, text="✅ GEWONNEN", font=("Arial", 9, "bold"), text_color="#00E676").pack(side="right", padx=3)
-                elif st == "won_bot":
-                    ctk.CTkLabel(action_frame, text="❌ VERLOREN", font=("Arial", 9, "bold"), text_color="#FF4081").pack(side="right", padx=3)
-            return
-
-        # Initial build
-        for w in self.tourney_pool_scroll.winfo_children():
-            w.destroy()
-        self._tourney_card_widgets = {}
 
         def get_slot_sort_key(s):
             for p in mod_order:
@@ -8415,104 +10321,97 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             for slot in slot_list:
                 map_data = pool.get(slot, {})
                 st = map_data.get("state", "available")
-                
-                card_bg = "#1a1a24"
-                b_border = "#262638"
+                bid = map_data.get("id")
+
+                card_bg = "#181822"
+                b_border = "#282838"
+                badge_txt = "VERFÜGBAR"
+                badge_col = "#3b8ed0"
+
                 if "won_player" in st:
-                    card_bg = "#122a1e"
+                    card_bg = "#13261a"
                     b_border = "#00E676"
+                    badge_txt = "✅ GEWONNEN"
+                    badge_col = "#00E676"
                 elif "won_bot" in st:
-                    card_bg = "#2a141e"
+                    card_bg = "#241315"
                     b_border = "#FF4081"
-                elif "banned" in st:
-                    card_bg = "#221616"
-                    b_border = "#772222"
+                    badge_txt = "❌ VERLOREN"
+                    badge_col = "#FF4081"
+                elif "banned_player" in st:
+                    card_bg = "#241315"
+                    b_border = "#c62828"
+                    badge_txt = "🚫 BANNED (Du)"
+                    badge_col = "#ff4444"
+                elif "banned_bot" in st:
+                    card_bg = "#241315"
+                    b_border = "#c62828"
+                    badge_txt = f"🚫 BANNED ({m.get('bot_name', 'Bot')})"
+                    badge_col = "#ff4444"
                 elif "protected_player" in st:
-                    card_bg = "#102830"
+                    card_bg = "#102228"
                     b_border = "#00E5FF"
+                    badge_txt = "🛡️ GESCHÜTZT (Du)"
+                    badge_col = "#00E5FF"
                 elif "protected_bot" in st:
                     card_bg = "#25182e"
                     b_border = "#BA68C8"
+                    badge_txt = f"🛡️ GESCHÜTZT ({m.get('bot_name', 'Bot')})"
+                    badge_col = "#BA68C8"
                 elif slot == m.get("current_pick"):
                     card_bg = "#262214"
                     b_border = "#FFD700"
+                    badge_txt = "⚡ LIVE GESPIELT"
+                    badge_col = "#FFD700"
 
                 card = ctk.CTkFrame(self.tourney_pool_scroll, fg_color=card_bg, corner_radius=8, border_width=1, border_color=b_border)
                 card.pack(fill="x", padx=4, pady=3)
 
-                c_row = ctk.CTkFrame(card, fg_color="transparent")
-                c_row.pack(fill="x", padx=6, pady=5)
+                top_row = ctk.CTkFrame(card, fg_color="transparent")
+                top_row.pack(fill="x", padx=10, pady=(6, 2))
 
-                # Left slot label
-                ctk.CTkLabel(c_row, text=slot, font=("Arial", 12, "bold"), text_color=col, width=38, anchor="w").pack(side="left", padx=(2, 4))
+                m_name = map_data.get("name", "Map")
+                ctk.CTkLabel(top_row, text=f"{slot}: {m_name[:42]}", font=("Arial", 11, "bold"), text_color="#ffffff", anchor="w").pack(side="left")
+                ctk.CTkLabel(top_row, text=badge_txt, font=("Arial", 9, "bold"), text_color=badge_col).pack(side="right")
 
-                # Right action & link buttons container (PACKED FIRST to ensure no clipping!)
-                right_btns = ctk.CTkFrame(c_row, fg_color="transparent")
-                right_btns.pack(side="right", padx=(2, 0))
+                bot_row = ctk.CTkFrame(card, fg_color="transparent")
+                bot_row.pack(fill="x", padx=10, pady=(0, 6))
 
-                bid = map_data.get("id")
+                skill_name = get_slot_standard_skillset_name(slot)
+                meta_txt = f"★ {map_data.get('sr', 5.0):.2f} • {map_data.get('bpm', 180)} BPM • {map_data.get('len', 120)}s • {skill_name}"
+                ctk.CTkLabel(bot_row, text=meta_txt, font=("Arial", 9), text_color="#888899", anchor="w").pack(side="left")
+
+                r_btns = ctk.CTkFrame(bot_row, fg_color="transparent")
+                r_btns.pack(side="right")
+
                 def make_direct(b=bid):
                     try: os.startfile(f"osu://b/{b}")
                     except: webbrowser.open(f"https://osu.ppy.sh/b/{b}")
                 def make_web(b=bid):
                     webbrowser.open(f"https://osu.ppy.sh/b/{b}")
 
-                ctk.CTkButton(right_btns, text="direct", width=46, height=22, font=("Arial", 9, "bold"),
+                ctk.CTkButton(r_btns, text="direct", width=44, height=20, font=("Arial", 9, "bold"),
                               fg_color="#E91E63", hover_color="#C2185B", command=make_direct).pack(side="right", padx=(2, 0))
-                ctk.CTkButton(right_btns, text="🌐 web", width=46, height=22, font=("Arial", 9, "bold"),
+                ctk.CTkButton(r_btns, text="🌐 web", width=44, height=20, font=("Arial", 9, "bold"),
                               fg_color="#2b2b38", hover_color="#3a3a4c", command=make_web).pack(side="right", padx=(2, 0))
-
-                action_frame = ctk.CTkFrame(right_btns, fg_color="transparent")
-                action_frame.pack(side="right", padx=(0, 2))
-
-                # Center map info (PACKED LAST to consume remaining space cleanly)
-                info_f = ctk.CTkFrame(c_row, fg_color="transparent")
-                info_f.pack(side="left", fill="x", expand=True, padx=(2, 4))
-                
-                m_name = map_data.get("name", "Map")
-                ctk.CTkLabel(info_f, text=m_name[:34], font=("Arial", 11, "bold"), text_color="#ffffff", anchor="w").pack(anchor="w", fill="x")
-                ctk.CTkLabel(info_f, text=f"★ {map_data.get('sr', 5.0):.2f} • {map_data.get('bpm', 180)} BPM • {map_data.get('len', 120)}s",
-                             font=("Arial", 9), text_color="#888899", anchor="w").pack(anchor="w", fill="x")
-
-                self._tourney_card_widgets[slot] = {
-                    "card": card,
-                    "action_frame": action_frame,
-                    "col": col
-                }
 
                 if st == "available":
                     if phase == "protect" and m["turn"] == "player" and slot != "TB":
                         def make_prot(s=slot): return lambda: self.tourney_player_do_protect(s)
-                        ctk.CTkButton(action_frame, text="🛡️ Save", width=58, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=1)
+                        ctk.CTkButton(r_btns, text="🛡️ Save", width=54, height=20, font=("Arial", 9, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_prot()).pack(side="right", padx=(2, 0))
                     elif phase == "ban" and m["turn"] == "player" and slot != "TB":
                         def make_ban(s=slot): return lambda: self.tourney_player_do_ban(s)
-                        ctk.CTkButton(action_frame, text="🚫 Ban", width=52, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=1)
+                        ctk.CTkButton(r_btns, text="🚫 Ban", width=50, height=20, font=("Arial", 9, "bold"),
+                                      fg_color="#c62828", hover_color="#b71c1c", command=make_ban()).pack(side="right", padx=(2, 0))
                     elif phase == "pick" and m["turn"] == "player" and slot != "TB":
                         def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
-                elif st == "protected_player":
-                    if phase == "pick" and m["turn"] == "player" and slot != "TB":
-                        def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
-                    ctk.CTkLabel(action_frame, text="🛡️ GESCHÜTZT (Du)", font=("Arial", 9, "bold"), text_color="#00E5FF").pack(side="right", padx=3)
-                elif st == "protected_bot":
-                    if phase == "pick" and m["turn"] == "player" and slot != "TB":
-                        def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
-                        ctk.CTkButton(action_frame, text="🎯 Pick", width=52, height=22, font=("Arial", 10, "bold"),
-                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=1)
-                    ctk.CTkLabel(action_frame, text=f"🛡️ GESCHÜTZT ({m['bot_name']})", font=("Arial", 9, "bold"), text_color="#BA68C8").pack(side="right", padx=3)
-                elif st == "banned_player":
-                    ctk.CTkLabel(action_frame, text="🚫 BANNED (Du)", font=("Arial", 9, "bold"), text_color="#FF5252").pack(side="right", padx=3)
-                elif st == "banned_bot":
-                    ctk.CTkLabel(action_frame, text=f"🚫 BANNED ({m['bot_name']})", font=("Arial", 9, "bold"), text_color="#FF5252").pack(side="right", padx=3)
-                elif st == "won_player":
-                    ctk.CTkLabel(action_frame, text="✅ GEWONNEN", font=("Arial", 9, "bold"), text_color="#00E676").pack(side="right", padx=3)
-                elif st == "won_bot":
-                    ctk.CTkLabel(action_frame, text=f"❌ VERLOREN", font=("Arial", 9, "bold"), text_color="#FF4081").pack(side="right", padx=3)
+                        ctk.CTkButton(r_btns, text="🎯 Pick", width=50, height=20, font=("Arial", 9, "bold"),
+                                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=(2, 0))
+                elif "protected" in st and phase == "pick" and m["turn"] == "player" and slot != "TB":
+                    def make_pick(s=slot): return lambda: self.tourney_player_do_pick(s)
+                    ctk.CTkButton(r_btns, text="🎯 Pick", width=50, height=20, font=("Arial", 9, "bold"),
+                                  fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000", command=make_pick()).pack(side="right", padx=(2, 0))
 
     def tourney_do_roll(self):
         m = self.tourney_match
@@ -8540,6 +10439,10 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             m["phase"] = "pick"
             m["history"].append(f"🎲 ROLL: {winner_text} -> Pick-Phase!")
 
+        # Broadcast Roll to IRC
+        if getattr(self, "tourney_referee_bot", None) and self.tourney_referee_bot.connected and self.tourney_referee_bot.channel:
+            self.tourney_referee_bot.send_channel_message(f"🎲 Roll-Ergebnis: Spieler [{p_roll}] vs [{b_roll}] {m['bot_name']} -> {winner_text}")
+
         self.refresh_tourney_lobby_state()
 
     def tourney_player_do_protect(self, slot):
@@ -8547,6 +10450,9 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         m["pool"][slot]["state"] = "protected_player"
         m["protects_done"] += 1
         m["history"].append(f"🛡️ SAVE: Du schützt {slot} ({m['pool'][slot]['name'][:30]}) vor Bans!")
+
+        if getattr(self, "tourney_referee_bot", None) and self.tourney_referee_bot.connected and self.tourney_referee_bot.channel:
+            self.tourney_referee_bot.send_channel_message(f"🛡️ SAVE: Spieler schützt Slot [{slot}]!")
 
         if m["protects_done"] >= m["protects_needed"]:
             m["phase"] = "ban" if m["bans_needed"] > 0 else "pick"
@@ -8562,15 +10468,16 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         if not hasattr(self, "winfo_exists") or not self.winfo_exists():
             return
         m = self.tourney_match
-        avail = [s for s, d in m["pool"].items() if d.get("state") == "available" and s != "TB"]
-        if not avail: return
-
-        preferred = [s for s in avail if any(k in s for k in ["DT", "HD", "NM", "FM", "HR"])]
-        chosen_slot = random.choice(preferred) if preferred else random.choice(avail)
+        bot_stats = m.get("bot_stats", {})
+        player_stats = m.get("player_team", [{}])[0].get("stats", {})
+        chosen_slot = bot_select_action(m["pool"], bot_stats, player_stats, "protect")
 
         m["pool"][chosen_slot]["state"] = "protected_bot"
         m["protects_done"] += 1
         m["history"].append(f"🛡️ SAVE: {m['bot_name']} schützt {chosen_slot} ({m['pool'][chosen_slot]['name'][:30]}) vor Bans!")
+
+        if getattr(self, "tourney_referee_bot", None) and self.tourney_referee_bot.connected and self.tourney_referee_bot.channel:
+            self.tourney_referee_bot.send_channel_message(f"🛡️ SAVE: {m['bot_name']} schützt Slot [{chosen_slot}]!")
 
         if m["protects_done"] >= m["protects_needed"]:
             m["phase"] = "ban" if m["bans_needed"] > 0 else "pick"
@@ -8585,6 +10492,9 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         m["pool"][slot]["state"] = "banned_player"
         m["bans_done"] += 1
         m["history"].append(f"🚫 BAN: Du bannst {slot} ({m['pool'][slot]['name'][:30]})")
+
+        if getattr(self, "tourney_referee_bot", None) and self.tourney_referee_bot.connected and self.tourney_referee_bot.channel:
+            self.tourney_referee_bot.send_channel_message(f"🚫 BAN: Spieler bannt Slot [{slot}]!")
         
         if m["bans_done"] >= m["bans_needed"]:
             m["phase"] = "pick"
@@ -8600,16 +10510,16 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         if not hasattr(self, "winfo_exists") or not self.winfo_exists():
             return
         m = self.tourney_match
-        avail = [s for s, d in m["pool"].items() if d.get("state") == "available" and s != "TB"]
-        if not avail:
-            m["bans_done"] += 1
-        else:
-            preferred = [s for s in avail if any(k in s for k in ["HR", "DT", "HD"])]
-            chosen_slot = random.choice(preferred) if preferred else random.choice(avail)
+        bot_stats = m.get("bot_stats", {})
+        player_stats = m.get("player_team", [{}])[0].get("stats", {})
+        chosen_slot = bot_select_action(m["pool"], bot_stats, player_stats, "ban")
 
-            m["pool"][chosen_slot]["state"] = "banned_bot"
-            m["bans_done"] += 1
-            m["history"].append(f"🚫 BAN: {m['bot_name']} bannt {chosen_slot} ({m['pool'][chosen_slot]['name'][:30]})")
+        m["pool"][chosen_slot]["state"] = "banned_bot"
+        m["bans_done"] += 1
+        m["history"].append(f"🚫 BAN: {m['bot_name']} bannt {chosen_slot} ({m['pool'][chosen_slot]['name'][:30]})")
+
+        if getattr(self, "tourney_referee_bot", None) and self.tourney_referee_bot.connected and self.tourney_referee_bot.channel:
+            self.tourney_referee_bot.send_channel_message(f"🚫 BAN: {m['bot_name']} bannt Slot [{chosen_slot}]!")
 
         if m["bans_done"] >= m["bans_needed"]:
             m["phase"] = "pick"
@@ -8628,20 +10538,36 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         if not hasattr(self, "winfo_exists") or not self.winfo_exists():
             return
         m = self.tourney_match
-        avail = [s for s, d in m["pool"].items() if d.get("state") == "available" and s != "TB"]
-        if not avail:
-            self.tourney_pick_slot("TB", picked_by="bot")
-            return
-        chosen_slot = random.choice(avail)
+        bot_stats = m.get("bot_stats", {})
+        player_stats = m.get("player_team", [{}])[0].get("stats", {})
+        chosen_slot = bot_select_action(m["pool"], bot_stats, player_stats, "pick")
         self.tourney_pick_slot(chosen_slot, picked_by="bot")
 
     def tourney_pick_slot(self, slot, picked_by="player"):
         m = self.tourney_match
         m["current_pick"] = slot
         m["phase"] = "playing"
+        m["pick_timestamp"] = time.time()
+        m.setdefault("processed_play_keys", set())
         m["pool"][slot]["state"] = "picked"
         picker_name = "Du" if picked_by == "player" else m["bot_name"]
         m["history"].append(f"🎯 PICK: {picker_name} wählt {slot}: {m['pool'][slot]['name']}")
+
+        cur_map = m["pool"].get(slot, {})
+        bid = cur_map.get("id")
+        if bid and getattr(self, "tourney_referee_bot", None) and self.tourney_referee_bot.connected and self.tourney_referee_bot.channel:
+            req_mod = "NM"
+            if "HD" in slot: req_mod = "HD"
+            elif "HR" in slot: req_mod = "HR"
+            elif "DT" in slot: req_mod = "DT"
+            elif "FM" in slot: req_mod = "FM"
+            elif "TB" in slot: req_mod = "TB"
+
+            self.tourney_referee_bot.set_map(bid, mods=req_mod, enforce_nf=True)
+            self.tourney_referee_bot.send_channel_message(
+                f"🎯 Nächste Map: [{slot}] {cur_map.get('name', '')[:32]} (★ {cur_map.get('sr', 5.0):.2f}) | Mod: {req_mod} + NF | ScoreV2 aktiv! Tippe !ready zum Starten."
+            )
+
         self.refresh_tourney_lobby_state()
 
     def _start_tourney_match_auto_sync_loop(self):
@@ -8697,10 +10623,30 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                 return
 
             found_play = None
+            processed_keys = m.setdefault("processed_play_keys", set())
+            pick_ts = m.get("pick_timestamp", 0)
+
             for p in plays:
-                if str(p.get("beatmap_id")) == bid:
-                    found_play = p
-                    break
+                if str(p.get("beatmap_id")) != bid:
+                    continue
+
+                play_key = f"{p.get('beatmap_id')}_{p.get('date')}_{p.get('score')}"
+                if play_key in processed_keys:
+                    continue
+
+                # Validate play date against pick time to avoid consuming old previous plays
+                date_str = p.get("date", "")
+                if date_str:
+                    try:
+                        play_dt = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+                        if pick_ts > 0 and play_dt.timestamp() < (pick_ts - 120):
+                            continue
+                    except Exception:
+                        pass
+
+                found_play = p
+                processed_keys.add(play_key)
+                break
 
             if found_play:
                 self.process_tourney_match_round(found_play)
@@ -8714,7 +10660,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
         cur_slot = m["current_pick"]
         cur_map = m["pool"].get(cur_slot, {})
-        bot_cfg = m["bot_cfg"]
 
         h300 = int(play_data.get("count300", 0) or 0)
         h100 = int(play_data.get("count100", 0) or 0)
@@ -8722,26 +10667,66 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
         miss = int(play_data.get("countmiss", 0) or 0)
         tot = h300 + h100 + h50 + miss
         p_acc = (safe_div(h300 * 300 + h100 * 100 + h50 * 50, tot * 300, 0.0) * 100.0) if tot > 0 else 0.0
-        p_score = int(play_data.get("score", 0) or 0)
+        p_score = int(play_data.get("scorev2", 0) or play_data.get("score", 0) or 0)
 
-        # Simulate bot round
-        b_acc = max(75.0, min(100.0, random.gauss(bot_cfg.get("target_acc", 97.0), 1.2)))
-        b_miss = max(0, int(random.gauss(bot_cfg.get("miss_rate", 1.0), 1.0)))
-        b_score = int(p_score * (safe_div(b_acc, max(1.0, p_acc), 1.0)) * random.uniform(0.92, 1.08))
+        # Convert player score to ScoreV2 if score > 1,000,000 (ScoreV1 submitted)
+        if p_score > 1000000:
+            max_c = int(play_data.get("maxcombo", 0) or 0)
+            total_obj = max(1, tot)
+            p_combo_ratio = safe_div(max_c, total_obj, 0.8)
+            p_v2_combo = 700000.0 * (min(1.0, p_combo_ratio) ** 0.5)
+            p_v2_acc = 300000.0 * ((p_acc / 100.0) ** 4.0)
+            player_v2_score = max(0, min(1000000, int(round(p_v2_combo + p_v2_acc))))
+        else:
+            player_v2_score = max(0, min(1000000, p_score))
 
-        if p_score >= b_score:
+        # 1. Evaluate Player Team Scores
+        player_team_members = m.get("player_team", [])
+        player_team_scores = [player_v2_score]
+        p_name = player_team_members[0]['name'] if player_team_members else m.get('player_name', 'Du')
+        p_round_details = [f"• {p_name} (Du): {player_v2_score:,} ScoreV2 ({p_acc:.2f}%, {miss} Miss)"]
+
+        for tm in player_team_members[1:]:
+            tm_sim = calculate_bot_scorev2(tm["stats"], cur_map)
+            player_team_scores.append(tm_sim["scorev2"])
+            p_round_details.append(f"• {tm['name']}: {tm_sim['scorev2']:,} ScoreV2 ({tm_sim['acc']:.2f}%, {tm_sim['misses']} Miss)")
+
+        # 2. Evaluate Opponent Team Scores
+        opponent_team_members = m.get("opponent_team", [])
+        opponent_team_scores = []
+        o_round_details = []
+
+        for opp in opponent_team_members:
+            opp_sim = calculate_bot_scorev2(opp["stats"], cur_map)
+            opponent_team_scores.append(opp_sim["scorev2"])
+            o_round_details.append(f"• {opp['name']}: {opp_sim['scorev2']:,} ScoreV2 ({opp_sim['acc']:.2f}%, {opp_sim['misses']} Miss)")
+
+        # 3. Aggregate Team Scoring
+        agg = aggregate_round_scores(player_team_scores, opponent_team_scores)
+        p_total = agg["player_team_total"]
+        o_total = agg["opponent_team_total"]
+        margin = agg["margin"]
+
+        if agg["winner"] == "player_team":
             r_winner = "player"
             m["player_score"] += 1
             m["pool"][cur_slot]["state"] = "won_player"
-            win_msg = f"🟢 PUNKT FÜR DICH auf {cur_slot}! ({p_score:,} vs {b_score:,} Pkt)"
+            win_msg = f"🟢 PUNKT FÜR DEIN TEAM auf {cur_slot}! ({p_total:,} vs {o_total:,} Pkt • +{margin:,})"
         else:
             r_winner = "bot"
             m["bot_score"] += 1
             m["pool"][cur_slot]["state"] = "won_bot"
-            win_msg = f"🔴 PUNKT FÜR {m['bot_name']} auf {cur_slot}! ({b_score:,} vs {p_score:,} Pkt)"
+            win_msg = f"🔴 PUNKT FÜR GEGNER-TEAM auf {cur_slot}! ({o_total:,} vs {p_total:,} Pkt • +{margin:,})"
 
-        round_log = f"⚔️ RUNDE {cur_slot}:\n• Du: {p_acc:.2f}% Acc | {miss} Miss | {p_score:,} Pkt\n• {m['bot_name']}: {b_acc:.2f}% Acc | {b_miss} Miss | {b_score:,} Pkt\n➔ {win_msg}"
+        p_det_str = "\n  ".join(p_round_details)
+        o_det_str = "\n  ".join(o_round_details)
+        round_log = f"⚔️ RUNDE {cur_slot} (ScoreV2 Team-Ergebnis):\n🔵 Dein Team (Total: {p_total:,}):\n  {p_det_str}\n🔴 Gegner-Team (Total: {o_total:,}):\n  {o_det_str}\n➔ {win_msg}"
         m["history"].append(round_log)
+
+        # Broadcast outcome to Bancho IRC Channel
+        if getattr(self, "tourney_referee_bot", None) and self.tourney_referee_bot.connected and self.tourney_referee_bot.channel:
+            self.tourney_referee_bot.send_channel_message(f"🏆 Runden-Ergebnis [{cur_slot}]: Dein Team ({p_total:,}) vs Gegner ({o_total:,}) ➔ {win_msg}")
+            self.tourney_referee_bot.send_channel_message(f"📊 Neuer Spielstand: Du [{m['player_score']}] : [{m['bot_score']}] {m['bot_name']} (Ziel: {m['target_wins']} Siege)")
 
         # Check for Match Conclusion
         if m["player_score"] >= m["target_wins"] or m["bot_score"] >= m["target_wins"]:
@@ -8749,7 +10734,6 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
             m["history"].append(f"🏆 MATCH ENDSTAND: {m['player_score']} : {m['bot_score']}")
         else:
             m["phase"] = "pick"
-            # Switch pick turn
             m["turn"] = "bot" if m.get("turn") == "player" else "player"
 
         def update_ui():
@@ -8760,77 +10744,153 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
 
     def _update_tourney_feed_display(self):
         if hasattr(self, 'tourney_feed_box') and self.tourney_feed_box.winfo_exists():
+            m = getattr(self, "tourney_match", {}) or {}
+            ref_logs = m.get("referee_logs", [])
+            hist_logs = m.get("history", [])
+            combined = []
+            if ref_logs:
+                combined.extend(ref_logs)
+            if hist_logs:
+                if combined: combined.append("────────────────────────────────────────")
+                combined.extend(hist_logs)
+            if not combined:
+                combined = ["Warte auf Match-Aktivität..."]
+
             self.tourney_feed_box.configure(state="normal")
             self.tourney_feed_box.delete("1.0", "end")
-            self.tourney_feed_box.insert("1.0", "\n\n".join(self.tourney_match.get("history", [])))
+            self.tourney_feed_box.insert("1.0", "\n".join(combined))
             self.tourney_feed_box.configure(state="disabled")
             try: self.tourney_feed_box.see("end")
             except: pass
 
     def show_tourney_post_match_modal(self):
+        """Interactive Post-Match Strategy Guessing Challenge & Gemini AI German Debriefing Modal."""
         m = self.tourney_match
         modal = ctk.CTkToplevel(self)
-        modal.title("Turnier-Match Abschlussbericht")
-        modal.geometry("640x700")
+        modal.title("Turnier-Match Abschlussbericht & Scouting Challenge")
+        modal.geometry("780x820")
         modal.configure(fg_color="#121216")
 
-        winner_txt = "🎉 DU HAST DAS MATCH GEWONNEN!" if m["player_score"] >= m["target_wins"] else f"🤖 {m['bot_name']} GEWINNT DAS MATCH!"
+        winner_txt = "🎉 DEIN TEAM HAT DAS MATCH GEWONNEN!" if m["player_score"] >= m["target_wins"] else f"🤖 TEAM {m['bot_name']} GEWINNT DAS MATCH!"
         w_col = "#00E676" if m["player_score"] >= m["target_wins"] else "#FF4081"
-        ctk.CTkLabel(modal, text=winner_txt, font=("Arial", 18, "bold"), text_color=w_col).pack(pady=(20, 5))
-        ctk.CTkLabel(modal, text=f"Endstand: {m['player_score']} : {m['bot_score']} ({m['badge']} {m['division']} • {m['format_name']})",
-                     font=("Arial", 13, "bold"), text_color="#ffffff").pack(pady=(0, 10))
+        ctk.CTkLabel(modal, text=winner_txt, font=("Arial", 18, "bold"), text_color=w_col).pack(pady=(16, 4))
+        ctk.CTkLabel(modal, text=f"Endstand: {m['player_score']} : {m['bot_score']} ({m['badge']} {m['division']} • {m.get('team_format_name', '1v1')} • {m['format_name']})",
+                     font=("Arial", 12, "bold"), text_color="#ffffff").pack(pady=(0, 10))
 
-        txt = ctk.CTkTextbox(modal, wrap="word", font=("Arial", 12), fg_color="#181822", border_width=1, border_color="#2e2e3f")
-        txt.pack(fill="both", expand=True, padx=20, pady=10)
-        txt.insert("1.0", "⏳ Gemini KI erstellt den ausführlichen Caster-Match-Report...")
+        content_scroll = ctk.CTkScrollableFrame(modal, fg_color="transparent")
+        content_scroll.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
+        # --- SECTION 1: INTERACTIVE SCOUTING GUESSING CHALLENGE ---
+        guess_card = ctk.CTkFrame(content_scroll, fg_color="#181824", corner_radius=12, border_width=1, border_color="#2e2e3f")
+        guess_card.pack(fill="x", pady=(0, 12))
+
+        ctk.CTkLabel(guess_card, text="🎯 SCOUTING-CHALLENGE: DEDUZIERE DAS GEGNERISCHE PROFIL!",
+                     font=("Arial", 13, "bold"), text_color="#FF9800").pack(pady=(12, 4))
+        ctk.CTkLabel(guess_card, text="Wähle basierend auf dem Draft & den Match-Runden die Top 2 Stärken und Top 2 Schwächen des Gegners:",
+                     font=("Arial", 11), text_color="#aaaaaa").pack(pady=(0, 8))
+
+        cols_f = ctk.CTkFrame(guess_card, fg_color="transparent")
+        cols_f.pack(fill="x", padx=16, pady=4)
+        cols_f.grid_columnconfigure(0, weight=1)
+        cols_f.grid_columnconfigure(1, weight=1)
+
+        # Strengths Selection
+        s_box = ctk.CTkFrame(cols_f, fg_color="#13131c", corner_radius=8)
+        s_box.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
+        ctk.CTkLabel(s_box, text="Top-2 Stärken des Gegners:", font=("Arial", 11, "bold"), text_color="#00E676").pack(anchor="w", padx=10, pady=6)
+        
+        strength_vars = {}
+        for s in ALL_8_SKILLS:
+            var = ctk.BooleanVar(value=False)
+            strength_vars[s] = var
+            ctk.CTkCheckBox(s_box, text=s, variable=var, font=("Arial", 11), fg_color="#00E676", hover_color="#00C853").pack(anchor="w", padx=12, pady=2)
+
+        # Weaknesses Selection
+        w_box = ctk.CTkFrame(cols_f, fg_color="#13131c", corner_radius=8)
+        w_box.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
+        ctk.CTkLabel(w_box, text="Top-2 Schwächen des Gegners:", font=("Arial", 11, "bold"), text_color="#FF5252").pack(anchor="w", padx=10, pady=6)
+
+        weakness_vars = {}
+        for s in ALL_8_SKILLS:
+            var = ctk.BooleanVar(value=False)
+            weakness_vars[s] = var
+            ctk.CTkCheckBox(w_box, text=s, variable=var, font=("Arial", 11), fg_color="#FF5252", hover_color="#D32F2F").pack(anchor="w", padx=12, pady=2)
+
+        result_frame = ctk.CTkFrame(guess_card, fg_color="transparent")
+        result_frame.pack(fill="x", padx=16, pady=8)
+
+        # Text debrief box
+        txt = ctk.CTkTextbox(content_scroll, wrap="word", font=("Arial", 11), fg_color="#181822", border_width=1, border_color="#2e2e3f", height=320)
+        txt.pack(fill="both", expand=True, pady=(0, 10))
+        txt.insert("1.0", "⏳ Triff oben deine Scouting-Vorhersage und klicke auf 'Scouting-Analyse enthüllen'...")
         txt.configure(state="disabled")
 
-        def run_ai():
-            prompt = f"""Du bist der offizielle osu! Tournament Caster und Analyst.
-Ein Match wurde soeben beendet:
-Turnier: {m['badge']} ({m['division']}, Jahrgang {m['year']})
-Format: {m['format_name']}
-Endstand: Spieler {m['player_score']} : {m['bot_score']} {m['bot_name']}
+        def submit_guess():
+            chosen_strengths = [k for k, v in strength_vars.items() if v.get()]
+            chosen_weaknesses = [k for k, v in weakness_vars.items() if v.get()]
 
-Match Verlauf & Gespielte Runden:
-{chr(10).join(m['history'])}
+            opp_lead = m.get("bot_profile", {})
+            true_top2 = opp_lead.get("top_strengths", ["Aim", "Speed"])
+            true_bot2 = opp_lead.get("top_weaknesses", ["Reading", "Stamina"])
 
-Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mit:
-1. MATCH HIGHLIGHTS & CLUTCH MOMENTS (welche Map-Picks haben das Match entschieden)
-2. STÄRKEN DES SPIELERS (wo hat der Spieler dominiert)
-3. SCHWÄCHEN & BAN/PICK TAKTIK (welche Slots wie HR/DT/Tech waren riskant)
-4. TURNIER-TRAININGSTIPP FÜR DAS NÄCHSTE MATCH"""
+            eval_res = evaluate_scouting_guess(chosen_strengths, chosen_weaknesses, true_top2, true_bot2)
 
-            report_txt = ""
-            if getattr(self, "gemini_key", ""):
-                try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{getattr(self, 'selected_ai_model', 'gemini-3.6-flash')}:generateContent?key={self.gemini_key}"
-                    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7, "maxOutputTokens": 2048}}
-                    r = requests.post(url, json=payload, timeout=20)
-                    resp = r.json()
-                    candidates = resp.get("candidates", [])
-                    if candidates:
-                        report_txt = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-                    if not report_txt:
-                        report_txt = f"KI-Bericht: Starkes Match! Endstand {m['player_score']} : {m['bot_score']}."
-                except Exception:
-                    report_txt = f"KI-Bericht: Starkes Match! Endstand {m['player_score']} : {m['bot_score']}. Trainiere gezielt deine schwächeren Slots im KI-Training!"
-            else:
-                report_txt = f"Endstand: {m['player_score']} : {m['bot_score']}.\n\nGute Performance in {m['badge']} {m['division']}! Nutze das KI-Live-Training, um gezielt an deinen Pick-Schwächen zu arbeiten."
+            for w in result_frame.winfo_children():
+                w.destroy()
 
-            def update_rep():
-                if txt.winfo_exists():
-                    txt.configure(state="normal")
-                    txt.delete("1.0", "end")
-                    txt.insert("1.0", report_txt)
-                    txt.configure(state="disabled")
+            r_box = ctk.CTkFrame(result_frame, fg_color="#14141e", corner_radius=10, border_width=1, border_color="#00E5FF")
+            r_box.pack(fill="x", pady=6)
 
-            self.after(0, update_rep)
+            ctk.CTkLabel(r_box, text=f"{eval_res['verdict_title']} • {eval_res['accuracy_pct']:.0f}% Genauigkeit ({eval_res['correct_count']}/4 Treffer)",
+                         font=("Arial", 13, "bold"), text_color="#00E5FF").pack(anchor="w", padx=12, pady=(8, 2))
+            ctk.CTkLabel(r_box, text=eval_res['verdict_desc'], font=("Arial", 11), text_color="#bbbbcc").pack(anchor="w", padx=12, pady=(0, 4))
+            ctk.CTkLabel(r_box, text=f"• Echte Stärken: {', '.join(true_top2)} | Echte Schwächen: {', '.join(true_bot2)}",
+                         font=("Arial", 11, "bold"), text_color="#FF9800").pack(anchor="w", padx=12, pady=(0, 8))
 
-        threading.Thread(target=run_ai, daemon=True).start()
+            # Reveal true opponent radar canvas
+            r_canvas_f = ctk.CTkFrame(r_box, fg_color="transparent")
+            r_canvas_f.pack(fill="x", padx=10, pady=(0, 8))
+            ctk.CTkLabel(r_canvas_f, text="🔍 Enthülltes wahres 8-Skillset Gegnerprofil:", font=("Arial", 11, "bold"), text_color="#E040FB").pack(anchor="w", pady=(0, 4))
+            opp_canvas = tk.Canvas(r_canvas_f, width=360, height=240, bg="#101018", highlightthickness=0)
+            opp_canvas.pack(pady=4)
+            draw_radar_polygon(opp_canvas, opp_lead.get("stats", {}), color_theme="purple", is_hidden=False)
 
-        ctk.CTkButton(modal, text="Schließen", width=120, height=36, font=("Arial", 12, "bold"),
-                      fg_color="#2b2b36", hover_color="#3a3a48", command=modal.destroy).pack(pady=(5, 15))
+            # Generate Gemini AI Debrief
+            match_summary = {
+                "tournament": m.get("tournament", "OWC"),
+                "badge": m.get("badge", "OWC"),
+                "division": m.get("division", "Grand Finals"),
+                "year": m.get("year", 2025),
+                "format_name": m.get("format_name", "Best of 13"),
+                "player_score": m.get("player_score", 0),
+                "bot_score": m.get("bot_score", 0),
+                "bot_name": m.get("bot_name", "Bot"),
+                "history": m.get("history", [])
+            }
+
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("1.0", "⏳ Gemini KI generiert den offiziellen deutschen Caster-Match-Report...")
+            txt.configure(state="disabled")
+
+            def _bg_debrief():
+                report_str = generate_strategic_debrief(match_summary, opp_lead, eval_res, api_key=getattr(self, "gemini_key", None))
+                def _update_ui():
+                    if txt.winfo_exists():
+                        txt.configure(state="normal")
+                        txt.delete("1.0", "end")
+                        txt.insert("1.0", report_str)
+                        txt.configure(state="disabled")
+                self.after(0, _update_ui)
+
+            threading.Thread(target=_bg_debrief, daemon=True).start()
+
+        ctk.CTkButton(guess_card, text="🔍 Scouting-Analyse enthüllen & Auswerten ➔", font=("Arial", 13, "bold"), height=36,
+                      fg_color="#00E5FF", hover_color="#00B4D8", text_color="#000000",
+                      command=submit_guess).pack(fill="x", padx=16, pady=(4, 12))
+
+        ctk.CTkButton(modal, text="Schließen", width=140, height=36, font=("Arial", 12, "bold"),
+                      fg_color="#2b2b36", hover_color="#3a3a48", command=modal.destroy).pack(pady=(4, 14))
 
 
     # ---------------------------------------------------------------------------
@@ -9485,7 +11545,8 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                      font=("Arial", 12), text_color="#eeddcc", justify="left", wraplength=340).pack(padx=16, pady=(4, 12), anchor="w")
 
         ctk.CTkButton(c3, text="⚔️ Turnier-Match starten ➔", font=("Arial", 13, "bold"), height=38,
-                      fg_color="#FF9800", hover_color="#F57C00", text_color="#000000", command=self.show_tournament_selector).pack(fill="x", padx=16, side="bottom", pady=16)
+                      fg_color="#FF9800", hover_color="#F57C00", text_color="#000000",
+                      command=lambda: self.ensure_osu_irc_password(on_success_callback=self.show_tournament_selector)).pack(fill="x", padx=16, side="bottom", pady=16)
 
         # ----------------- CARD 4: DEEP REPLAY ANALYSE (ZERO-CLICK & KI) -----------------
         c4 = ctk.CTkFrame(grid_frame, fg_color="#141c26", corner_radius=16, border_width=2, border_color="#00E5FF", width=380, height=220)
@@ -9713,21 +11774,21 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                     self._user_requested_mod = None
                     did_update_map = True
                     coach_directive_note = "Spieler möchte vorerst keine Easy (EZ) Maps mehr. Bestätige den Ausschluss freundlich und erkläre den Fokuswechsel."
-                    self.pick_next_ai_training_map(banned_mod="EZ", rotate_weakness=True)
+                    self.pick_next_ai_training_map(banned_mod="EZ", rotate_weakness=True, silent_announcement=True)
                 elif is_negative and any(tech_kw in msg_lower for tech_kw in ["tech", "technical"]):
                     if not hasattr(self, "_skipped_skills"): self._skipped_skills = set()
                     self._skipped_skills.add("Tech")
                     did_update_map = True
                     coach_directive_note = "Spieler möchte aktuell keine Tech-Maps. Bestätige und rotiere zur nächsten Schwäche."
-                    self.pick_next_ai_training_map(skip_skill="Tech", rotate_weakness=True)
+                    self.pick_next_ai_training_map(skip_skill="Tech", rotate_weakness=True, silent_announcement=True)
                 elif is_fun_mode:
                     did_update_map = True
                     coach_directive_note = "Spieler möchte aus Spaß spielen / sich auspowern. Schalte auf Fun-Mode mit seiner stärksten Disziplin (Speed/Aim)."
-                    self.pick_next_ai_training_map(is_fun_mode=True)
+                    self.pick_next_ai_training_map(is_fun_mode=True, silent_announcement=True)
                 elif is_skip_intent:
                     did_update_map = True
                     coach_directive_note = "Spieler möchte die aktuelle Map / Schwäche überspringen. Rotiere zur nächsten Herausforderung."
-                    self.pick_next_ai_training_map(rotate_weakness=True)
+                    self.pick_next_ai_training_map(rotate_weakness=True, silent_announcement=True)
                 elif (requested_skill or requested_sr is not None or requested_mod is not None or mod_crutch_detected) and (is_explicit_map_request or not is_pure_question):
                     did_update_map = True
                     new_skill = requested_skill or getattr(self, "ai_training_target_skill", "Streams")
@@ -9738,7 +11799,7 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
                         self._user_requested_sr = requested_sr
                         self._ai_training_target_sr = requested_sr
 
-                    self.pick_next_ai_training_map(forced_skill=new_skill, forced_mod=self._user_requested_mod)
+                    self.pick_next_ai_training_map(forced_skill=new_skill, forced_mod=self._user_requested_mod, silent_announcement=True)
 
                 # Auto-detect hardware / technique details from user chat
                 did_save_setup = self.update_user_setup_from_text(msg)
@@ -9890,13 +11951,65 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
                 self.add_modern_chat_bubble("ai", fallback_welcome)
 
         init_coach_assessment()
+        self._preload_ai_training_cache()
         self.pick_next_ai_training_map()
+
+    def _preload_ai_training_cache(self, base_sr=None):
+        """Pre-fetches 3 curated maps from SQLite for every one of the 8 skillsets so map switching is 0ms instant."""
+        if not hasattr(self, "_ai_prefetched_maps_pool"):
+            self._ai_prefetched_maps_pool = {}
+        
+        pa = getattr(self, "last_profile_analysis", {}) or {}
+        p_stats = pa.get("player_stats", {})
+        if base_sr is None:
+            base_sr = getattr(self, "_ai_training_target_sr", None) or float(p_stats.get("effective_sr", 5.2))
+
+        all_skills = ["Aim", "Streams", "Speed", "Stamina", "Tech", "Precision", "Reading", "Consistency"]
+        exclude = getattr(self, "recent_ai_training_map_ids", set())
+
+        for sk in all_skills:
+            if sk not in self._ai_prefetched_maps_pool:
+                self._ai_prefetched_maps_pool[sk] = []
+            
+            existing_ids = set(str(x.get("id", "")) for x in self._ai_prefetched_maps_pool[sk])
+            while len(self._ai_prefetched_maps_pool[sk]) < 3:
+                m = pick_dynamic_map_for_skill(
+                    category=sk,
+                    target_sr=base_sr,
+                    exclude_ids=exclude.union(existing_ids),
+                    banned_mods=getattr(self, "_banned_mods", set())
+                )
+                if m and str(m.get("id", "")) not in existing_ids:
+                    self._ai_prefetched_maps_pool[sk].append(m)
+                    existing_ids.add(str(m.get("id", "")))
+                else:
+                    break
+
+    def _refill_skill_cache(self, skill, target_sr):
+        """Refills the pre-fetched pool for a given skill to ensure 3 maps are always ready."""
+        if not hasattr(self, "_ai_prefetched_maps_pool"):
+            self._ai_prefetched_maps_pool = {}
+        self._ai_prefetched_maps_pool.setdefault(skill, [])
+        exclude = getattr(self, "recent_ai_training_map_ids", set())
+        existing_ids = set(str(x.get("id", "")) for x in self._ai_prefetched_maps_pool[skill])
+        while len(self._ai_prefetched_maps_pool[skill]) < 3:
+            m = pick_dynamic_map_for_skill(
+                category=skill,
+                target_sr=target_sr,
+                exclude_ids=exclude.union(existing_ids),
+                banned_mods=getattr(self, "_banned_mods", set())
+            )
+            if m and str(m.get("id", "")) not in existing_ids:
+                self._ai_prefetched_maps_pool[skill].append(m)
+                existing_ids.add(str(m.get("id", "")))
+            else:
+                break
 
     def set_ai_training_skill(self, skill_name):
         self.ai_training_target_skill = skill_name
         self.pick_next_ai_training_map(forced_skill=skill_name)
 
-    def pick_next_ai_training_map(self, adaptive_delta=0.0, forced_skill=None, forced_mod=None, banned_mod=None, skip_skill=None, rotate_weakness=False, is_fun_mode=False):
+    def pick_next_ai_training_map(self, adaptive_delta=0.0, forced_skill=None, forced_mod=None, banned_mod=None, skip_skill=None, rotate_weakness=False, is_fun_mode=False, silent_announcement=False):
         if not hasattr(self, "_ai_train_session_count"):
             self._ai_train_session_count = 0
         if not hasattr(self, "_ai_train_tested_skills"):
@@ -10035,14 +12148,21 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
         if not hasattr(self, "recent_ai_training_map_ids"):
             self.recent_ai_training_map_ids = set()
 
-        chosen = pick_dynamic_map_for_skill(
-            category=skill,
-            target_sr=target_sr,
-            exclude_ids=self.recent_ai_training_map_ids,
-            mod=target_mod,
-            user_feedback=getattr(self, "ai_user_feedback", {}),
-            banned_mods=self._banned_mods
-        )
+        # Fetch from pre-loaded 8-skillset cache for 0ms instant load
+        chosen = None
+        if hasattr(self, "_ai_prefetched_maps_pool") and self._ai_prefetched_maps_pool.get(skill):
+            chosen = self._ai_prefetched_maps_pool[skill].pop(0)
+            threading.Thread(target=lambda s=skill, sr=target_sr: self._refill_skill_cache(s, sr), daemon=True).start()
+
+        if not chosen:
+            chosen = pick_dynamic_map_for_skill(
+                category=skill,
+                target_sr=target_sr,
+                exclude_ids=self.recent_ai_training_map_ids,
+                mod=target_mod,
+                user_feedback=getattr(self, "ai_user_feedback", {}),
+                banned_mods=self._banned_mods
+            )
         self.recent_ai_training_map_ids.add(chosen["id"])
         if len(self.recent_ai_training_map_ids) > 30:
             self.recent_ai_training_map_ids.clear()
@@ -10103,12 +12223,26 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
         if hasattr(self, "ai_train_web_btn") and self.ai_train_web_btn.winfo_exists():
             self.ai_train_web_btn.configure(command=open_web)
 
-        # Announce in feed
-        if is_stress_test_mode:
-            coach_note = f"🔥 **STRESS-TEST ({len(self._ai_train_tested_skills)}/8):** Limit-Test für **{skill}{mod_badge}** (★ {chosen['sr']:.1f})!\n\n**Ziel:** {chosen.get('goal', '')}\n\n*Hier pushen wir bewusst deine Belastungsgrenze, um Choke-Punkte und Schwächen aufzudecken.*"
-        else:
-            coach_note = f"🎯 Nächste Herausforderung: **{chosen['name']}** (★ {chosen['sr']:.1f})\n\n**Ziel:** {chosen.get('goal', '')}\n\nStarte die Map direkt über osu!direct oder den Web-Link. Nach der Runde analysiere ich deinen Score automatisch!"
-        self.add_modern_chat_bubble("ai", coach_note)
+        # Announce in feed only when not silent (e.g. not right after user chat)
+        if not silent_announcement:
+            m_raw = chosen.get("name", "Unknown")
+            m_artist = chosen.get("artist", "")
+            m_title = chosen.get("title", "")
+            m_ver = chosen.get("version", "")
+            if m_artist and m_title:
+                song_name = f"{m_artist} - {m_title}"
+            else:
+                song_name = re.sub(r'\s*\[.*?\]\s*$', '', m_raw).strip()
+            if not m_ver:
+                ver_match = re.search(r'\[(.*?)\]', m_raw)
+                m_ver = ver_match.group(1) if ver_match else ""
+            diff_str = f"[{m_ver}]" if m_ver else ""
+
+            if is_stress_test_mode:
+                coach_note = f"🔥 **STRESS-TEST ({len(self._ai_train_tested_skills)}/8):** Limit-Test für **{skill}{mod_badge}** (★ {chosen['sr']:.1f})!\n\n🎵 **Map:** {song_name}\n🏷️ **Difficulty:** {diff_str}\n\n**Ziel:** {chosen.get('goal', '')}\n\n*Hier pushen wir bewusst deine Belastungsgrenze, um Choke-Punkte und Schwächen aufzudecken.*"
+            else:
+                coach_note = f"🎯 Nächste Herausforderung:\n🎵 **Map:** {song_name}\n🏷️ **Difficulty:** {diff_str} (★ {chosen['sr']:.1f})\n\n**Ziel:** {chosen.get('goal', '')}\n\nStarte die Map direkt über osu!direct oder den Web-Link. Nach der Runde analysiere ich deinen Score automatisch!"
+            self.add_modern_chat_bubble("ai", coach_note)
 
     def fetch_ai_training_recent_plays(self, silent=False):
         user = getattr(self, "osu_username", "")
@@ -10253,7 +12387,7 @@ KERNZIEL: Schwächen und Belastungsgrenzen (Fingerlocking, Overaiming, Reading-F
 Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch (3-5 prägnante Sätze):
 1. Analysiere das Abschneiden und die konkrete Ursache für den {'Fail / Choke' if is_real_fail else 'Score'}.
 2. Was muss der Spieler mechanisch korrigieren (z. B. Handgelenk-Führung, Lockere Finger, Klick-Release, Reading-Fokus)?
-3. {'Mache ihm Mut und erkläre, ob die Map für ihn machbar ist!' if is_real_fail else 'Motiviere ihn für die nächste Steigerung!'}"""
+3. {'Mache ihm Mut und erkläre, ob the Map für ihn machbar ist!' if is_real_fail else 'Motiviere ihn für die nächste Steigerung!'}"""
                     try:
                         g_model = getattr(self, "selected_ai_model", "gemini-3.6-flash")
                         g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self.gemini_key}"
@@ -10267,61 +12401,17 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                     except Exception:
                         pass
 
-                # 2. Real Fail Handling (Nur mit Knopfdruck skippen, KI fragt nach Aktion)
+                # 2. Real Fail Handling
                 if is_real_fail:
-                    is_passable = (acc >= 85.0 or tot >= 120 or combo >= 80)
-                    if is_passable:
-                        fail_verdict = f"💀 **Map nicht bestanden (Fail)** – aber du warst nah dran ({acc:.1f}% Acc bis Note #{tot})! Mit etwas mehr Lockerheit schaffst du den Pass."
-                    else:
-                        fail_verdict = f"💀 **Map nicht bestanden (Fail)** – Choke bei Note #{tot} ({acc:.1f}% Acc). Diese Pattern waren mechanisch sehr fordernd."
-
                     if not ai_coaching_text:
                         ai_coaching_text = "Achte auf eine entspannte Handhaltung und versuche, die Noten nicht hektisch zu spamen."
 
-                    fail_feedback = f"{fail_verdict}\n\n🤖 **Coach-Analyse:**\n{ai_coaching_text}\n\n💡 *Die Map bleibt geladen. Möchtest du sie nochmal versuchen oder überspringen?*"
+                    fail_feedback = f"💀 **Map nicht bestanden (Fail)** – Choke bei Note #{tot} ({acc:.1f}% Acc).\n\n🤖 **Coach-Analyse:**\n{ai_coaching_text}\n\n💡 *Die Map bleibt für einen Re-Try geladen. Klicke links auf 'Nächste Map' oder schreibe mir im Chat, wenn du wechseln willst!*"
 
                     def update_fail_feed():
                         if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
-                            self.ai_train_sync_lbl.configure(text=f"💀 Fail erfasst ({acc:.1f}% bis Note #{tot}) • Wähle nächste Aktion", text_color="#FFA726")
+                            self.ai_train_sync_lbl.configure(text=f"💀 Fail erfasst ({acc:.1f}% bis Note #{tot}) • Bereit für Re-Try", text_color="#FFA726")
                             self.add_modern_chat_bubble("ai", fail_feedback)
-
-                            q_title = "💀 Runde nicht bestanden (Fail) – Wie möchtest du weitermachen?"
-                            q_sub = f"Map: {map_name[:40]} • {acc:.1f}% Acc • Abbruch bei Note #{tot}"
-                            if is_passable:
-                                q_opts = [
-                                    "🔄 Nochmal versuchen (Die Map ist machbar, ich hol mir den Pass!)",
-                                    "⏭️ Map skippen & nächste Trainings-Map laden",
-                                    "💡 Coach-Tipp & Detail-Choke-Analyse im Chat vertiefen",
-                                    "📉 Schwierigkeit minimal senken (-0.2★) für mehr Stabilität",
-                                    "☕ Skillset wechseln (z. B. auf Aim oder Tech)"
-                                ]
-                            else:
-                                q_opts = [
-                                    "⏭️ Map skippen & passendere Trainings-Map laden",
-                                    "📉 Schwierigkeit senken (-0.35★) – war zu schwer",
-                                    "🔄 Trotzdem nochmal versuchen (Sturheit siegt!)",
-                                    "☕ Skillset wechseln (z. B. auf Aim oder Tech)",
-                                    "💬 Setup-/Hardware-Tipp vom Coach anfordern"
-                                ]
-
-                            def on_fail_choice(c_idx, c_txt):
-                                if c_idx == -1 or not c_txt: return
-                                if "Nochmal versuchen" in c_txt or "Trotzdem" in c_txt:
-                                    self.add_modern_chat_bubble("ai", f"💪 **Starker Kampfgeist!** Wir bleiben auf **{map_name}**. Konzentriere dich auf die Miss-Stelle bei Note #{tot}!")
-                                    if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
-                                        self.ai_train_sync_lbl.configure(text=f"🔄 Bereit für Re-Try auf: {map_name[:25]}...", text_color="#00E5FF")
-                                elif "skippen" in c_txt or "nächste" in c_txt:
-                                    self.add_modern_chat_bubble("ai", "⏭️ **Map übersprungen.** Ich bereite die nächste Map für dich vor!")
-                                    self.pick_next_ai_training_map(rotate_weakness=True)
-                                elif "senken" in c_txt:
-                                    self.add_modern_chat_bubble("ai", "📉 **Schwierigkeit angepasst.** Nächste Map wird etwas zugänglicher (-0.3★) gewählt.")
-                                    self.pick_next_ai_training_map(adaptive_delta=-0.30)
-                                elif "Skillset wechseln" in c_txt:
-                                    self.handle_ai_question_response(3, "Skillset wechseln")
-                                else:
-                                    self.add_modern_chat_bubble("ai", f"💡 **Coach-Tipp:** Achte bei schnellen Passagen auf eine lockere Handhaltung. Du kannst die Map jederzeit per Klick auf 'Nächste Map' links überspringen.")
-
-                            self.after(1000, lambda: self.show_ai_question_modal(title=q_title, subtitle=q_sub, options=q_opts, callback=on_fail_choice))
 
                     self.after(0, update_fail_feed)
                     return
@@ -10367,45 +12457,13 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                     calculations={"adaptive_sr_delta": delta, "adapt_msg": adapt_msg}
                 )
 
-                if not hasattr(self, "_rounds_since_feedback_prompt"):
-                    self._rounds_since_feedback_prompt = 0
-                self._rounds_since_feedback_prompt += 1
-
                 feedback = f"✅ Runde erfolgreich abgeschlossen ({played_mods_str})!\nAcc: {acc:.2f}% | 300s: {h300} | 100s: {h100} | Misses: {miss}\n\n🤖 Coach-Analyse:\n{ai_coaching_text}\n\n{mod_warning + chr(10) + chr(10) if mod_warning else ''}{adapt_msg}"
-
-                should_ask_question = (self._rounds_since_feedback_prompt >= 2 or miss >= 3)
-                if should_ask_question:
-                    self._rounds_since_feedback_prompt = 0
 
                 def update_feed():
                     if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
-                        self.ai_train_sync_lbl.configure(text=f"⚡ Live-Sync: Runde erfasst ({acc:.1f}% / {miss} Miss) ➔ Wähle nächste Map...", text_color="#00E676")
+                        self.ai_train_sync_lbl.configure(text=f"⚡ Live-Sync: Runde erfasst ({acc:.1f}% / {miss} Miss) ➔ Bereite nächste Map vor...", text_color="#00E676")
                         self.add_modern_chat_bubble("ai", feedback)
-                        
-                        if should_ask_question:
-                            if miss >= 3:
-                                q_title = "Worauf möchtest du dich bei der nächsten Map fokussieren?"
-                                q_sub = f"Letzte Map: {map_name[:40]} • {miss} Misses ({acc:.1f}% Acc)"
-                                q_opts = [
-                                    "Tempo drosseln (-15 BPM), um Fingerlocking zu verhindern",
-                                    "Schwierigkeit (-0.3★) senken, um wieder saubere Passes zu spielen",
-                                    "Fokus auf Tech & Slider-Control legen",
-                                    "Zu einem anderen Skillset wechseln (z. B. Jumps/Aim)",
-                                    "Keine Anpassung, aktuelle Map nochmal versuchen"
-                                ]
-                            else:
-                                q_title = "Wie hat sich diese Map für dich angefühlt?"
-                                q_sub = f"Letzte Map: {map_name[:40]} • {acc:.1f}% Acc (Guter Run!)"
-                                q_opts = [
-                                    "Schwierigkeit erhöhen (+0.2★ / mehr Challenge)",
-                                    "Auf diesem Level bleiben und Konstanz festigen",
-                                    "Tempo erhöhen (+DT / +15 BPM Speed)",
-                                    "Zum nächsten Schwachstellen-Skillset weitergehen",
-                                    "Alles perfekt, einfach weiter mit normaler Rotation!"
-                                ]
-                            self.after(1000, lambda: self.show_ai_question_modal(title=q_title, subtitle=q_sub, options=q_opts))
-                        else:
-                            self.after(1200, lambda: self.pick_next_ai_training_map(adaptive_delta=delta) if hasattr(self, 'ai_train_map_title') and self.ai_train_map_title.winfo_exists() else None)
+                        self.after(1200, lambda: self.pick_next_ai_training_map(adaptive_delta=delta) if hasattr(self, 'ai_train_map_title') and self.ai_train_map_title.winfo_exists() else None)
 
                 self.after(0, update_feed)
             except Exception as e:
