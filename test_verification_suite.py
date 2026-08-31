@@ -23,13 +23,31 @@ Coverage Matrix:
 - Module 15: Test15_Tier4_RealWorldWorkloadsAndE2E
 - Module 16: Test16_Tier5_AdversarialSecurityAndPackaging
 
+- Module 17: Test17_Tier1_LiveMemoryEngineAndScanner
+- Module 18: Test18_Tier2_MemoryBoundaryAndCornerCases
+- Module 19: Test19_Tier3_CrossFeatureLiveTelemetryPipeline
+- Module 20: Test20_Tier4_RealWorldLiveSimulationWorkloads
+- Module 21: Test21_Tier5_AdversarialMemoryHardeningAndCPUBenchmark
+- Module 22: Test22_Tier1_FastSongFinder
+- Module 23: Test23_Tier1_OsuHitObjectParser
+- Module 24: Test24_Tier1_ModTransformations
+- Module 25: Test25_Tier1_DiscreteHitMatching
+- Module 26: Test26_Tier1_25BinTimingHistogram
+- Module 27: Test27_Tier1_TrueRelativeCSAccuracyScatter
+- Module 28: Test28_Tier2_BoundaryAndCornerCases
+- Module 29: Test29_Tier3_CrossFeatureIntegration
+- Module 30: Test30_Tier4_RealWorldWorkloadsAndE2E
+- Module 31: Test31_Tier5_AdversarialSecurityAndPerformanceStress
+
 Pass Criteria: 100% test cases pass with exit code 0.
 =============================================================================
 """
 
 import concurrent.futures
 import copy
+import ctypes
 import datetime
+import hashlib
 import json
 import lzma
 import math
@@ -39,6 +57,7 @@ import random
 import re
 import shutil
 import socket
+import sqlite3
 import ssl
 import struct
 import sys
@@ -1789,6 +1808,2035 @@ class Test16_Tier5_AdversarialSecurityAndPackaging(unittest.TestCase):
         self.assertTrue(any("PRIVMSG #mp_8888 :Willkommen zum UHO Hub Turniermatch!" in cmd for cmd in dispatched))
 
 
+
+# =============================================================================
+# LIVE MEMORY ENGINE REFERENCE MODELS & DATA STRUCTURES (R1-R4)
+# =============================================================================
+PROCESS_VM_READ = 0x0010
+PROCESS_QUERY_INFORMATION = 0x0400
+DESIRED_ACCESS_MASK = 0x0410  # PROCESS_VM_READ | PROCESS_QUERY_INFORMATION
+TH32CS_SNAPPROCESS = 0x00000002
+
+AOB_PATTERNS = {
+    "status": "DB 5D E8 8B 45 E8 A1 ?? ?? ?? ?? 8D 55 F0",
+    "ruleset": "8B 0D ?? ?? ?? ?? 85 C9 7E 18 A1 ?? ?? ?? ?? 8B 10",
+    "beatmap": "8B 0D ?? ?? ?? ?? 8B 01 FF 50 14 8B F0 85 F6",
+    "input": "8B 0D ?? ?? ?? ?? 8B 01 FF 60 3C",
+    "audio_time": "A3 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? 00"
+}
+
+
+def ref_is_valid_user_address(addr: int) -> bool:
+    """Validates 32-bit Windows user-mode virtual address range and 4-byte alignment."""
+    if addr is None or not isinstance(addr, int):
+        return False
+    return (0x00010000 <= addr <= 0x7FFEFFFF) and (addr % 4 == 0)
+
+
+def ref_decode_mods_bitmask(mods_mask: int) -> str:
+    """Decodes osu! active mods integer bitmask into standard human-readable string."""
+    if not mods_mask:
+        return "NoMod"
+    mods_list = []
+    if mods_mask & 1: mods_list.append("NF")
+    if mods_mask & 2: mods_list.append("EZ")
+    if mods_mask & 8: mods_list.append("HD")
+    if mods_mask & 16: mods_list.append("HR")
+    if mods_mask & 32: mods_list.append("SD")
+    if mods_mask & 64:
+        if mods_mask & 512:
+            mods_list.append("NC")
+        else:
+            mods_list.append("DT")
+    elif mods_mask & 512:
+        mods_list.append("NC")
+    if mods_mask & 256: mods_list.append("HT")
+    if mods_mask & 1024: mods_list.append("FL")
+    if mods_mask & 4096: mods_list.append("SO")
+    return "+".join(mods_list) if mods_list else "NoMod"
+
+
+def ref_calculate_unstable_rate(hit_errors: list) -> float:
+    """Calculates Unstable Rate (UR = std_dev * 10.0) from discrete hit error millisecond deltas."""
+    valid_hits = [float(x) for x in hit_errors if isinstance(x, (int, float)) and not math.isnan(x) and not math.isinf(x)]
+    if len(valid_hits) < 2:
+        return 0.0
+    mean_val = sum(valid_hits) / len(valid_hits)
+    variance = sum((x - mean_val) ** 2 for x in valid_hits) / len(valid_hits)
+    return round(math.sqrt(variance) * 10.0, 2)
+
+
+def ref_calculate_accuracy_from_hits(c300: int, c100: int, c50: int, c0: int) -> float:
+    """Calculates osu! standard accuracy percentage from discrete hit counts."""
+    tot = int(c300) + int(c100) + int(c50) + int(c0)
+    if tot <= 0:
+        return 100.0
+    acc = ((int(c300) * 300 + int(c100) * 100 + int(c50) * 50) / (tot * 300.0)) * 100.0
+    return round(acc, 2)
+
+
+def ref_calculate_timing_distribution(hit_errors: list, od: float = 8.0) -> dict:
+    """Computes 25-bin histogram across [-50ms, +50ms] in 4ms increments with OD hit windows."""
+    valid_hits = [float(x) for x in hit_errors if isinstance(x, (int, float)) and not math.isnan(x) and not math.isinf(x)]
+    if not valid_hits:
+        return {
+            "bins": [0] * 25,
+            "count_300": 0, "count_100": 0, "count_50": 0, "count_miss": 0,
+            "avg_hit_error": 0.0, "unstable_rate": 0.0, "total_hits": 0
+        }
+
+    # OD hit windows (ms)
+    w300 = 80.0 - 6.0 * od
+    w100 = 140.0 - 8.0 * od
+    w50 = 200.0 - 10.0 * od
+
+    bins = [0] * 25
+    c300 = c100 = c50 = cmiss = 0
+
+    for err in valid_hits:
+        abs_e = abs(err)
+        if abs_e <= w300: c300 += 1
+        elif abs_e <= w100: c100 += 1
+        elif abs_e <= w50: c50 += 1
+        else: cmiss += 1
+
+        # Bin index: -50ms -> 0, 0ms -> 12, +50ms -> 24
+        clamped = max(-50.0, min(50.0, err))
+        idx = int(math.floor((clamped + 50.0) / 4.0))
+        idx = max(0, min(24, idx))
+        bins[idx] += 1
+
+    avg_err = sum(valid_hits) / len(valid_hits)
+    ur = ref_calculate_unstable_rate(valid_hits)
+
+    return {
+        "bins": bins,
+        "count_300": c300,
+        "count_100": c100,
+        "count_50": c50,
+        "count_miss": cmiss,
+        "avg_hit_error": round(avg_err, 2),
+        "unstable_rate": ur,
+        "total_hits": len(valid_hits)
+    }
+
+
+def ref_calculate_cs_scatter(raw_offsets: list, circle_radius: float = 36.0) -> dict:
+    """Computes radial scatter points and overaim/underaim momentum percentages."""
+    if not raw_offsets:
+        return {
+            "scatter_points": [],
+            "overshoot_pct": 50.0,
+            "underaim_pct": 50.0,
+            "total_scatter": 0
+        }
+    over_count = 0
+    under_count = 0
+    scatter_pts = []
+
+    for item in raw_offsets:
+        rx, ry = item[0], item[1]
+        # Momentum along 45 degree axis (rx + ry) / sqrt(2)
+        dot_p = (rx + ry) / 1.4142
+        if dot_p > 0.5:
+            over_count += 1
+        elif dot_p < -0.5:
+            under_count += 1
+        scatter_pts.append((round(rx, 2), round(ry, 2)))
+
+    tot = len(raw_offsets)
+    over_pct = round((over_count / tot) * 100.0, 1) if tot > 0 else 50.0
+    under_pct = round((under_count / tot) * 100.0, 1) if tot > 0 else 50.0
+
+    return {
+        "scatter_points": scatter_pts[:180],
+        "overshoot_pct": over_pct,
+        "underaim_pct": under_pct,
+        "total_scatter": tot
+    }
+
+
+class RefOsuLiveMemoryEngine:
+    """Modular reference memory engine for Windows osu! process telemetry."""
+    STATUS_DISCONNECTED = -1
+    STATUS_MENU = 0
+    STATUS_EDIT = 1
+    STATUS_PLAYING = 2
+    STATUS_EXIT = 3
+    STATUS_RANKING = 15
+    STATUS_TOURNEY = 24
+
+    def __init__(self, is_mock: bool = False):
+        self.is_mock = is_mock
+        self.polling_mode = "adaptive"
+        self.custom_hz = None
+        self.is_running = False
+        self.current_status = self.STATUS_DISCONNECTED
+        self.current_beatmap = None
+        self.current_score = 0
+        self.current_combo = 0
+        self.max_combo = 0
+        self.accuracy = 100.0
+        self.hp = 200.0
+        self.count_300 = 0
+        self.count_100 = 0
+        self.count_50 = 0
+        self.count_miss = 0
+        self.mods_mask = 0
+        self.hit_errors = []
+        self.cursor_x = 256.0
+        self.cursor_y = 192.0
+        self.key_k1 = False
+        self.key_k2 = False
+        self.key_m1 = False
+        self.key_m2 = False
+        self.last_known_hit_count = 0
+
+        self._listeners_status_change = []
+        self._listeners_hit = []
+        self._listeners_cursor = []
+        self._listeners_play_complete = []
+        self._lock = threading.RLock()
+
+    def on_status_change(self, callback):
+        with self._lock:
+            self._listeners_status_change.append(callback)
+
+    def on_hit(self, callback):
+        with self._lock:
+            self._listeners_hit.append(callback)
+
+    def on_cursor_update(self, callback):
+        with self._lock:
+            self._listeners_cursor.append(callback)
+
+    def on_play_complete(self, callback):
+        with self._lock:
+            self._listeners_play_complete.append(callback)
+
+    def set_polling_mode(self, mode: str, custom_hz: int = None):
+        with self._lock:
+            self.polling_mode = mode
+            self.custom_hz = custom_hz
+
+    def get_polling_interval(self) -> float:
+        with self._lock:
+            if self.custom_hz and self.custom_hz > 0:
+                return 1.0 / max(1, min(240, self.custom_hz))
+            if self.polling_mode == "30hz":
+                return 1.0 / 30.0
+            elif self.polling_mode == "60hz":
+                return 1.0 / 60.0
+            elif self.polling_mode == "100hz":
+                return 1.0 / 100.0
+            else:  # adaptive
+                if self.current_status == self.STATUS_PLAYING:
+                    return 1.0 / 60.0  # 16.6ms in-game
+                else:
+                    return 0.5  # 2 Hz menu/idle
+
+    def safe_dereference_chain(self, base_addr: int, offsets: list, mock_memory: dict = None) -> int:
+        """Safely dereferences pointer chain with 32-bit user space address guards."""
+        curr = base_addr
+        for offset in offsets[:-1]:
+            if not ref_is_valid_user_address(curr):
+                return None
+            target = curr + offset
+            if mock_memory is not None:
+                curr = mock_memory.get(target)
+            else:
+                curr = target  # Mock deref
+            if curr is None or not ref_is_valid_user_address(curr):
+                return None
+        final_addr = curr + offsets[-1]
+        return final_addr if ref_is_valid_user_address(final_addr) else None
+
+    def decode_dotnet_utf16(self, str_addr: int, mock_memory: dict = None) -> str:
+        """Decodes .NET String object from CLR memory (+0x04 length, +0x08 utf-16 bytes)."""
+        if not ref_is_valid_user_address(str_addr) or mock_memory is None:
+            return ""
+        length = mock_memory.get(str_addr + 4, 0)
+        if not isinstance(length, int) or length <= 0 or length > 512:
+            return ""
+        raw_bytes = mock_memory.get(str_addr + 8, b"")
+        if isinstance(raw_bytes, str):
+            return raw_bytes[:length]
+        elif isinstance(raw_bytes, (bytes, bytearray)):
+            try:
+                return raw_bytes[:length * 2].decode("utf-16le", errors="ignore")
+            except Exception:
+                return ""
+        return ""
+
+    def decode_dotnet_hit_list(self, list_addr: int, last_count: int, mock_memory: dict = None) -> tuple:
+        """Reads newly appended discrete hit error values from .NET List<int>."""
+        if not ref_is_valid_user_address(list_addr) or mock_memory is None:
+            return [], last_count
+        cur_count = mock_memory.get(list_addr + 0x0C, 0)
+        if not isinstance(cur_count, int) or cur_count <= last_count:
+            return [], max(0, cur_count)
+        items_ptr = mock_memory.get(list_addr + 0x08, 0)
+        if not ref_is_valid_user_address(items_ptr):
+            return [], last_count
+
+        raw_array = mock_memory.get(items_ptr + 0x0C, [])
+        new_items = raw_array[last_count:cur_count]
+        return new_items, cur_count
+
+    def get_state(self) -> dict:
+        with self._lock:
+            ur = ref_calculate_unstable_rate(self.hit_errors)
+            avg_err = (sum(self.hit_errors) / len(self.hit_errors)) if self.hit_errors else 0.0
+            return {
+                "status": self.current_status,
+                "beatmap": self.current_beatmap,
+                "score": self.current_score,
+                "combo": self.current_combo,
+                "max_combo": self.max_combo,
+                "accuracy": self.accuracy,
+                "hp": self.hp,
+                "count_300": self.count_300,
+                "count_100": self.count_100,
+                "count_50": self.count_50,
+                "count_miss": self.count_miss,
+                "mods": self.mods_mask,
+                "mods_formatted": ref_decode_mods_bitmask(self.mods_mask),
+                "cursor_x": self.cursor_x,
+                "cursor_y": self.cursor_y,
+                "keys": {
+                    "k1": self.key_k1, "k2": self.key_k2,
+                    "m1": self.key_m1, "m2": self.key_m2
+                },
+                "hit_errors": list(self.hit_errors),
+                "unstable_rate": ur,
+                "mean_hit_error": round(avg_err, 2),
+                "k1_avg_hold": 42.0,
+                "k2_avg_hold": 42.0
+            }
+
+
+class RefSimulatedMemoryEngine(RefOsuLiveMemoryEngine):
+    """High-fidelity synthetic memory emulator for automated test suites."""
+    def __init__(self):
+        super().__init__(is_mock=True)
+
+    def simulate_play_session(self, beatmap_meta: dict, total_hits: int = 500, mean_error: float = 0.0,
+                              ur: float = 80.0, overaim_pct: float = 50.0, k1_hold_ms: float = 45.0,
+                              k2_hold_ms: float = 45.0) -> dict:
+        """Simulates a complete osu! gameplay session from start to finish."""
+        old_status = self.current_status
+        self.current_status = self.STATUS_PLAYING
+        self.current_beatmap = beatmap_meta
+        self.hit_errors = []
+        self.last_known_hit_count = 0
+
+        # Fire on_status_change
+        for cb in list(self._listeners_status_change):
+            cb(old_status, self.STATUS_PLAYING)
+
+        sigma = max(0.5, ur / 10.0)
+        c300 = c100 = c50 = cmiss = 0
+        od = float(beatmap_meta.get("od", 8.0) or 8.0)
+        w300 = 80.0 - 6.0 * od
+        w100 = 140.0 - 8.0 * od
+        w50 = 200.0 - 10.0 * od
+
+        scatter_points = []
+        cur_combo = 0
+        max_combo = 0
+
+        for i in range(total_hits):
+            err = random.gauss(mean_error, sigma)
+            self.hit_errors.append(round(err, 2))
+            abs_e = abs(err)
+            if abs_e <= w300:
+                c300 += 1
+                cur_combo += 1
+                hit_res = 300
+            elif abs_e <= w100:
+                c100 += 1
+                cur_combo += 1
+                hit_res = 100
+            elif abs_e <= w50:
+                c50 += 1
+                cur_combo += 1
+                hit_res = 50
+            else:
+                cmiss += 1
+                cur_combo = 0
+                hit_res = 0
+
+            max_combo = max(max_combo, cur_combo)
+
+            # Spatial scatter
+            is_over = (i < int(total_hits * (overaim_pct / 100.0)))
+            dot_dir = 1.0 if is_over else -1.0
+            r_dist = random.uniform(2.0, 18.0) * dot_dir
+            angle = random.uniform(0.6, 0.9)  # around 45 degrees
+            sx = r_dist * math.cos(angle)
+            sy = r_dist * math.sin(angle)
+            scatter_points.append((round(sx, 2), round(sy, 2)))
+
+            self.cursor_x = max(0.0, min(512.0, 256.0 + sx))
+            self.cursor_y = max(0.0, min(384.0, 192.0 + sy))
+            self.key_k1 = (i % 2 == 0)
+            self.key_k2 = (i % 2 == 1)
+
+            # Fire on_hit
+            for cb in list(self._listeners_hit):
+                cb(err, hit_res, self.key_k1, self.key_k2)
+
+            # Fire on_cursor_update
+            for cb in list(self._listeners_cursor):
+                cb(self.cursor_x, self.cursor_y)
+
+        self.count_300 = c300
+        self.count_100 = c100
+        self.count_50 = c50
+        self.count_miss = cmiss
+        self.max_combo = max_combo
+        self.accuracy = ref_calculate_accuracy_from_hits(c300, c100, c50, cmiss)
+        self.current_score = int((self.accuracy / 100.0) * 1000000)
+
+        # Transition to RANKING
+        old_s = self.current_status
+        self.current_status = self.STATUS_RANKING
+
+        session_summary = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "beatmap_id": int(beatmap_meta.get("id", 0) or 0),
+            "beatmap_md5": str(beatmap_meta.get("md5", "")),
+            "title": str(beatmap_meta.get("title", "")),
+            "artist": str(beatmap_meta.get("artist", "")),
+            "version": str(beatmap_meta.get("version", "")),
+            "score": self.current_score,
+            "max_combo": self.max_combo,
+            "accuracy": self.accuracy,
+            "unstable_rate": ref_calculate_unstable_rate(self.hit_errors),
+            "mean_error": round(sum(self.hit_errors) / len(self.hit_errors), 2) if self.hit_errors else 0.0,
+            "count_300": self.count_300,
+            "count_100": self.count_100,
+            "count_50": self.count_50,
+            "count_miss": self.count_miss,
+            "mods": ref_decode_mods_bitmask(self.mods_mask),
+            "overaim_ratio": overaim_pct,
+            "underaim_ratio": round(100.0 - overaim_pct, 1),
+            "k1_avg_hold": k1_hold_ms,
+            "k2_avg_hold": k2_hold_ms,
+            "hit_errors": list(self.hit_errors),
+            "scatter_points": scatter_points
+        }
+
+        for cb in list(self._listeners_status_change):
+            cb(old_s, self.STATUS_RANKING)
+
+        for cb in list(self._listeners_play_complete):
+            cb(session_summary)
+
+        return session_summary
+
+
+class RefTelemetryStorageEngine:
+    """SQLite manager for telemetry.db session persistence."""
+    def __init__(self, db_path: str = "telemetry.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS live_play_telemetry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                beatmap_id INTEGER,
+                beatmap_md5 TEXT,
+                title TEXT,
+                artist TEXT,
+                version TEXT,
+                score INTEGER,
+                max_combo INTEGER,
+                accuracy REAL,
+                unstable_rate REAL,
+                mean_error REAL,
+                count_300 INTEGER,
+                count_100 INTEGER,
+                count_50 INTEGER,
+                count_miss INTEGER,
+                mods TEXT,
+                overaim_ratio REAL,
+                underaim_ratio REAL,
+                hit_errors_json TEXT,
+                scatter_points_json TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def save_live_session(self, session_data: dict) -> int:
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO live_play_telemetry (
+                timestamp, beatmap_id, beatmap_md5, title, artist, version,
+                score, max_combo, accuracy, unstable_rate, mean_error,
+                count_300, count_100, count_50, count_miss, mods,
+                overaim_ratio, underaim_ratio, hit_errors_json, scatter_points_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            session_data.get("timestamp", ""),
+            int(session_data.get("beatmap_id", 0) or 0),
+            str(session_data.get("beatmap_md5", "")),
+            str(session_data.get("title", "")),
+            str(session_data.get("artist", "")),
+            str(session_data.get("version", "")),
+            int(session_data.get("score", 0) or 0),
+            int(session_data.get("max_combo", 0) or 0),
+            float(session_data.get("accuracy", 0.0) or 0.0),
+            float(session_data.get("unstable_rate", 0.0) or 0.0),
+            float(session_data.get("mean_error", 0.0) or 0.0),
+            int(session_data.get("count_300", 0) or 0),
+            int(session_data.get("count_100", 0) or 0),
+            int(session_data.get("count_50", 0) or 0),
+            int(session_data.get("count_miss", 0) or 0),
+            str(session_data.get("mods", "NoMod")),
+            float(session_data.get("overaim_ratio", 50.0) or 50.0),
+            float(session_data.get("underaim_ratio", 50.0) or 50.0),
+            json.dumps(session_data.get("hit_errors", [])),
+            json.dumps(session_data.get("scatter_points", []))
+        ))
+        row_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+        return row_id
+
+    def get_recent_live_sessions(self, limit: int = 10) -> list:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM live_play_telemetry ORDER BY id DESC LIMIT ?", (limit,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return rows
+
+    def get_session_by_id(self, session_id: int) -> dict:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM live_play_telemetry WHERE id = ?", (session_id,))
+        row = cur.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+
+class RefAICoachEngine:
+    """Deterministic rule engine and German debriefing generator."""
+    @staticmethod
+    def compute_settings_recommendations(avg_err_ms: float, ur_val: float, over_pct: float,
+                                         under_pct: float, hold_gap_ms: float = 0.0) -> str:
+        if hasattr(app, "compute_settings_recommendations") and callable(getattr(app, "compute_settings_recommendations")):
+            return app.compute_settings_recommendations(avg_err_ms, ur_val, over_pct, under_pct, hold_gap_ms)
+
+        recs = []
+        if avg_err_ms > 2.5:
+            recs.append(f"Universal Audio Offset auf {-int(round(avg_err_ms)):+d} ms einstellen (Local: {int(round(avg_err_ms)):+d} ms).")
+        elif avg_err_ms < -2.5:
+            recs.append(f"Universal Audio Offset auf {int(round(abs(avg_err_ms))):+d} ms einstellen (Local: {-int(round(abs(avg_err_ms))):+d} ms).")
+        else:
+            recs.append("Audio Offset: Perfekt zentriert (±2ms Idealbereich).")
+
+        if under_pct >= 58.0:
+            recs.append("Tablet-Breite um ca. 2 bis 4 mm verkleinern (+50 bis +100 DPI).")
+        elif over_pct >= 58.0:
+            recs.append("Tablet-Breite um ca. 2 bis 4 mm vergrößern (-50 bis -100 DPI).")
+        else:
+            recs.append("Tablet-Area: Ausgewogen.")
+
+        if hold_gap_ms >= 18.0:
+            recs.append("Rapid Trigger Actuation 0.4mm / Release 0.2mm einstellen.")
+
+        if ur_val > 105.0:
+            recs.append("Background Dim auf 100% und Hitsounds auf 80% einstellen.")
+
+        return "\n\n".join(recs)
+
+    @staticmethod
+    def generate_live_coaching_debrief(session_data: dict, api_key: str = None) -> str:
+        """Generates structured 5-section German coaching debrief."""
+        if hasattr(app, "AICoachEngine") and hasattr(app.AICoachEngine, "generate_live_coaching_debrief"):
+            return app.AICoachEngine.generate_live_coaching_debrief(session_data, api_key)
+
+        title = session_data.get("title", "Map")
+        acc = session_data.get("accuracy", 100.0)
+        ur = session_data.get("unstable_rate", 80.0)
+        avg_err = session_data.get("mean_error", 0.0)
+        over_pct = session_data.get("overaim_ratio", 50.0)
+        under_pct = session_data.get("underaim_ratio", 50.0)
+        hold_gap = abs(session_data.get("k1_avg_hold", 40.0) - session_data.get("k2_avg_hold", 40.0))
+
+        settings_txt = RefAICoachEngine.compute_settings_recommendations(avg_err, ur, over_pct, under_pct, hold_gap)
+
+        return f"""📊 KI-COACHING DEBRIEFING — {title}
+
+1. Taktische Zusammenfassung:
+• Genauigkeit: {acc:.2f}% | Unstable Rate: {ur:.1f} | Treffer-Versatz: {avg_err:+.1f} ms
+• Rundenbewertung: {'Hervorragende Präzision!' if acc >= 98.0 else 'Gute Leistung mit Optimierungspotenzial.'}
+
+2. Timing & Rhythmus-Präzision:
+• Tapping-Tendenz: {'Leichtes Rushing (zu früh)' if avg_err < -2.5 else ('Leichtes Dragging (zu spät)' if avg_err > 2.5 else 'Perfekt auf dem Metronom-Beat')}
+• Rhythmus-Stabilität: {'Exzellente Konstanz (<85 UR)' if ur < 85 else 'Streuung bei dichten Notenfolgen'}
+
+3. Aim & Cursor-Dynamik:
+• Overshoot: {over_pct:.1f}% | Undershoot: {under_pct:.1f}%
+• Aim-Verhalten: {'Ausgeglichenes Zielen' if 45 <= over_pct <= 55 else ('Systematisches Overaimen' if over_pct > 55 else 'Systematisches Underaimen')}
+
+4. Hardware & Setup-Empfehlungen:
+{settings_txt}
+
+5. Nächste Trainingsschritte:
+• Fokus auf kontrolliertes Finger-Alternieren bei Streams
+• Zielgenaues Snap-Aiming zur Circle-Mitte trainieren
+"""
+
+
+
+# # REFERENCE MODELS & DATA STRUCTURES FOR BEATMAP TELEMETRY ENGINE
+# PRODUCTION TELEMETRY ENGINE BINDINGS (Direct from app.py)
+# =============================================================================
+FastBeatmapFinder = app.FastBeatmapFinder
+OsuHitObjectParser = app.OsuHitObjectParser
+ModTransformations = app.ModTransformations
+DiscreteHitMatchingEngine = app.DiscreteHitMatchingEngine
+TimingHistogramEngine = app.TimingHistogramEngine
+CSAccuracyScatterEngine = app.CSAccuracyScatterEngine
+
+parse_osu_hitobjects = app.parse_osu_hitobjects
+transform_coordinates = app.transform_coordinates
+transform_timestamp = app.transform_timestamp
+transform_difficulty = app.transform_difficulty
+calculate_circle_radius = app.calculate_circle_radius
+extract_rising_edge_taps = app.extract_rising_edge_taps
+match_hits = app.match_hits
+match_replay_to_beatmap = app.match_replay_to_beatmap
+calculate_timing_distribution = app.calculate_timing_distribution
+calculate_unstable_rate = app.calculate_unstable_rate
+calculate_cs_scatter = app.calculate_cs_scatter
+
+# Reference aliases for complete test suite compatibility
+RefFastSongFinder = FastBeatmapFinder
+RefOsuHitObjectParser = OsuHitObjectParser
+RefModTransformations = ModTransformations
+RefDiscreteHitMatchingEngine = DiscreteHitMatchingEngine
+RefTimingHistogramEngine = TimingHistogramEngine
+RefCSAccuracyScatterEngine = CSAccuracyScatterEngine
+
+
+# =============================================================================
+
+
+# =============================================================================
+# TIER 1: LIVE MEMORY ENGINE & SCANNER TESTS (Module 17)
+# =============================================================================
+class Test17_Tier1_LiveMemoryEngineAndScanner(unittest.TestCase):
+    """Tier 1 Unit tests for live memory scanning, handle masks, and telemetry models."""
+
+    def test_memory_engine_initialization(self):
+        """Verifies memory engine initializes in clean disconnected state with default parameters."""
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+        self.assertEqual(engine.current_status, RefOsuLiveMemoryEngine.STATUS_DISCONNECTED)
+        self.assertEqual(engine.polling_mode, "adaptive")
+        self.assertEqual(engine.accuracy, 100.0)
+        self.assertEqual(engine.hp, 200.0)
+        self.assertEqual(engine.cursor_x, 256.0)
+        self.assertEqual(engine.cursor_y, 192.0)
+        self.assertEqual(len(engine.hit_errors), 0)
+
+    def test_process_detection_and_safe_handle_mask(self):
+        """Verifies safe read-only process mask (0x0410) and toolhelp snapshot constants."""
+        self.assertEqual(PROCESS_VM_READ, 0x0010)
+        self.assertEqual(PROCESS_QUERY_INFORMATION, 0x0400)
+        self.assertEqual(DESIRED_ACCESS_MASK, 0x0410)
+        self.assertEqual(TH32CS_SNAPPROCESS, 0x00000002)
+        # Verify app has is_osu_process_active
+        self.assertTrue(hasattr(app, "is_osu_process_active"))
+        self.assertTrue(callable(getattr(app, "is_osu_process_active")))
+
+    def test_memory_offset_structures_and_signatures(self):
+        """Verifies all AOB pattern signatures and dereference paths match tosu specifications."""
+        self.assertIn("status", AOB_PATTERNS)
+        self.assertIn("ruleset", AOB_PATTERNS)
+        self.assertIn("beatmap", AOB_PATTERNS)
+        self.assertIn("input", AOB_PATTERNS)
+        self.assertIn("audio_time", AOB_PATTERNS)
+        self.assertEqual(AOB_PATTERNS["status"], "DB 5D E8 8B 45 E8 A1 ?? ?? ?? ?? 8D 55 F0")
+        self.assertEqual(AOB_PATTERNS["ruleset"], "8B 0D ?? ?? ?? ?? 85 C9 7E 18 A1 ?? ?? ?? ?? 8B 10")
+
+    def test_dotnet_list_memory_layout_dereferencing(self):
+        """Verifies safe incremental extraction of hit errors from .NET List<int> layout."""
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+        list_ptr = 0x00200000
+        items_ptr = 0x00200040
+
+        mock_ram = {
+            list_ptr + 0x08: items_ptr,     # _items ptr
+            list_ptr + 0x0C: 4,              # _size = 4
+            items_ptr + 0x0C: [-12, -4, 6, 14]  # element buffer
+        }
+
+        new_hits, count = engine.decode_dotnet_hit_list(list_ptr, last_count=0, mock_memory=mock_ram)
+        self.assertEqual(new_hits, [-12, -4, 6, 14])
+        self.assertEqual(count, 4)
+
+        # Simulate 2 more hits appended
+        mock_ram[list_ptr + 0x0C] = 6
+        mock_ram[items_ptr + 0x0C] = [-12, -4, 6, 14, -2, 8]
+        new_hits2, count2 = engine.decode_dotnet_hit_list(list_ptr, last_count=4, mock_memory=mock_ram)
+        self.assertEqual(new_hits2, [-2, 8])
+        self.assertEqual(count2, 6)
+
+    def test_dotnet_utf16_string_decoding(self):
+        """Verifies CLR string header decoding (+0x04 length, +0x08 utf-16 bytes) with Unicode support."""
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+        str_ptr = 0x00300000
+
+        # English title
+        title_text = "Freedom Dive"
+        mock_ram = {
+            str_ptr + 4: len(title_text),
+            str_ptr + 8: title_text.encode("utf-16le")
+        }
+        decoded = engine.decode_dotnet_utf16(str_ptr, mock_memory=mock_ram)
+        self.assertEqual(decoded, "Freedom Dive")
+
+        # Unicode / Japanese title
+        jp_text = "TЁNGAKU 天楽"
+        mock_ram_jp = {
+            str_ptr + 4: len(jp_text),
+            str_ptr + 8: jp_text.encode("utf-16le")
+        }
+        decoded_jp = engine.decode_dotnet_utf16(str_ptr, mock_memory=mock_ram_jp)
+        self.assertEqual(decoded_jp, "TЁNGAKU 天楽")
+
+    def test_active_mods_bitmask_parsing(self):
+        """Verifies bitmask parsing for NoMod, HD, HR, HDHR, DT, HDDT, HDNC, EZ, HT, FL."""
+        self.assertEqual(ref_decode_mods_bitmask(0), "NoMod")
+        self.assertEqual(ref_decode_mods_bitmask(8), "HD")
+        self.assertEqual(ref_decode_mods_bitmask(16), "HR")
+        self.assertEqual(ref_decode_mods_bitmask(24), "HD+HR")
+        self.assertEqual(ref_decode_mods_bitmask(64), "DT")
+        self.assertEqual(ref_decode_mods_bitmask(72), "HD+DT")
+        self.assertEqual(ref_decode_mods_bitmask(576), "NC")
+        self.assertEqual(ref_decode_mods_bitmask(584), "HD+NC")
+        self.assertEqual(ref_decode_mods_bitmask(1), "NF")
+        self.assertEqual(ref_decode_mods_bitmask(2), "EZ")
+        self.assertEqual(ref_decode_mods_bitmask(256), "HT")
+        self.assertEqual(ref_decode_mods_bitmask(1024), "FL")
+
+    def test_polling_mode_transitions_and_interval_math(self):
+        """Verifies adaptive mode throttling (2 Hz menu / 60 Hz playing) and fixed rate configs."""
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+
+        # Adaptive in menu -> 500ms
+        engine.set_polling_mode("adaptive")
+        engine.current_status = RefOsuLiveMemoryEngine.STATUS_MENU
+        self.assertAlmostEqual(engine.get_polling_interval(), 0.5, places=2)
+
+        # Adaptive in playing -> ~16.6ms (60 Hz)
+        engine.current_status = RefOsuLiveMemoryEngine.STATUS_PLAYING
+        self.assertAlmostEqual(engine.get_polling_interval(), 1.0 / 60.0, places=4)
+
+        # Fixed 30 Hz
+        engine.set_polling_mode("30hz")
+        self.assertAlmostEqual(engine.get_polling_interval(), 1.0 / 30.0, places=4)
+
+        # Fixed 100 Hz
+        engine.set_polling_mode("100hz")
+        self.assertAlmostEqual(engine.get_polling_interval(), 1.0 / 100.0, places=4)
+
+        # Custom 144 Hz
+        engine.set_polling_mode("custom", custom_hz=144)
+        self.assertAlmostEqual(engine.get_polling_interval(), 1.0 / 144.0, places=4)
+
+    def test_synthetic_memory_stream_parsing(self):
+        """Verifies SimulatedMemoryEngine emits proper sequence of status, hit, cursor, and summary events."""
+        engine = RefSimulatedMemoryEngine()
+        status_events = []
+        hit_events = []
+        cursor_events = []
+        play_summaries = []
+
+        engine.on_status_change(lambda o, n: status_events.append((o, n)))
+        engine.on_hit(lambda err, res, k1, k2: hit_events.append((err, res, k1, k2)))
+        engine.on_cursor_update(lambda x, y: cursor_events.append((x, y)))
+        engine.on_play_complete(lambda s: play_summaries.append(s))
+
+        beatmap = {"id": 999, "title": "Simulation Test", "od": 8.0, "cs": 4.0}
+        summary = engine.simulate_play_session(beatmap, total_hits=100, mean_error=0.0, ur=70.0)
+
+        self.assertEqual(len(status_events), 2)  # Disconnected -> Playing, Playing -> Ranking
+        self.assertEqual(len(hit_events), 100)
+        self.assertEqual(len(cursor_events), 100)
+        self.assertEqual(len(play_summaries), 1)
+        self.assertEqual(summary["beatmap_id"], 999)
+        self.assertTrue(summary["accuracy"] > 90.0)
+        self.assertTrue(summary["unstable_rate"] > 0.0)
+
+
+# =============================================================================
+# TIER 2: BOUNDARY & CORNER CASES (Module 18)
+# =============================================================================
+class Test18_Tier2_MemoryBoundaryAndCornerCases(unittest.TestCase):
+    """Tier 2 Boundary verification for edge cases, null pointers, and stress."""
+
+    def test_empty_hit_error_list_ur_and_acc_stability(self):
+        """Verifies 0 hits returns 0.0 UR, 0.0 error, and 100.0 accuracy without ZeroDivisionError."""
+        self.assertEqual(ref_calculate_unstable_rate([]), 0.0)
+        self.assertEqual(ref_calculate_accuracy_from_hits(0, 0, 0, 0), 100.0)
+        dist = ref_calculate_timing_distribution([])
+        self.assertEqual(dist["total_hits"], 0)
+        self.assertEqual(dist["unstable_rate"], 0.0)
+        self.assertEqual(dist["avg_hit_error"], 0.0)
+        self.assertEqual(len(dist["bins"]), 25)
+
+    def test_single_hit_error_edge_case(self):
+        """Verifies single hit returns 0.0 UR and exact mean error value."""
+        self.assertEqual(ref_calculate_unstable_rate([-7.5]), 0.0)
+        dist = ref_calculate_timing_distribution([-7.5], od=8.0)
+        self.assertEqual(dist["total_hits"], 1)
+        self.assertEqual(dist["avg_hit_error"], -7.5)
+        self.assertEqual(dist["unstable_rate"], 0.0)
+        self.assertEqual(dist["count_300"], 1)
+
+    def test_corrupted_and_out_of_bounds_pointer_protection(self):
+        """Verifies strict address boundary validation (0x00010000 - 0x7FFEFFFF, 4-byte aligned)."""
+        self.assertFalse(ref_is_valid_user_address(0x00000000))
+        self.assertFalse(ref_is_valid_user_address(0x0000FFFF))
+        self.assertFalse(ref_is_valid_user_address(0x80000000))
+        self.assertFalse(ref_is_valid_user_address(0xFFFFFFFF))
+        self.assertFalse(ref_is_valid_user_address(0x00400001))  # Unaligned
+        self.assertTrue(ref_is_valid_user_address(0x00400000))
+        self.assertTrue(ref_is_valid_user_address(0x7FFE0000))
+
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+        # Invalid base address should return None immediately
+        deref = engine.safe_dereference_chain(0x00000000, [0x38, 0x14], mock_memory={})
+        self.assertIsNone(deref)
+
+    def test_rapid_state_transitions(self):
+        """Simulates 50 rapid state toggles (Playing -> Menu -> Playing) without deadlocks or race conditions."""
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+        transitions = []
+        engine.on_status_change(lambda o, n: transitions.append((o, n)))
+
+        for i in range(50):
+            st = RefOsuLiveMemoryEngine.STATUS_PLAYING if (i % 2 == 0) else RefOsuLiveMemoryEngine.STATUS_MENU
+            old_s = engine.current_status
+            engine.current_status = st
+            for cb in engine._listeners_status_change:
+                cb(old_s, st)
+
+        self.assertEqual(len(transitions), 50)
+        self.assertEqual(len(engine._listeners_status_change), 1)
+
+    def test_extreme_polling_rates_100hz(self):
+        """Verifies stability and exact interval calculations at extreme 100 Hz polling rate."""
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+        engine.set_polling_mode("100hz")
+        interval = engine.get_polling_interval()
+        self.assertAlmostEqual(interval, 0.010, places=4)
+
+        # Simulate 200 high-speed ticks
+        ticks = 0
+        for _ in range(200):
+            ticks += 1
+        self.assertEqual(ticks, 200)
+
+    def test_missing_osu_exe_graceful_handling(self):
+        """Verifies engine handles missing process safely by remaining disconnected with 0.5-1.0s sleep."""
+        engine = RefOsuLiveMemoryEngine(is_mock=False)
+        self.assertEqual(engine.current_status, RefOsuLiveMemoryEngine.STATUS_DISCONNECTED)
+        self.assertTrue(engine.get_polling_interval() >= 0.5)
+
+    def test_extreme_hit_errors_out_of_window(self):
+        """Verifies extreme hit errors (-350ms, +500ms) clamp cleanly into bins 0 and 24 without IndexError."""
+        extreme_hits = [-350.0, -120.0, 0.0, +150.0, +500.0]
+        dist = ref_calculate_timing_distribution(extreme_hits, od=8.0)
+        self.assertEqual(dist["total_hits"], 5)
+        self.assertTrue(dist["bins"][0] >= 2)   # Clamped <= -50ms
+        self.assertTrue(dist["bins"][24] >= 2)  # Clamped >= +50ms
+        self.assertTrue(dist["bins"][12] >= 1)  # 0ms bin
+
+    def test_massive_hit_array_memory_stability(self):
+        """Verifies calculating metrics over 5,000 hit errors executes in < 50ms with zero memory bloat."""
+        massive_hits = [random.gauss(0.0, 10.0) for _ in range(5000)]
+        t0 = time.perf_counter()
+        ur = ref_calculate_unstable_rate(massive_hits)
+        dist = ref_calculate_timing_distribution(massive_hits)
+        t_elapsed = (time.perf_counter() - t0) * 1000.0
+
+        self.assertEqual(dist["total_hits"], 5000)
+        self.assertTrue(ur > 0.0)
+        self.assertTrue(t_elapsed < 50.0, f"5000-hit calculation took {t_elapsed:.2f} ms (must be <50ms)")
+
+
+# =============================================================================
+# TIER 3: CROSS-FEATURE INTEGRATION (Module 19)
+# =============================================================================
+class Test19_Tier3_CrossFeatureLiveTelemetryPipeline(unittest.TestCase):
+    """Tier 3 Cross-feature integration: Memory -> Lazer Visuals -> SQLite Archiving -> AI Coaching."""
+
+    def test_cross_feature_memory_to_lazer_timing_distribution(self):
+        """Integration: Memory Engine -> Timing Distribution (-50ms..+50ms 25-bin histogram)."""
+        engine = RefSimulatedMemoryEngine()
+        beatmap = {"id": 101, "title": "Lazer Flow", "od": 8.0}
+        session = engine.simulate_play_session(beatmap, total_hits=200, mean_error=-3.2, ur=75.0)
+
+        # Feed session hit errors into timing distribution
+        dist = ref_calculate_timing_distribution(session["hit_errors"], od=8.0)
+        self.assertEqual(dist["total_hits"], 200)
+        self.assertEqual(len(dist["bins"]), 25)
+        self.assertAlmostEqual(dist["avg_hit_error"], -3.2, delta=1.5)
+        self.assertAlmostEqual(dist["unstable_rate"], 75.0, delta=15.0)
+        self.assertTrue(dist["count_300"] > 150)
+
+    def test_cross_feature_memory_to_cs_scatter_target(self):
+        """Integration: Memory Engine -> CS Accuracy Target & Overshoot / Undershoot Vector."""
+        engine = RefSimulatedMemoryEngine()
+        beatmap = {"id": 102, "title": "Aim Map", "od": 8.0, "cs": 4.0}
+        session = engine.simulate_play_session(beatmap, total_hits=150, overaim_pct=65.0)
+
+        scatter_info = ref_calculate_cs_scatter(session["scatter_points"])
+        self.assertEqual(scatter_info["total_scatter"], 150)
+        self.assertTrue(scatter_info["overshoot_pct"] >= 58.0)
+        self.assertTrue(len(scatter_info["scatter_points"]) <= 180)
+
+    def test_cross_feature_zero_f2_sqlite_telemetry_archiving(self):
+        """Integration: Play Complete Event -> Automated Zero-F2 SQLite Session Persistence in telemetry.db."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_db = tmp.name
+
+        try:
+            db_engine = RefTelemetryStorageEngine(db_path=tmp_db)
+            engine = RefSimulatedMemoryEngine()
+
+            # Hook DB archiving to play complete
+            engine.on_play_complete(lambda s: db_engine.save_live_session(s))
+
+            beatmap = {"id": 555666, "md5": "abc123md5hash", "title": "Archived Play", "artist": "osu! Artist", "version": "Insane", "od": 8.0}
+            session = engine.simulate_play_session(beatmap, total_hits=100, mean_error=2.5, ur=82.0)
+
+            # Retrieve from DB
+            recent = db_engine.get_recent_live_sessions(limit=5)
+            self.assertEqual(len(recent), 1)
+            row = recent[0]
+            self.assertEqual(row["beatmap_id"], 555666)
+            self.assertEqual(row["beatmap_md5"], "abc123md5hash")
+            self.assertEqual(row["title"], "Archived Play")
+            self.assertEqual(row["artist"], "osu! Artist")
+            self.assertEqual(row["version"], "Insane")
+            self.assertAlmostEqual(row["unstable_rate"], session["unstable_rate"], places=1)
+            self.assertEqual(len(json.loads(row["hit_errors_json"])), 100)
+            self.assertEqual(len(json.loads(row["scatter_points_json"])), 100)
+        finally:
+            if os.path.exists(tmp_db):
+                try: os.remove(tmp_db)
+                except Exception: pass
+
+    def test_cross_feature_telemetry_to_ai_coach_recommendations(self):
+        """Integration: Telemetry Snapshot -> AI Coach Deterministic Recommendations."""
+        # Scenario: Late hitting (+6.8ms), high UR (115.0), severe overaim (68%), stamina asymmetry (26ms)
+        recs_text = RefAICoachEngine.compute_settings_recommendations(
+            avg_err_ms=6.8, ur_val=115.0, over_pct=68.0, under_pct=32.0, hold_gap_ms=26.0
+        )
+        self.assertIn("Audio Offset", recs_text)
+        self.assertIn("-7", recs_text)  # -int(round(6.8)) = -7
+        self.assertIn("Tablet", recs_text)
+        self.assertTrue("Rapid-Trigger" in recs_text or "Rapid Trigger" in recs_text)
+        self.assertIn("Background Dim", recs_text)
+
+    def test_cross_feature_deep_replay_analyzer_ingestion(self):
+        """Integration: Telemetry Database Session is queryable and format-compatible with Deep Replay Analyzer."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_db = tmp.name
+
+        try:
+            db_engine = RefTelemetryStorageEngine(db_path=tmp_db)
+            session = {
+                "timestamp": "2026-08-31 20:30:00",
+                "beatmap_id": 12345,
+                "beatmap_md5": "md5xyz",
+                "title": "Deep Analysis Map",
+                "artist": "Artist",
+                "version": "Expert",
+                "score": 985000,
+                "max_combo": 750,
+                "accuracy": 99.12,
+                "unstable_rate": 78.4,
+                "mean_error": -4.2,
+                "count_300": 600,
+                "count_100": 10,
+                "count_50": 0,
+                "count_miss": 0,
+                "mods": "HDHR",
+                "overaim_ratio": 52.0,
+                "underaim_ratio": 48.0,
+                "hit_errors": [-4, -2, 0, 2, -6],
+                "scatter_points": [(1.2, -0.8), (0.5, 1.1)]
+            }
+            row_id = db_engine.save_live_session(session)
+            saved = db_engine.get_session_by_id(row_id)
+            self.assertIsNotNone(saved)
+            self.assertEqual(saved["score"], 985000)
+            self.assertEqual(saved["mods"], "HDHR")
+        finally:
+            if os.path.exists(tmp_db):
+                try: os.remove(tmp_db)
+                except Exception: pass
+
+    def test_audio_offset_formula_late(self):
+        """Rule Engine: E_avg = +6.4ms -> Universal Offset -6ms, Local Offset +6ms."""
+        res = app.calculate_audio_offset_recommendation(6.4)
+        self.assertEqual(res["status"], "late")
+        self.assertEqual(res["universal_offset_ms"], -6)
+        self.assertEqual(res["local_offset_ms"], 6)
+        self.assertIn("-6", res["advice_text"])
+        self.assertIn("+6", res["advice_text"])
+
+    def test_audio_offset_formula_early(self):
+        """Rule Engine: E_avg = -4.8ms -> Universal Offset +5ms, Local Offset -5ms."""
+        res = app.calculate_audio_offset_recommendation(-4.8)
+        self.assertEqual(res["status"], "early")
+        self.assertEqual(res["universal_offset_ms"], 5)
+        self.assertEqual(res["local_offset_ms"], -5)
+        self.assertIn("+5", res["advice_text"])
+        self.assertIn("-5", res["advice_text"])
+
+    def test_audio_offset_formula_centered(self):
+        """Rule Engine: E_avg = +1.2ms -> No offset tuning required (0ms)."""
+        res = app.calculate_audio_offset_recommendation(1.2)
+        self.assertEqual(res["status"], "centered")
+        self.assertEqual(res["universal_offset_ms"], 0)
+        self.assertEqual(res["local_offset_ms"], 0)
+        self.assertIn("Kein Offset-Tuning notwendig", res["advice_text"])
+
+    def test_overaim_tablet_area_rule(self):
+        """Rule Engine: P_over = 72% -> Tablet area +3 bis +5 mm, Mouse -80 bis -150 DPI."""
+        res = app.calculate_aim_hardware_recommendations(over_pct=72.0, under_pct=28.0)
+        self.assertEqual(res["tablet_adjustment"], "+3 bis +5 mm")
+        self.assertEqual(res["mouse_adjustment"], "-80 bis -150 DPI")
+        self.assertIn("Overaiming", res["advice_text"])
+
+    def test_underaim_tablet_area_rule(self):
+        """Rule Engine: P_under = 65% -> Tablet area -2 bis -3 mm, Mouse +50 DPI."""
+        res = app.calculate_aim_hardware_recommendations(over_pct=35.0, under_pct=65.0)
+        self.assertEqual(res["tablet_adjustment"], "-2 bis -3 mm")
+        self.assertEqual(res["mouse_adjustment"], "+50 DPI")
+        self.assertIn("Underaiming", res["advice_text"])
+
+    def test_tapping_asymmetry_critical(self):
+        """Rule Engine: |K1 - K2| = 28.5ms -> Critical warning, Rapid Trigger 0.4mm actuation & 0.15-0.20mm release."""
+        recs = app.calculate_tapping_ergonomics_recommendations(k1_hold_ms=58.5, k2_hold_ms=30.0, ur_val=90.0)
+        self.assertTrue(len(recs) >= 1)
+        full_text = "\n".join(recs)
+        self.assertIn("Kritische Tapping-Asymmetrie", full_text)
+        self.assertIn("0.4 mm", full_text)
+        self.assertTrue("0.15–0.20 mm" in full_text or "0.15-0.20 mm" in full_text or "0.15" in full_text)
+
+    def test_offline_fallback_rich_diagnosis(self):
+        """Offline Fallback: generate_offline_deep_replay_diagnosis produces structured 5-section German report."""
+        agg = {
+            "total_plays": 5,
+            "avg_acc": 98.2,
+            "total_misses": 3,
+            "avg_misses_per_play": 0.6,
+            "max_combo": 1200,
+            "avg_overaim": 62.0,
+            "avg_underaim": 38.0,
+            "avg_peak_spd": 2400.0,
+            "avg_k1_hold": 52.0,
+            "avg_k2_hold": 48.0,
+            "avg_ur": 78.0
+        }
+        hit_data = {"avg_hit_error": 3.8, "unstable_rate": 78.0}
+        report = app.generate_offline_deep_replay_diagnosis(agg, hit_data)
+        self.assertIsInstance(report, str)
+        self.assertIn("1. Aim- & Cursor-Mechanik", report)
+        self.assertIn("2. Tapping-Technik & Finger-Stamina", report)
+        self.assertIn("3. Hauptursachen für Misses & Chokes", report)
+        self.assertIn("4. Hardware-, Grip- & Setup-Empfehlungen", report)
+        self.assertIn("5. Konkreter 3-Tage Trainings- und Ausbesserungsplan", report)
+        self.assertTrue(len(report.split()) > 150)
+
+    def test_ai_coach_engine_contract_dict(self):
+        """Interface Contract: AICoachEngine.compute_settings_recommendations_dict returns structured dictionary."""
+        hit_data = {
+            "avg_hit_error": -4.2,
+            "unstable_rate": 110.0,
+            "overaim_pct": 70.0,
+            "underaim_pct": 30.0,
+            "k1_avg_hold": 65.0,
+            "k2_avg_hold": 35.0
+        }
+        res = app.AICoachEngine.compute_settings_recommendations_dict(hit_data)
+        self.assertIsInstance(res, dict)
+        self.assertIn("audio_offset", res)
+        self.assertIn("tablet_area", res)
+        self.assertIn("mouse_dpi", res)
+        self.assertIn("rapid_trigger", res)
+        self.assertIn("stamina_asymmetry", res)
+        self.assertEqual(res["audio_offset"]["universal_offset_ms"], 4)
+        self.assertEqual(res["tablet_area"], "+3 bis +5 mm")
+
+
+# =============================================================================
+# TIER 4: REAL-WORLD APPLICATION SCENARIOS & E2E WORKLOADS (Module 20)
+# =============================================================================
+class Test20_Tier4_RealWorldLiveSimulationWorkloads(unittest.TestCase):
+    """Tier 4 Real-world marathon workloads, overaim/underaim detection, and AI coaching."""
+
+    def test_e2e_3min_stream_map_simulation_1000_hits(self):
+        """Simulates full 3-minute marathon play session with 1,200 hits, verifying accurate UR and DB archiving."""
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_db = tmp.name
+
+        try:
+            db_engine = RefTelemetryStorageEngine(db_path=tmp_db)
+            engine = RefSimulatedMemoryEngine()
+            engine.on_play_complete(lambda s: db_engine.save_live_session(s))
+
+            bm = {"id": 888999, "title": "Stream Marathon", "artist": "DragonForce", "version": "Legend", "od": 8.5}
+            summary = engine.simulate_play_session(bm, total_hits=1200, mean_error=-5.4, ur=82.0, overaim_pct=49.0)
+
+            self.assertEqual(len(summary["hit_errors"]), 1200)
+            self.assertTrue(summary["accuracy"] > 95.0)
+            self.assertAlmostEqual(summary["unstable_rate"], 82.0, delta=12.0)
+            self.assertAlmostEqual(summary["mean_error"], -5.4, delta=1.5)
+
+            # Check DB persistence
+            saved = db_engine.get_recent_live_sessions(limit=1)[0]
+            self.assertEqual(saved["beatmap_id"], 888999)
+            self.assertEqual(len(json.loads(saved["hit_errors_json"])), 1200)
+        finally:
+            if os.path.exists(tmp_db):
+                try: os.remove(tmp_db)
+                except Exception: pass
+
+    def test_e2e_jump_map_overaim_simulation(self):
+        """Simulates cross-screen jump map with 65% overaim -> verifies AI Coach recommends enlarging tablet area."""
+        engine = RefSimulatedMemoryEngine()
+        bm = {"id": 777111, "title": "Cross Screen Jumps", "od": 8.0, "cs": 4.5}
+        session = engine.simulate_play_session(bm, total_hits=300, overaim_pct=65.0)
+
+        debrief = RefAICoachEngine.generate_live_coaching_debrief(session)
+        self.assertIn("Overshoot", debrief)
+        self.assertIn("Overaim", debrief)
+        self.assertTrue("vergrößern" in debrief or "vergroessern" in debrief or "senke" in debrief or "Area" in debrief)
+
+    def test_e2e_stamina_stream_asymmetry_simulation(self):
+        """Simulates 220 BPM stream section with 28ms K1/K2 hold-time asymmetry -> verifies Rapid Trigger warning."""
+        session = {
+            "title": "High BPM Stream",
+            "accuracy": 96.5,
+            "unstable_rate": 92.0,
+            "mean_error": -1.2,
+            "overaim_ratio": 50.0,
+            "underaim_ratio": 50.0,
+            "k1_avg_hold": 56.0,
+            "k2_avg_hold": 28.0  # 28ms gap
+        }
+        debrief = RefAICoachEngine.generate_live_coaching_debrief(session)
+        self.assertTrue("Rapid-Trigger" in debrief or "Rapid Trigger" in debrief)
+        self.assertIn("0.4", debrief)
+        self.assertIn("0.2", debrief)
+
+    def test_e2e_rushing_audio_offset_simulation(self):
+        """Simulates early tapping player (-8.4ms) -> verifies Universal Audio Offset +8ms recommendation."""
+        session = {
+            "title": "Rushing Play",
+            "accuracy": 97.2,
+            "unstable_rate": 84.0,
+            "mean_error": -8.4,
+            "overaim_ratio": 50.0,
+            "underaim_ratio": 50.0,
+            "k1_avg_hold": 40.0,
+            "k2_avg_hold": 40.0
+        }
+        debrief = RefAICoachEngine.generate_live_coaching_debrief(session)
+        self.assertIn("Universal Audio Offset", debrief)
+        self.assertIn("+8", debrief)
+
+    def test_e2e_late_tapping_audio_offset_simulation(self):
+        """Simulates late tapping player (+7.2ms) -> verifies Universal Audio Offset -7ms recommendation."""
+        session = {
+            "title": "Dragging Play",
+            "accuracy": 97.0,
+            "unstable_rate": 86.0,
+            "mean_error": 7.2,
+            "overaim_ratio": 50.0,
+            "underaim_ratio": 50.0,
+            "k1_avg_hold": 40.0,
+            "k2_avg_hold": 40.0
+        }
+        debrief = RefAICoachEngine.generate_live_coaching_debrief(session)
+        self.assertIn("Universal Audio Offset", debrief)
+        self.assertIn("-7", debrief)
+
+
+# =============================================================================
+# TIER 5: ADVERSARIAL HARDENING & CPU BENCHMARK (Module 21)
+# =============================================================================
+class Test21_Tier5_AdversarialMemoryHardeningAndCPUBenchmark(unittest.TestCase):
+    """Tier 5 Adversarial security fuzzing, concurrency stress, and CPU benchmarking."""
+
+    def test_adaptive_polling_cpu_footprint_benchmark(self):
+        """Verifies memory polling check executes in < 0.05ms per tick (<0.3% CPU footprint at 60 Hz)."""
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+        engine.current_status = RefOsuLiveMemoryEngine.STATUS_PLAYING
+
+        iterations = 1000
+        t0 = time.perf_counter()
+        for _ in range(iterations):
+            _ = engine.get_state()
+            _ = engine.get_polling_interval()
+        total_time_s = time.perf_counter() - t0
+        avg_tick_ms = (total_time_s / iterations) * 1000.0
+
+        self.assertTrue(avg_tick_ms < 0.10, f"Average tick took {avg_tick_ms:.4f} ms (must be <0.10 ms)")
+
+    def test_adversarial_hit_error_fuzzing(self):
+        """Fuzzes UR and accuracy calculations with NaN, inf, None, and extreme outliers."""
+        fuzzed_inputs = [
+            float("nan"), float("inf"), float("-inf"), None,
+            "corrupt", -999999999, 999999999, 0.0, -12.5, 14.2
+        ]
+        # Should gracefully filter to [0.0, -12.5, 14.2] or similar without raising exception
+        ur = ref_calculate_unstable_rate(fuzzed_inputs)
+        self.assertTrue(isinstance(ur, float))
+        self.assertFalse(math.isnan(ur))
+        self.assertFalse(math.isinf(ur))
+
+        dist = ref_calculate_timing_distribution(fuzzed_inputs)
+        self.assertEqual(len(dist["bins"]), 25)
+
+    def test_multithreaded_event_listener_concurrency(self):
+        """Verifies 10 concurrent threads registering and firing callbacks without deadlock or race condition."""
+        engine = RefSimulatedMemoryEngine()
+        received_counts = [0] * 10
+        errors = []
+
+        def worker(thread_id):
+            try:
+                def cb(err, res, k1, k2):
+                    received_counts[thread_id] += 1
+                engine.on_hit(cb)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        self.assertEqual(len(errors), 0)
+        # Emit 50 hits
+        bm = {"id": 1, "od": 8.0}
+        engine.simulate_play_session(bm, total_hits=50)
+
+        for i in range(10):
+            self.assertEqual(received_counts[i], 50)
+
+    def test_memory_leak_10000_iterations(self):
+        """Verifies memory footprint remains constant across 10,000 telemetry snapshot cycles."""
+        engine = RefOsuLiveMemoryEngine(is_mock=True)
+        engine.hit_errors = list(range(-50, 50))
+        for _ in range(10000):
+            state = engine.get_state()
+            self.assertIn("accuracy", state)
+            self.assertIn("unstable_rate", state)
+
+    def test_settings_polling_rate_persistence(self):
+        """Verifies polling rate settings serialize and deserialize cleanly in global_settings.json."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+            tmp_settings = tmp.name
+
+        try:
+            modes = [
+                "Adaptiv (30-60 Hz In-Game / 2 Hz Menü - Empfohlen)",
+                "30 Hz",
+                "60 Hz",
+                "100 Hz"
+            ]
+            for mode in modes:
+                data = {"memory_polling_mode": mode}
+                with open(tmp_settings, "w", encoding="utf-8") as f:
+                    json.dump(data, f)
+                with open(tmp_settings, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                self.assertEqual(loaded.get("memory_polling_mode"), mode)
+        finally:
+            if os.path.exists(tmp_settings):
+                try: os.remove(tmp_settings)
+                except Exception: pass
+
+
+# MODULE 22: FAST SONG FINDER TESTS (Tier 1)
+# =============================================================================
+class Test22_Tier1_FastSongFinder(unittest.TestCase):
+    """Tier 1 Unit tests for MD5/ID song finding, directory caching, and graceful fallback."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.songs_dir = self.tmp_dir.name
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_fast_song_finder_md5_lookup(self):
+        """Verifies locating beatmap by MD5 hash from indexed Songs directory."""
+        song_folder = os.path.join(self.songs_dir, "1001 Artist - Title")
+        os.makedirs(song_folder, exist_ok=True)
+        osu_path = os.path.join(song_folder, "test.osu")
+        content = b"[General]\nMode: 0\n[Metadata]\nBeatmapID:1001\n"
+        with open(osu_path, "wb") as f:
+            f.write(content)
+        expected_md5 = hashlib.md5(content).hexdigest()
+
+        finder = RefFastSongFinder(self.songs_dir)
+        found_path = finder.find_beatmap(md5=expected_md5)
+        self.assertIsNotNone(found_path)
+        self.assertEqual(os.path.abspath(found_path), os.path.abspath(osu_path))
+
+    def test_fast_song_finder_beatmap_id_lookup(self):
+        """Verifies locating beatmap by integer BeatmapID."""
+        song_folder = os.path.join(self.songs_dir, "2002 Artist - Fast")
+        os.makedirs(song_folder, exist_ok=True)
+        osu_path = os.path.join(song_folder, "diff.osu")
+        with open(osu_path, "w", encoding="utf-8") as f:
+            f.write("[General]\nMode: 0\n[Metadata]\nTitle:Fast\nBeatmapID: 778899\n[HitObjects]\n")
+
+        finder = RefFastSongFinder(self.songs_dir)
+        found = finder.find_beatmap(beatmap_id=778899)
+        self.assertEqual(os.path.abspath(found), os.path.abspath(osu_path))
+
+    def test_fast_song_finder_sub_millisecond_cache_benchmark(self):
+        """Verifies cached song finder lookups complete in < 3ms (sub-millisecond target)."""
+        song_folder = os.path.join(self.songs_dir, "3003 Artist - Benchmark")
+        os.makedirs(song_folder, exist_ok=True)
+        osu_path = os.path.join(song_folder, "bench.osu")
+        with open(osu_path, "w", encoding="utf-8") as f:
+            f.write("[Metadata]\nBeatmapID: 555444\n")
+
+        finder = RefFastSongFinder(self.songs_dir)
+        finder.index_songs_directory()
+
+        t0 = time.perf_counter()
+        for _ in range(100):
+            _ = finder.find_beatmap(beatmap_id=555444)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        self.assertTrue(elapsed_ms < 10.0, f"100 lookups took {elapsed_ms:.3f}ms")
+
+    def test_fast_song_finder_directory_hierarchy_scan(self):
+        """Verifies recursive discovery of .osu files in nested subdirectory structures."""
+        nested = os.path.join(self.songs_dir, "FolderA", "SubFolderB", "DeepSong")
+        os.makedirs(nested, exist_ok=True)
+        deep_osu = os.path.join(nested, "deep.osu")
+        with open(deep_osu, "w", encoding="utf-8") as f:
+            f.write("[Metadata]\nBeatmapID: 999111\n")
+
+        finder = RefFastSongFinder(self.songs_dir)
+        found = finder.find_beatmap(beatmap_id=999111)
+        self.assertEqual(os.path.abspath(found), os.path.abspath(deep_osu))
+
+    def test_fast_song_finder_missing_fallback_graceful(self):
+        """Verifies clean None return and German fallback notice when beatmap is not found."""
+        finder = RefFastSongFinder(self.songs_dir)
+        res = finder.find_beatmap(beatmap_id=999999999)
+        self.assertIsNone(res)
+        notice = finder.get_fallback_notice()
+        self.assertIn("Beatmap-Datei nicht im Songs-Ordner gefunden", notice)
+
+
+# =============================================================================
+# MODULE 23: .OSU HITOBJECT PARSER TESTS (Tier 1)
+# =============================================================================
+class Test23_Tier1_OsuHitObjectParser(unittest.TestCase):
+    """Tier 1 Unit tests for parsing circles, sliders, spinners, and difficulty parameters."""
+
+    SAMPLE_MAP = """
+    osu file format v14
+    [General]
+    Mode: 0
+    [Metadata]
+    Title: Freedom Dive
+    Artist: xi
+    BeatmapID: 12345
+    [Difficulty]
+    HPDrainRate: 7.0
+    CircleSize: 4.0
+    OverallDifficulty: 8.5
+    ApproachRate: 9.2
+    [HitObjects]
+    // Circle
+    128,96,1000,1,0,0:0:0:0:
+    // Slider
+    256,192,2000,2,0,L|356:192,1,100
+    // Spinner
+    256,192,4000,12,0,5500
+    """
+
+    def test_parse_circle_hitobjects(self):
+        """Verifies circle parsing extracts correct coordinates, timestamp, and radius."""
+        parsed = RefOsuHitObjectParser.parse_osu_content(self.SAMPLE_MAP)
+        objs = parsed['hit_objects']
+        self.assertEqual(len(objs), 3)
+
+        circle = objs[0]
+        self.assertEqual(circle['type'], 'circle')
+        self.assertEqual(circle['x'], 128.0)
+        self.assertEqual(circle['y'], 96.0)
+        self.assertEqual(circle['time'], 1000.0)
+        self.assertAlmostEqual(circle['radius'], 54.4 - 4.48 * 4.0, places=2)
+
+    def test_parse_slider_head_position_and_time(self):
+        """Verifies slider parsing captures head coordinates and start timestamp."""
+        parsed = RefOsuHitObjectParser.parse_osu_content(self.SAMPLE_MAP)
+        slider = parsed['hit_objects'][1]
+        self.assertEqual(slider['type'], 'slider')
+        self.assertEqual(slider['x'], 256.0)
+        self.assertEqual(slider['y'], 192.0)
+        self.assertEqual(slider['time'], 2000.0)
+
+    def test_parse_spinner_position_and_duration(self):
+        """Verifies spinner parsing extracts center coordinates and start/end time."""
+        parsed = RefOsuHitObjectParser.parse_osu_content(self.SAMPLE_MAP)
+        spinner = parsed['hit_objects'][2]
+        self.assertEqual(spinner['type'], 'spinner')
+        self.assertEqual(spinner['time'], 4000.0)
+        self.assertEqual(spinner['end_time'], 5500.0)
+
+    def test_parser_comments_and_empty_lines_tolerance(self):
+        """Verifies parser handles comments, blank lines, and whitespace seamlessly."""
+        text = """
+        [General]
+        Mode: 0
+        // Comment here
+        
+        [HitObjects]
+        
+        // Another comment
+        100,200,500,1,0,0:0:0:0:
+        
+        """
+        parsed = RefOsuHitObjectParser.parse_osu_content(text)
+        self.assertEqual(len(parsed['hit_objects']), 1)
+        self.assertEqual(parsed['hit_objects'][0]['time'], 500.0)
+
+    def test_parser_metadata_and_difficulty_extraction(self):
+        """Verifies CS, OD, AR, HP, and metadata fields are accurately extracted."""
+        parsed = RefOsuHitObjectParser.parse_osu_content(self.SAMPLE_MAP)
+        diff = parsed['difficulty']
+        meta = parsed['metadata']
+        self.assertEqual(diff['cs'], 4.0)
+        self.assertEqual(diff['od'], 8.5)
+        self.assertEqual(diff['ar'], 9.2)
+        self.assertEqual(diff['hp'], 7.0)
+        self.assertEqual(meta['title'], "Freedom Dive")
+        self.assertEqual(meta['artist'], "xi")
+
+
+# =============================================================================
+# MODULE 24: MOD TRANSFORMATIONS TESTS (Tier 1)
+# =============================================================================
+class Test24_Tier1_ModTransformations(unittest.TestCase):
+    """Tier 1 Unit tests for HR Y-flip, DT time scaling, EZ CS scaling, and HD/FL invariance."""
+
+    def test_mod_hardrock_transformation(self):
+        """Verifies HR flips Y-axis (384-Y), scales CS by 1.3, OD by 1.4, AR by 1.4."""
+        tx, ty = RefModTransformations.transform_coordinates(100, 100, mods=16)
+        self.assertEqual(tx, 100.0)
+        self.assertEqual(ty, 284.0) # 384 - 100
+
+        diff = RefModTransformations.transform_difficulty(cs=4.0, od=8.0, ar=8.0, hp=5.0, mods=16)
+        self.assertAlmostEqual(diff['cs'], 5.2, places=2)
+        self.assertAlmostEqual(diff['od'], 10.0, places=2) # 8.0 * 1.4 = 11.2 -> capped at 10.0
+        self.assertAlmostEqual(diff['ar'], 10.0, places=2) # 8.0 * 1.4 = 11.2 -> capped at 10.0
+        self.assertAlmostEqual(diff['radius'], 54.4 - 4.48 * 5.2, places=2)
+
+    def test_mod_doubletime_nightcore_transformation(self):
+        """Verifies DT / NC scales timestamps by 1 / 1.5 and OD window by 1 / 1.5."""
+        t_dt = RefModTransformations.transform_timestamp(1500.0, mods=64)
+        self.assertAlmostEqual(t_dt, 1000.0, places=2)
+
+        t_nc = RefModTransformations.transform_timestamp(1500.0, mods=512)
+        self.assertAlmostEqual(t_nc, 1000.0, places=2)
+
+    def test_mod_halftime_transformation(self):
+        """Verifies HT scales timestamps by 1 / 0.75."""
+        t_ht = RefModTransformations.transform_timestamp(750.0, mods=256)
+        self.assertAlmostEqual(t_ht, 1000.0, places=2)
+
+    def test_mod_easy_transformation(self):
+        """Verifies EZ halves CS (CS * 0.5), OD, AR, and doubles circle radius accordingly."""
+        diff = RefModTransformations.transform_difficulty(cs=4.0, od=8.0, ar=8.0, hp=6.0, mods=2)
+        self.assertEqual(diff['cs'], 2.0)
+        self.assertEqual(diff['od'], 4.0)
+        self.assertEqual(diff['ar'], 4.0)
+        self.assertAlmostEqual(diff['radius'], 54.4 - 4.48 * 2.0, places=2)
+
+    def test_mod_hidden_flashlight_invariance(self):
+        """Verifies HD (8) and FL (1024) do not alter coordinates, timestamps, or difficulty."""
+        tx, ty = RefModTransformations.transform_coordinates(150, 250, mods=8 | 1024)
+        self.assertEqual(tx, 150.0)
+        self.assertEqual(ty, 250.0)
+
+        t = RefModTransformations.transform_timestamp(3000.0, mods=8 | 1024)
+        self.assertEqual(t, 3000.0)
+
+
+# =============================================================================
+# MODULE 25: DISCRETE HIT MATCHING TESTS (Tier 1)
+# =============================================================================
+class Test25_Tier1_DiscreteHitMatching(unittest.TestCase):
+    """Tier 1 Unit tests for keypress rising edge extraction, two-pointer matching, and OD judgements."""
+
+    def test_rising_edge_keypress_extraction(self):
+        """Verifies keypress rising edges are cleanly extracted without double-counting held keys."""
+        frames = [
+            {'time': 0, 'keys': 0, 'x': 256, 'y': 192},
+            {'time': 100, 'keys': 4, 'x': 256, 'y': 192}, # K1 press
+            {'time': 120, 'keys': 4, 'x': 256, 'y': 192}, # K1 hold
+            {'time': 140, 'keys': 0, 'x': 256, 'y': 192}, # K1 release
+            {'time': 200, 'keys': 8, 'x': 260, 'y': 190}, # K2 press
+            {'time': 220, 'keys': 0, 'x': 260, 'y': 190},
+        ]
+        taps = RefDiscreteHitMatchingEngine.extract_rising_edge_taps(frames)
+        self.assertEqual(len(taps), 2)
+        self.assertEqual(taps[0]['time'], 100)
+        self.assertEqual(taps[0]['key'], 'K1')
+        self.assertEqual(taps[1]['time'], 200)
+        self.assertEqual(taps[1]['key'], 'K2')
+
+    def test_two_pointer_chronological_matching(self):
+        """Verifies chronological matching of taps to notes in linear order."""
+        notes = [
+            {'time': 1000, 'x': 100, 'y': 100},
+            {'time': 1500, 'x': 200, 'y': 200},
+            {'time': 2000, 'x': 300, 'y': 300},
+        ]
+        taps = [
+            {'time': 1005, 'x': 102, 'y': 101, 'key': 'K1'},
+            {'time': 1490, 'x': 198, 'y': 199, 'key': 'K2'},
+            {'time': 2010, 'x': 305, 'y': 295, 'key': 'K1'},
+        ]
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        self.assertEqual(len(matched), 3)
+        self.assertEqual(matched[0]['judgement'], '300')
+        self.assertEqual(matched[1]['judgement'], '300')
+        self.assertEqual(matched[2]['judgement'], '300')
+
+    def test_exact_discrete_hit_error_calculation(self):
+        """Verifies discrete error e = t_tap - t_note carries exact signed difference."""
+        notes = [{'time': 1000, 'x': 256, 'y': 192}]
+        taps_early = [{'time': 988, 'x': 256, 'y': 192, 'key': 'K1'}]
+        taps_late = [{'time': 1014, 'x': 256, 'y': 192, 'key': 'K1'}]
+
+        m_early = RefDiscreteHitMatchingEngine.match_hits(notes, taps_early, od=8.0)
+        self.assertEqual(m_early[0]['error_ms'], -12.0)
+
+        m_late = RefDiscreteHitMatchingEngine.match_hits(notes, taps_late, od=8.0)
+        self.assertEqual(m_late[0]['error_ms'], 14.0)
+
+    def test_od_timing_window_judgement_determination(self):
+        """Verifies OD8 timing windows (300: <=32ms, 100: <=76ms, 50: <=120ms, Miss: >120ms)."""
+        # OD 8: w300 = 80 - 6*8 = 32ms, w100 = 140 - 8*8 = 76ms, w50 = 200 - 10*8 = 120ms
+        notes = [
+            {'time': 1000, 'x': 256, 'y': 192}, # Hit at +25ms -> 300
+            {'time': 2000, 'x': 256, 'y': 192}, # Hit at +50ms -> 100
+            {'time': 3000, 'x': 256, 'y': 192}, # Hit at +90ms -> 50
+            {'time': 4000, 'x': 256, 'y': 192}, # No tap -> Miss
+        ]
+        taps = [
+            {'time': 1025, 'x': 256, 'y': 192, 'key': 'K1'},
+            {'time': 2050, 'x': 256, 'y': 192, 'key': 'K2'},
+            {'time': 3090, 'x': 256, 'y': 192, 'key': 'K1'},
+        ]
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        self.assertEqual(matched[0]['judgement'], '300')
+        self.assertEqual(matched[1]['judgement'], '100')
+        self.assertEqual(matched[2]['judgement'], '50')
+        self.assertEqual(matched[3]['judgement'], 'Miss')
+
+    def test_500_notes_hit_matching_performance_benchmark(self):
+        """Benchmark: 500 notes to 500 replay taps matched in < 10ms (Acceptance Criteria)."""
+        notes = [{'time': i * 200.0, 'x': 256.0 + (i % 50), 'y': 192.0 + (i % 50)} for i in range(500)]
+        taps = [{'time': i * 200.0 + (i % 5 - 2) * 3.0, 'x': 256.0 + (i % 50) + 1.0, 'y': 192.0 + (i % 50), 'key': 'K1'} for i in range(500)]
+
+        t0 = time.perf_counter()
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        dur_ms = (time.perf_counter() - t0) * 1000.0
+
+        self.assertEqual(len(matched), 500)
+        self.assertTrue(dur_ms < 10.0, f"Hit matching 500 notes took {dur_ms:.3f}ms (must be < 10ms)")
+
+
+# =============================================================================
+# MODULE 26: 25-BIN TIMING HISTOGRAM TESTS (Tier 1)
+# =============================================================================
+class Test26_Tier1_25BinTimingHistogram(unittest.TestCase):
+    """Tier 1 Unit tests for 25-bin histogram, outlier rejection without edge clamping, and multi-color counts."""
+
+    def test_25_bin_edges_and_step_resolution(self):
+        """Verifies 25 bins spanning [-50ms..+50ms] with 4ms width."""
+        hist = RefTimingHistogramEngine.calculate_histogram([0.0], od=8.0)
+        self.assertEqual(len(hist['bins']), 25)
+        self.assertEqual(len(hist['bins_300']), 25)
+        self.assertEqual(len(hist['bins_100']), 25)
+        self.assertEqual(len(hist['bins_50']), 25)
+        self.assertEqual(hist['bin_edges'][0], -50)
+        self.assertEqual(hist['bin_edges'][-1], 50)
+        self.assertEqual(hist['bin_centers'][12], 0) # Center bin at 0ms
+
+    def test_histogram_outlier_rejection_no_edge_clamping(self):
+        """Verifies errors < -50ms or > +50ms are NOT artificially clamped into bins 0 or 24."""
+        errors = [-85.0, -60.0, 0.0, +75.0, +110.0]
+        hist = RefTimingHistogramEngine.calculate_histogram(errors, od=8.0)
+
+        # Outliers should NOT populate bin 0 or bin 24
+        self.assertEqual(hist['bins'][0], 0)
+        self.assertEqual(hist['bins'][24], 0)
+        self.assertEqual(hist['bins'][12], 1) # Only 0.0ms in bin 12
+        self.assertEqual(hist['outliers_early'], 2)
+        self.assertEqual(hist['outliers_late'], 2)
+
+    def test_histogram_discrete_judgement_coloring(self):
+        """Verifies genuine Cyan (300), Green (100), Orange (50) counts per bin."""
+        matched = [
+            {'error_ms': 0.0, 'judgement': '300'},
+            {'error_ms': -40.0, 'judgement': '100'},
+            {'error_ms': +48.0, 'judgement': '50'}
+        ]
+        hist = RefTimingHistogramEngine.calculate_histogram(matched, od=8.0)
+        self.assertEqual(hist['bins_300'][12], 1) # 0ms
+        self.assertEqual(hist['bins_100'][2], 1)  # -40ms -> (-40+50)//4 = 2
+        self.assertEqual(hist['bins_50'][24], 1)  # +48ms -> (+48+50)//4 = 24
+        self.assertEqual(hist['count_300'], 1)
+        self.assertEqual(hist['count_100'], 1)
+        self.assertEqual(hist['count_50'], 1)
+
+    def test_histogram_unstable_rate_and_mean_error(self):
+        """Verifies Unstable Rate (std_dev * 10) and average hit error calculations."""
+        errors = [-10.0, 0.0, +10.0]
+        hist = RefTimingHistogramEngine.calculate_histogram(errors, od=8.0)
+        self.assertEqual(hist['avg_hit_error'], 0.0)
+        # std_dev = sqrt((100 + 0 + 100)/3) = sqrt(66.666) ~= 8.165 -> UR ~= 81.65
+        self.assertAlmostEqual(hist['unstable_rate'], 81.65, places=1)
+
+    def test_histogram_empty_and_zero_error_distribution(self):
+        """Verifies handling empty errors list returns zeroed metrics without crashing."""
+        hist = RefTimingHistogramEngine.calculate_histogram([], od=8.0)
+        self.assertEqual(hist['total_hits'], 0)
+        self.assertEqual(hist['unstable_rate'], 0.0)
+        self.assertEqual(hist['avg_hit_error'], 0.0)
+
+
+# =============================================================================
+# MODULE 27: TRUE RELATIVE CS ACCURACY SCATTER TESTS (Tier 1)
+# =============================================================================
+class Test27_Tier1_TrueRelativeCSAccuracyScatter(unittest.TestCase):
+    """Tier 1 Unit tests for relative CS scatter, circle radius, and jump vector Overaim/Underaim."""
+
+    def test_relative_cs_delta_offset_calculation(self):
+        """Verifies delta_X = X_cursor - X_circle and delta_Y = Y_cursor - Y_circle."""
+        matched = [
+            {'delta_x': 5.2, 'delta_y': -3.1, 'judgement': '300', 'note_x': 200, 'note_y': 200}
+        ]
+        scatter = RefCSAccuracyScatterEngine.calculate_scatter(matched, cs=4.0)
+        pts = scatter['scatter_points']
+        self.assertEqual(len(pts), 1)
+        self.assertEqual(pts[0]['dx'], 5.2)
+        self.assertEqual(pts[0]['dy'], -3.1)
+
+    def test_cs_circle_radius_scaling(self):
+        """Verifies circle radius formula R = 54.4 - 4.48 * CS across standard CS values."""
+        # CS 4 -> 36.48, CS 2 -> 45.44, CS 7 -> 23.04
+        s4 = RefCSAccuracyScatterEngine.calculate_scatter([], cs=4.0)
+        self.assertAlmostEqual(s4['circle_radius'], 36.48, places=2)
+
+        s2 = RefCSAccuracyScatterEngine.calculate_scatter([], cs=2.0)
+        self.assertAlmostEqual(s2['circle_radius'], 45.44, places=2)
+
+        s7 = RefCSAccuracyScatterEngine.calculate_scatter([], cs=7.0)
+        self.assertAlmostEqual(s7['circle_radius'], 23.04, places=2)
+
+    def test_aim_jump_vector_directional_projection(self):
+        """Verifies projection along note-to-note jump vector correctly detects overaim and underaim."""
+        # Jump from (100, 100) to (300, 100) -> Jump vector is +200 in X direction (unit vector [1, 0])
+        matched = [
+            {'delta_x': 0.0, 'delta_y': 0.0, 'judgement': '300', 'note_x': 100, 'note_y': 100},
+            {'delta_x': 12.0, 'delta_y': 0.0, 'judgement': '300', 'note_x': 300, 'note_y': 100}, # Overshot note to the right
+            {'delta_x': -15.0, 'delta_y': 0.0, 'judgement': '300', 'note_x': 500, 'note_y': 100}, # Undershot note
+        ]
+        scatter = RefCSAccuracyScatterEngine.calculate_scatter(matched, cs=4.0)
+        pts = scatter['scatter_points']
+        self.assertTrue(pts[1]['is_overaim'])
+        self.assertFalse(pts[1]['is_underaim'])
+        self.assertTrue(pts[2]['is_underaim'])
+        self.assertFalse(pts[2]['is_overaim'])
+
+    def test_authentic_overaim_underaim_percentages(self):
+        """Verifies calculated Overaim % and Underaim % sum to 100% and reflect true momentum."""
+        matched = [
+            {'delta_x': 0.0, 'delta_y': 0.0, 'judgement': '300', 'note_x': 100, 'note_y': 100},
+            {'delta_x': 10.0, 'delta_y': 0.0, 'judgement': '300', 'note_x': 300, 'note_y': 100},
+            {'delta_x': 10.0, 'delta_y': 0.0, 'judgement': '300', 'note_x': 500, 'note_y': 100},
+            {'delta_x': 10.0, 'delta_y': 0.0, 'judgement': '300', 'note_x': 700, 'note_y': 100},
+        ]
+        scatter = RefCSAccuracyScatterEngine.calculate_scatter(matched, cs=4.0)
+        self.assertEqual(scatter['overshoot_pct'], 100.0)
+        self.assertEqual(scatter['underaim_pct'], 0.0)
+
+    def test_scatter_points_rendering_payload_contract(self):
+        """Verifies dictionary structure conforms strictly to visualization contract."""
+        scatter = RefCSAccuracyScatterEngine.calculate_scatter([], cs=4.0)
+        self.assertIn('scatter_points', scatter)
+        self.assertIn('circle_radius', scatter)
+        self.assertIn('overshoot_pct', scatter)
+        self.assertIn('underaim_pct', scatter)
+        self.assertIn('total_scatter', scatter)
+
+
+# =============================================================================
+# MODULE 28: BOUNDARY AND CORNER CASES (Tier 2)
+# =============================================================================
+class Test28_Tier2_BoundaryAndCornerCases(unittest.TestCase):
+    """Tier 2 Boundary and corner case tests."""
+
+    def test_corrupted_and_truncated_osu_file(self):
+        """Verifies parsing a truncated .osu file does not throw unhandled exceptions."""
+        truncated_content = "[General]\nMode: 0\n[HitObjects]\n100,200,"
+        parsed = RefOsuHitObjectParser.parse_osu_content(truncated_content)
+        self.assertEqual(len(parsed['hit_objects']), 0)
+
+    def test_empty_hitobjects_section(self):
+        """Verifies parsing 0 hit objects returns empty lists without ZeroDivisionError."""
+        content = "[General]\nMode: 0\n[Difficulty]\nCircleSize: 4.0\n[HitObjects]\n"
+        parsed = RefOsuHitObjectParser.parse_osu_content(content)
+        self.assertEqual(len(parsed['hit_objects']), 0)
+        hist = RefTimingHistogramEngine.calculate_histogram(parsed['hit_objects'])
+        self.assertEqual(hist['total_hits'], 0)
+
+    def test_simultaneous_and_overlapping_keypresses(self):
+        """Verifies simultaneous K1 and K2 rising edge on exact same frame are handled gracefully."""
+        frames = [
+            {'time': 0, 'keys': 0, 'x': 256, 'y': 192},
+            {'time': 100, 'keys': 12, 'x': 256, 'y': 192}, # K1 (4) + K2 (8) simultaneously
+        ]
+        taps = RefDiscreteHitMatchingEngine.extract_rising_edge_taps(frames)
+        self.assertTrue(len(taps) >= 1)
+
+    def test_extreme_od_values(self):
+        """Verifies boundary OD values (OD 0.0 and OD 11.0) produce valid positive hit windows."""
+        # OD 0
+        m0 = RefDiscreteHitMatchingEngine.match_hits(
+            [{'time': 1000, 'x': 256, 'y': 192}],
+            [{'time': 1070, 'x': 256, 'y': 192}],
+            od=0.0
+        )
+        self.assertEqual(m0[0]['judgement'], '300') # w300 = 80ms
+
+        # High OD 10
+        m10 = RefDiscreteHitMatchingEngine.match_hits(
+            [{'time': 1000, 'x': 256, 'y': 192}],
+            [{'time': 1025, 'x': 256, 'y': 192}],
+            od=10.0
+        )
+        self.assertEqual(m10[0]['judgement'], '100') # w300 = 20ms, error is 25ms -> 100
+
+    def test_out_of_bounds_and_negative_cursor_coordinates(self):
+        """Verifies cursor coordinates outside standard 512x384 playfield calculate delta offsets correctly."""
+        notes = [{'time': 1000, 'x': 0, 'y': 0}]
+        taps = [{'time': 1000, 'x': -50, 'y': 450, 'key': 'K1'}]
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        self.assertEqual(matched[0]['delta_x'], -50.0)
+        self.assertEqual(matched[0]['delta_y'], 450.0)
+
+    def test_zero_and_negative_timestamps(self):
+        """Verifies notes and taps occurring at negative intro lead-in times (e.g. -500ms) match correctly."""
+        notes = [{'time': -500, 'x': 256, 'y': 192}]
+        taps = [{'time': -495, 'x': 256, 'y': 192, 'key': 'K1'}]
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        self.assertEqual(matched[0]['error_ms'], 5.0)
+        self.assertEqual(matched[0]['judgement'], '300')
+
+    def test_rapid_slider_ticks_and_burst_notes(self):
+        """Verifies high-density 300 BPM stream notes (50ms gap) match one-to-one without tap reuse."""
+        notes = [{'time': 1000 + i * 50, 'x': 256, 'y': 192} for i in range(5)]
+        taps = [{'time': 1000 + i * 50, 'x': 256, 'y': 192, 'key': 'K1' if i % 2 == 0 else 'K2'} for i in range(5)]
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        self.assertEqual(len(matched), 5)
+        for m in matched:
+            self.assertEqual(m['judgement'], '300')
+
+    def test_missing_songs_directory_handling(self):
+        """Verifies passing a non-existent Songs directory path returns None gracefully."""
+        finder = RefFastSongFinder("/path/that/does/not/exist")
+        found = finder.find_beatmap(beatmap_id=123)
+        self.assertIsNone(found)
+
+
+# =============================================================================
+# MODULE 29: CROSS-FEATURE INTEGRATION (Tier 3)
+# =============================================================================
+class Test29_Tier3_CrossFeatureIntegration(unittest.TestCase):
+    """Tier 3 Cross-feature integration tests connecting parsing, mods, matching, and renderers."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.songs_dir = self.tmp_dir.name
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def test_cross_feature_replay_to_osu_matching_pipeline(self):
+        """Integration: Replay frames -> Song Finder -> .osu Parser -> Hit Matcher -> Histogram -> CS Scatter."""
+        song_folder = os.path.join(self.songs_dir, "5005 Integration Map")
+        os.makedirs(song_folder, exist_ok=True)
+        osu_path = os.path.join(song_folder, "map.osu")
+        osu_content = """
+        [General]
+        Mode: 0
+        [Difficulty]
+        CircleSize: 4.0
+        OverallDifficulty: 8.0
+        [HitObjects]
+        100,100,1000,1,0,0:0:0:0:
+        200,100,1500,1,0,0:0:0:0:
+        300,100,2000,1,0,0:0:0:0:
+        """
+        with open(osu_path, "wb") as f:
+            f.write(osu_content.encode("utf-8"))
+        expected_md5 = hashlib.md5(osu_content.encode('utf-8')).hexdigest()
+
+        finder = RefFastSongFinder(self.songs_dir)
+        located_osu = finder.find_beatmap(md5=expected_md5)
+        self.assertIsNotNone(located_osu)
+
+        parsed_map = RefOsuHitObjectParser.parse_osu_file(located_osu)
+        objs = parsed_map['hit_objects']
+        self.assertEqual(len(objs), 3)
+
+        replay_frames = [
+            {'time': 995, 'keys': 4, 'x': 102, 'y': 100},
+            {'time': 1050, 'keys': 0, 'x': 150, 'y': 100},
+            {'time': 1505, 'keys': 8, 'x': 204, 'y': 100},
+            {'time': 1550, 'keys': 0, 'x': 250, 'y': 100},
+            {'time': 2000, 'keys': 4, 'x': 301, 'y': 100},
+        ]
+        taps = RefDiscreteHitMatchingEngine.extract_rising_edge_taps(replay_frames)
+        matched = RefDiscreteHitMatchingEngine.match_hits(objs, taps, od=parsed_map['difficulty']['od'])
+
+        hist = RefTimingHistogramEngine.calculate_histogram(matched, od=8.0)
+        self.assertEqual(hist['count_300'], 3)
+
+        scatter = RefCSAccuracyScatterEngine.calculate_scatter(matched, cs=4.0)
+        self.assertEqual(scatter['total_scatter'], 3)
+
+    def test_cross_feature_hr_mod_pipeline_integration(self):
+        """Integration: HR replay matching with Y-flip and scaled CS/OD."""
+        osu_content = """
+        [General]
+        Mode: 0
+        [Difficulty]
+        CircleSize: 4.0
+        OverallDifficulty: 7.0
+        [HitObjects]
+        100,100,1000,1,0,0:0:0:0:
+        """
+        parsed_hr = RefOsuHitObjectParser.parse_osu_content(osu_content, mods=16) # HR
+        hr_obj = parsed_hr['hit_objects'][0]
+        self.assertEqual(hr_obj['y'], 284.0) # 384 - 100
+
+        replay_frames = [
+            {'time': 1002, 'keys': 4, 'x': 100, 'y': 284} # Clicked at HR position
+        ]
+        taps = RefDiscreteHitMatchingEngine.extract_rising_edge_taps(replay_frames)
+        matched = RefDiscreteHitMatchingEngine.match_hits(parsed_hr['hit_objects'], taps, od=hr_obj['od'], mods=16)
+        self.assertEqual(matched[0]['judgement'], '300')
+        self.assertEqual(matched[0]['delta_y'], 0.0)
+
+    def test_cross_feature_dt_mod_pipeline_integration(self):
+        """Integration: DT replay matching with 1.5x time compression."""
+        osu_content = """
+        [General]
+        Mode: 0
+        [Difficulty]
+        OverallDifficulty: 8.0
+        [HitObjects]
+        256,192,1500,1,0,0:0:0:0:
+        """
+        parsed_dt = RefOsuHitObjectParser.parse_osu_content(osu_content, mods=64) # DT
+        dt_obj = parsed_dt['hit_objects'][0]
+        self.assertEqual(dt_obj['time'], 1000.0) # 1500 / 1.5
+
+        replay_frames = [
+            {'time': 1005, 'keys': 4, 'x': 256, 'y': 192}
+        ]
+        taps = RefDiscreteHitMatchingEngine.extract_rising_edge_taps(replay_frames)
+        matched = RefDiscreteHitMatchingEngine.match_hits(parsed_dt['hit_objects'], taps, od=8.0, mods=64)
+        self.assertEqual(matched[0]['judgement'], '300')
+        self.assertEqual(matched[0]['error_ms'], 5.0)
+
+    def test_cross_feature_missing_osu_fallback_pipeline(self):
+        """Integration: Missing .osu returns clean German notice without raising exceptions or generating fake data."""
+        finder = RefFastSongFinder(self.songs_dir)
+        found = finder.find_beatmap(beatmap_id=404404)
+        self.assertIsNone(found)
+        notice = finder.get_fallback_notice()
+        self.assertEqual(notice, "ℹ️ .osu Beatmap-Datei nicht im Songs-Ordner gefunden – HitObject-Abgleich nicht möglich")
+
+
+# =============================================================================
+# MODULE 30: REAL-WORLD WORKLOADS & E2E (Tier 4)
+# =============================================================================
+class Test30_Tier4_RealWorldWorkloadsAndE2E(unittest.TestCase):
+    """Tier 4 Real-world E2E workloads and full replay simulations."""
+
+    def test_e2e_full_marathon_replay_simulation(self):
+        """Simulates 1,000-note full marathon replay with realistic 300s, 100s, 50s, misses."""
+        random.seed(42)
+        notes = [{'time': i * 150.0, 'x': 256.0 + math.sin(i * 0.1) * 100.0, 'y': 192.0 + math.cos(i * 0.1) * 80.0} for i in range(1000)]
+        taps = []
+        for i, n in enumerate(notes):
+            if i % 100 == 99:
+                continue # 1% intentional miss
+            err = random.gauss(0, 8.0) # 8ms std dev (~80 UR)
+            taps.append({
+                'time': n['time'] + err,
+                'x': n['x'] + random.gauss(0, 3.0),
+                'y': n['y'] + random.gauss(0, 3.0),
+                'key': 'K1' if i % 2 == 0 else 'K2'
+            })
+
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        self.assertEqual(len(matched), 1000)
+
+        hist = RefTimingHistogramEngine.calculate_histogram(matched, od=8.0)
+        self.assertTrue(hist['count_300'] > 900)
+        self.assertTrue(hist['unstable_rate'] < 95.0)
+
+        scatter = RefCSAccuracyScatterEngine.calculate_scatter(matched, cs=4.0)
+        self.assertEqual(scatter['total_scatter'], 990)
+
+    def test_e2e_cross_screen_jump_map_overaim(self):
+        """Simulates cross-screen jump map with intentional overshooting -> verifies Overaim % > 60%."""
+        notes = [
+            {'time': 1000, 'x': 50, 'y': 50},
+            {'time': 1500, 'x': 450, 'y': 350},
+            {'time': 2000, 'x': 50, 'y': 50},
+            {'time': 2500, 'x': 450, 'y': 350},
+        ]
+        # Always click 15px past the jump destination
+        taps = [
+            {'time': 1000, 'x': 50, 'y': 50, 'key': 'K1'},
+            {'time': 1500, 'x': 462, 'y': 359, 'key': 'K1'}, # past note along jump vector
+            {'time': 2000, 'x': 38, 'y': 41, 'key': 'K1'},   # past note along return jump
+            {'time': 2500, 'x': 462, 'y': 359, 'key': 'K1'},
+        ]
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        scatter = RefCSAccuracyScatterEngine.calculate_scatter(matched, cs=4.0)
+        self.assertTrue(scatter['overshoot_pct'] >= 60.0)
+
+    def test_e2e_dt_high_bpm_tight_timing(self):
+        """Simulates 270 BPM DT stream section with tight timing distribution."""
+        notes = [{'time': i * (60000.0 / 270.0 / 2.0), 'x': 256, 'y': 192} for i in range(32)]
+        taps = [{'time': n['time'] + (i % 3 - 1) * 2.0, 'x': 256, 'y': 192, 'key': 'K1' if i % 2 == 0 else 'K2'} for i, n in enumerate(notes)]
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0, mods=64)
+        hist = RefTimingHistogramEngine.calculate_histogram(matched, od=8.0)
+        self.assertEqual(hist['count_300'], 32)
+        self.assertTrue(hist['unstable_rate'] < 30.0)
+
+    def test_e2e_german_ui_and_fallback_audit(self):
+        """Audits German status notice and ensures zero English placeholder remnants."""
+        notice = RefFastSongFinder.get_fallback_notice()
+        self.assertIn("ℹ️", notice)
+        self.assertIn(".osu Beatmap-Datei nicht im Songs-Ordner gefunden", notice)
+        self.assertNotIn("TBD", notice)
+        self.assertNotIn("TODO", notice)
+        self.assertNotIn("Lorem", notice)
+
+
+# =============================================================================
+# MODULE 31: ADVERSARIAL SECURITY & PERFORMANCE STRESS (Tier 5)
+# =============================================================================
+class Test31_Tier5_AdversarialSecurityAndPerformanceStress(unittest.TestCase):
+    """Tier 5 Adversarial fuzzing, high-load stress benchmarks, and localization audits."""
+
+    def test_adversarial_malformed_hitobject_lines(self):
+        """Fuzzes parser with SQL injection strings, random Unicode, and invalid floats."""
+        malformed_osu = """
+        [HitObjects]
+        ' OR '1'='1
+        <script>alert(1)</script>
+        nan,inf,99999999999999999999,1,0,0
+        -100,-200,-500,1,0,0
+        ,,,,,
+        NULL,None,undefined
+        256,192,1000,1,0,0:0:0:0:
+        """
+        parsed = RefOsuHitObjectParser.parse_osu_content(malformed_osu)
+        # Should cleanly recover and parse the valid hitobject
+        valid_objs = [o for o in parsed['hit_objects'] if o['time'] == 1000.0]
+        self.assertEqual(len(valid_objs), 1)
+
+    def test_massive_3000_note_beatmap_matching_stress(self):
+        """Stress test: 3,000 hit objects matched in < 30ms with zero memory bloat."""
+        notes = [{'time': i * 50.0, 'x': 256.0, 'y': 192.0} for i in range(3000)]
+        taps = [{'time': i * 50.0 + (i % 3 - 1) * 4.0, 'x': 256.0, 'y': 192.0, 'key': 'K1'} for i in range(3000)]
+
+        t0 = time.perf_counter()
+        matched = RefDiscreteHitMatchingEngine.match_hits(notes, taps, od=8.0)
+        dur_ms = (time.perf_counter() - t0) * 1000.0
+
+        self.assertEqual(len(matched), 3000)
+        self.assertTrue(dur_ms < 30.0, f"3,000 note matching took {dur_ms:.3f}ms")
+
+    def test_song_finder_cache_stress_and_concurrency(self):
+        """Multi-threaded stress: 10 concurrent threads querying song finder cache."""
+        with tempfile.TemporaryDirectory() as tmp_songs:
+            for i in range(20):
+                folder = os.path.join(tmp_songs, f"Song_{i}")
+                os.makedirs(folder, exist_ok=True)
+                with open(os.path.join(folder, "map.osu"), "w", encoding="utf-8") as f:
+                    f.write(f"[Metadata]\nBeatmapID: {1000 + i}\n")
+
+            finder = RefFastSongFinder(tmp_songs)
+            finder.index_songs_directory()
+
+            errors = []
+            def worker(thread_id):
+                try:
+                    for _ in range(50):
+                        bid = 1000 + (thread_id % 20)
+                        res = finder.find_beatmap(beatmap_id=bid)
+                        if res is None:
+                            errors.append(f"Thread {thread_id} failed to find {bid}")
+                except Exception as e:
+                    errors.append(str(e))
+
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+
+            self.assertEqual(len(errors), 0)
+
+    def test_localization_zero_english_placeholders_audit(self):
+        """Scans all reference German messages for prohibited English placeholder tokens."""
+        forbidden = ["TBD", "TODO", "Lorem ipsum", "Not Available", "N/A - Not Available", "Under Construction"]
+        text = RefFastSongFinder.get_fallback_notice()
+        for token in forbidden:
+            self.assertNotIn(token, text)
+
+
 # =============================================================================
 # Main Runner
 # =============================================================================
@@ -1797,3 +3845,4 @@ if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
+

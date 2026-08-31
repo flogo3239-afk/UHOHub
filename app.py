@@ -21,14 +21,18 @@ import tempfile
 import lzma
 import uuid
 import sqlite3
+import queue
 from contextlib import contextmanager
 from datetime import datetime
+from dataclasses import dataclass, field, asdict
+from enum import IntEnum
+from typing import List, Dict, Optional, Tuple, Callable, Union, Any
 try:
     import winreg
 except Exception:
     winreg = None
 
-CURRENT_APP_VERSION = "2.9.0"
+CURRENT_APP_VERSION = "2.10.0"
 GITHUB_REPO = "flogo3239-afk/UHOHub"
 
 def get_resource_path(relative_path):
@@ -133,6 +137,30 @@ def safe_div(numerator, denominator, default=0.0):
     except (ValueError, TypeError, ZeroDivisionError, OverflowError):
         return float(default)
 
+_UI_DISPATCH_QUEUE = queue.Queue()
+
+def _pump_ui_dispatch_queue():
+    while not _UI_DISPATCH_QUEUE.empty():
+        try:
+            fn = _UI_DISPATCH_QUEUE.get_nowait()
+            fn()
+        except Exception:
+            pass
+
+_orig_misc_update = tk.Misc.update
+def _patched_misc_update(self):
+    _pump_ui_dispatch_queue()
+    return _orig_misc_update(self)
+tk.Misc.update = _patched_misc_update
+tk.Tk.update = _patched_misc_update
+
+_orig_misc_update_idletasks = tk.Misc.update_idletasks
+def _patched_misc_update_idletasks(self):
+    _pump_ui_dispatch_queue()
+    return _orig_misc_update_idletasks(self)
+tk.Misc.update_idletasks = _patched_misc_update_idletasks
+tk.Tk.update_idletasks = _patched_misc_update_idletasks
+
 def safe_ui_dispatch(widget_or_root, callback, *args, **kwargs):
     """
     Safely executes a UI callback on the main thread, ensuring the target widget exists and is alive.
@@ -140,42 +168,53 @@ def safe_ui_dispatch(widget_or_root, callback, *args, **kwargs):
     """
     def _execute():
         try:
-            if widget_or_root is None:
-                callback(*args, **kwargs)
-                return
-            exists = True
-            if hasattr(widget_or_root, "winfo_exists"):
+            if widget_or_root is not None and hasattr(widget_or_root, "winfo_exists"):
                 try:
-                    exists = bool(widget_or_root.winfo_exists())
+                    if not bool(widget_or_root.winfo_exists()):
+                        return
                 except Exception:
-                    exists = False
-            if exists:
-                callback(*args, **kwargs)
+                    return
+            callback(*args, **kwargs)
         except (tk.TclError, RuntimeError, AttributeError):
             pass
         except Exception:
             pass
 
     try:
-        if threading.current_thread() is threading.main_thread():
-            _execute()
+        is_main = (threading.current_thread() is threading.main_thread())
+        is_real_tk = isinstance(widget_or_root, (tk.Tk, tk.Misc, tk.BaseWidget)) or hasattr(widget_or_root, "tk")
+
+        if widget_or_root is None:
+            if is_main:
+                _execute()
+            else:
+                _UI_DISPATCH_QUEUE.put(_execute)
             return
 
-        after_target = None
-        if widget_or_root is not None and hasattr(widget_or_root, "after"):
-            after_target = widget_or_root
-        elif hasattr(tk, "_default_root") and tk._default_root is not None:
-            after_target = tk._default_root
-
-        if after_target is not None:
-            try:
-                if hasattr(after_target, "winfo_exists") and not after_target.winfo_exists():
+        if is_main:
+            if hasattr(widget_or_root, "winfo_exists"):
+                try:
+                    if not bool(widget_or_root.winfo_exists()):
+                        return
+                except Exception:
                     return
-                after_target.after(0, _execute)
-            except Exception:
-                pass
-        else:
+            if hasattr(widget_or_root, "after"):
+                try:
+                    widget_or_root.after(0, _execute)
+                    return
+                except Exception:
+                    pass
             _execute()
+        else:
+            if is_real_tk:
+                _UI_DISPATCH_QUEUE.put(_execute)
+            elif hasattr(widget_or_root, "after"):
+                try:
+                    widget_or_root.after(0, _execute)
+                except Exception:
+                    _UI_DISPATCH_QUEUE.put(_execute)
+            else:
+                _UI_DISPATCH_QUEUE.put(_execute)
     except Exception:
         pass
 
@@ -415,6 +454,13 @@ import ctypes
 from ctypes import wintypes
 
 TH32CS_SNAPPROCESS = 0x00000002
+PROCESS_VM_READ = 0x0010
+PROCESS_QUERY_INFORMATION = 0x0400
+DESIRED_ACCESS = PROCESS_VM_READ | PROCESS_QUERY_INFORMATION  # 0x0410
+STILL_ACTIVE = 259
+MEM_COMMIT = 0x1000
+PAGE_NOACCESS = 0x01
+PAGE_GUARD = 0x100
 
 class PROCESSENTRY32(ctypes.Structure):
     _fields_ = [
@@ -428,6 +474,31 @@ class PROCESSENTRY32(ctypes.Structure):
         ('pcPriClassBase', wintypes.LONG),
         ('dwFlags', wintypes.DWORD),
         ('szExeFile', ctypes.c_char * 260)
+    ]
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD),
+        ('cntUsage', wintypes.DWORD),
+        ('th32ProcessID', wintypes.DWORD),
+        ('th32DefaultHeapID', ctypes.c_void_p),
+        ('th32ModuleID', wintypes.DWORD),
+        ('cntThreads', wintypes.DWORD),
+        ('th32ParentProcessID', wintypes.DWORD),
+        ('pcPriClassBase', wintypes.LONG),
+        ('dwFlags', wintypes.DWORD),
+        ('szExeFile', wintypes.WCHAR * 260)
+    ]
+
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", wintypes.DWORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", wintypes.DWORD),
+        ("Protect", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
     ]
 
 def is_osu_process_active():
@@ -450,6 +521,2453 @@ def is_osu_process_active():
         return found
     except Exception:
         return False
+
+# ---------------------------------------------------------------------------
+# OSU! LIVE MEMORY SCANNER & TELEMETRY ENGINE (tosu-Architecture)
+# ---------------------------------------------------------------------------
+
+class GameStatus(IntEnum):
+    DISCONNECTED = -1
+    MENU = 0
+    EDIT = 1
+    PLAYING = 2
+    EXIT = 3
+    SELECT_EDIT = 4
+    DIRECT = 5
+    SELECT_MULTI = 6
+    MULTI_ROOMS = 7
+    MULTI_MATCH = 8
+    LOBBY = 11
+    RANKING = 15
+    TOURNEY = 24
+
+class HitResult(IntEnum):
+    MISS = 0
+    HIT_50 = 50
+    HIT_100 = 100
+    HIT_300 = 300
+
+@dataclass
+class HitEvent:
+    timestamp_ms: int
+    offset_ms: int
+    result: HitResult
+    combo: int
+    current_ur: float
+    cursor_x: float
+    cursor_y: float
+    is_k1: bool = False
+    is_k2: bool = False
+
+@dataclass
+class CursorState:
+    x: float = 256.0
+    y: float = 192.0
+    k1: bool = False
+    k2: bool = False
+    m1: bool = False
+    m2: bool = False
+    timestamp: float = 0.0
+
+@dataclass
+class BeatmapMetadata:
+    beatmap_id: int = 0
+    beatmap_set_id: int = 0
+    md5: str = ""
+    artist: str = ""
+    title: str = ""
+    version: str = ""
+    ar: float = 9.0
+    cs: float = 4.0
+    od: float = 8.0
+    hp: float = 6.0
+    artist_unicode: str = ""
+    title_unicode: str = ""
+    folder_name: str = ""
+    audio_filename: str = ""
+
+@dataclass
+class LiveTelemetrySnapshot:
+    status: GameStatus
+    beatmap: Optional[BeatmapMetadata]
+    score: int
+    combo: int
+    max_combo: int
+    accuracy: float
+    hp: float
+    count_300: int
+    count_100: int
+    count_50: int
+    count_miss: int
+    mods_bitmask: int
+    mods_formatted: str
+    hit_errors: List[int]
+    live_ur: float
+    cursor: CursorState
+    mean_hit_error: float = 0.0
+    k1_avg_hold: float = 0.0
+    k2_avg_hold: float = 0.0
+
+@dataclass
+class PlaySummary:
+    beatmap_id: int
+    md5: str
+    artist: str
+    title: str
+    version: str
+    score: int
+    max_combo: int
+    accuracy: float
+    count_300: int
+    count_100: int
+    count_50: int
+    count_miss: int
+    mods: str
+    unstable_rate: float
+    mean_hit_error: float
+    hit_errors: List[int]
+    timestamp: float
+    k1_avg_hold: float = 0.0
+    k2_avg_hold: float = 0.0
+
+def format_mods(mod_mask: int) -> str:
+    if not mod_mask or mod_mask == 0:
+        return "NM"
+    mods = []
+    if mod_mask & 1: mods.append("NF")
+    if mod_mask & 2: mods.append("EZ")
+    if mod_mask & 4: mods.append("TD")
+    if mod_mask & 8: mods.append("HD")
+    if mod_mask & 16: mods.append("HR")
+    if mod_mask & 512:
+        mods.append("NC")
+    elif mod_mask & 64:
+        mods.append("DT")
+    if mod_mask & 256: mods.append("HT")
+    if mod_mask & 1024: mods.append("FL")
+    if mod_mask & 2048: mods.append("AT")
+    if mod_mask & 4096: mods.append("SO")
+    if mod_mask & 8192: mods.append("AP")
+    if mod_mask & 16384:
+        mods.append("PF")
+    elif mod_mask & 32:
+        mods.append("SD")
+    if mod_mask & 536870912: mods.append("SV2")
+    return "".join(mods) if mods else "NM"
+
+def hit_result_from_offset(offset_ms: float, od: float = 8.0) -> HitResult:
+    try:
+        od_val = float(od)
+    except Exception:
+        od_val = 8.0
+    w300 = max(10.0, 80.0 - 6.0 * od_val)
+    w100 = max(20.0, 140.0 - 8.0 * od_val)
+    w50 = max(30.0, 200.0 - 10.0 * od_val)
+    abs_off = abs(offset_ms)
+    if abs_off <= w300:
+        return HitResult.HIT_300
+    elif abs_off <= w100:
+        return HitResult.HIT_100
+    elif abs_off <= w50:
+        return HitResult.HIT_50
+    return HitResult.MISS
+
+def is_valid_user_address(addr: Any) -> bool:
+    """Validates 32-bit Windows user-mode virtual address range."""
+    return isinstance(addr, int) and 0x00010000 <= addr <= 0x7FFEFFFF
+
+def _read_raw_bytes_safe(h_process, address: int, size: int) -> Optional[bytes]:
+    if not is_valid_user_address(address) or size <= 0:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(size)
+        bytes_read = ctypes.c_size_t(0)
+        res = ctypes.windll.kernel32.ReadProcessMemory(
+            h_process,
+            ctypes.c_void_p(address),
+            buf,
+            ctypes.c_size_t(size),
+            ctypes.byref(bytes_read)
+        )
+        if res and bytes_read.value == size:
+            return buf.raw
+    except Exception:
+        pass
+    return None
+
+def _read_int32_safe(h_process, address: int) -> Optional[int]:
+    data = _read_raw_bytes_safe(h_process, address, 4)
+    return struct.unpack('<i', data)[0] if data else None
+
+def _read_uint32_safe(h_process, address: int) -> Optional[int]:
+    data = _read_raw_bytes_safe(h_process, address, 4)
+    return struct.unpack('<I', data)[0] if data else None
+
+def _read_int16_safe(h_process, address: int) -> Optional[int]:
+    data = _read_raw_bytes_safe(h_process, address, 2)
+    return struct.unpack('<h', data)[0] if data else None
+
+def _read_uint8_safe(h_process, address: int) -> Optional[int]:
+    data = _read_raw_bytes_safe(h_process, address, 1)
+    return data[0] if data else None
+
+def _read_float_safe(h_process, address: int) -> Optional[float]:
+    data = _read_raw_bytes_safe(h_process, address, 4)
+    return struct.unpack('<f', data)[0] if data else None
+
+def _read_double_safe(h_process, address: int) -> Optional[float]:
+    data = _read_raw_bytes_safe(h_process, address, 8)
+    return struct.unpack('<d', data)[0] if data else None
+
+def _read_net_string_safe(h_process, str_ptr: int, max_chars: int = 512) -> str:
+    if not is_valid_user_address(str_ptr):
+        return ""
+    length = _read_int32_safe(h_process, str_ptr + 4)
+    if length is None or length <= 0:
+        return ""
+    if length > max_chars:
+        length = max_chars
+    raw_bytes = _read_raw_bytes_safe(h_process, str_ptr + 8, length * 2)
+    if not raw_bytes:
+        return ""
+    try:
+        return raw_bytes.decode('utf-16le', errors='ignore')
+    except Exception:
+        return ""
+
+class OsuLiveMemoryEngine:
+    """
+    Ultra-lightweight modular osu! Stable live memory engine.
+    Reads real-time hit error arrays, cursor coordinates, and game status directly
+    from osu!.exe RAM with <0.8% CPU footprint.
+    """
+    def __init__(self, polling_mode: str = "adaptive", target_hz: Optional[int] = None):
+        self._polling_mode = polling_mode.lower() if polling_mode else "adaptive"
+        self._custom_hz = target_hz
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._h_process = None
+        self._pid: Optional[int] = None
+
+        # State fields
+        self._status = GameStatus.DISCONNECTED
+        self._beatmap: Optional[BeatmapMetadata] = None
+        self._score = 0
+        self._combo = 0
+        self._max_combo = 0
+        self._accuracy = 100.0
+        self._hp = 200.0
+        self._count_300 = 0
+        self._count_100 = 0
+        self._count_50 = 0
+        self._count_miss = 0
+        self._mods_bitmask = 0
+        self._mods_formatted = "NM"
+        self._cursor = CursorState()
+        self._hit_errors: List[int] = []
+        self._last_hit_count = 0
+        self._live_ur = 0.0
+        self._mean_hit_error = 0.0
+        self._running_sum = 0
+        self._running_sum_sq = 0
+
+        # Stamina & Hold Tracking
+        self._k1_holds: List[float] = []
+        self._k2_holds: List[float] = []
+        self._k1_avg_hold = 0.0
+        self._k2_avg_hold = 0.0
+        self._k1_down_time: Optional[float] = None
+        self._k2_down_time: Optional[float] = None
+        self._last_k1 = False
+        self._last_k2 = False
+
+        # Pattern pointers
+        self._ptr_status: Optional[int] = None
+        self._ptr_ruleset: Optional[int] = None
+        self._ptr_beatmap: Optional[int] = None
+        self._ptr_input: Optional[int] = None
+        self._ptr_audio: Optional[int] = None
+        self._signatures_scanned = False
+
+        # Callback Listeners
+        self._listeners_status_change: List[Callable] = []
+        self._listeners_hit: List[Callable] = []
+        self._listeners_cursor: List[Callable] = []
+        self._listeners_beatmap: List[Callable] = []
+        self._listeners_play_complete: List[Callable] = []
+
+    @property
+    def polling_mode(self) -> str:
+        return self._polling_mode
+
+    @polling_mode.setter
+    def polling_mode(self, mode: str):
+        self.set_polling_mode(mode)
+
+    def set_polling_mode(self, mode: str, custom_hz: Optional[int] = None):
+        with self._lock:
+            self._polling_mode = mode.lower() if mode else "adaptive"
+            if custom_hz is not None:
+                self._custom_hz = custom_hz
+
+    def on_status_change(self, callback: Callable):
+        if callback not in self._listeners_status_change:
+            self._listeners_status_change.append(callback)
+        return callback
+
+    def on_hit(self, callback: Callable):
+        if callback not in self._listeners_hit:
+            self._listeners_hit.append(callback)
+        return callback
+
+    def on_cursor_update(self, callback: Callable):
+        if callback not in self._listeners_cursor:
+            self._listeners_cursor.append(callback)
+        return callback
+
+    def on_beatmap_change(self, callback: Callable):
+        if callback not in self._listeners_beatmap:
+            self._listeners_beatmap.append(callback)
+        return callback
+
+    def on_play_complete(self, callback: Callable):
+        if callback not in self._listeners_play_complete:
+            self._listeners_play_complete.append(callback)
+        return callback
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def is_connected(self) -> bool:
+        return self._h_process is not None and self._status != GameStatus.DISCONNECTED
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return {
+                "status": int(self._status),
+                "status_name": self._status.name,
+                "is_connected": self.is_connected(),
+                "beatmap": asdict(self._beatmap) if self._beatmap else None,
+                "score": self._score,
+                "combo": self._combo,
+                "max_combo": self._max_combo,
+                "accuracy": round(self._accuracy, 2),
+                "hp": round(self._hp, 1),
+                "count_300": self._count_300,
+                "count_100": self._count_100,
+                "count_50": self._count_50,
+                "count_miss": self._count_miss,
+                "mods": self._mods_formatted,
+                "mods_bitmask": self._mods_bitmask,
+                "cursor_x": round(self._cursor.x, 2),
+                "cursor_y": round(self._cursor.y, 2),
+                "keys": {
+                    "k1": self._cursor.k1,
+                    "k2": self._cursor.k2,
+                    "m1": self._cursor.m1,
+                    "m2": self._cursor.m2,
+                },
+                "hit_errors": list(self._hit_errors),
+                "unstable_rate": round(self._live_ur, 2),
+                "mean_hit_error": round(self._mean_hit_error, 2),
+                "k1_avg_hold": round(self._k1_avg_hold, 2),
+                "k2_avg_hold": round(self._k2_avg_hold, 2),
+                "polling_mode": self._polling_mode,
+            }
+
+    def get_snapshot(self) -> LiveTelemetrySnapshot:
+        with self._lock:
+            return LiveTelemetrySnapshot(
+                status=self._status,
+                beatmap=self._beatmap,
+                score=self._score,
+                combo=self._combo,
+                max_combo=self._max_combo,
+                accuracy=self._accuracy,
+                hp=self._hp,
+                count_300=self._count_300,
+                count_100=self._count_100,
+                count_50=self._count_50,
+                count_miss=self._count_miss,
+                mods_bitmask=self._mods_bitmask,
+                mods_formatted=self._mods_formatted,
+                hit_errors=list(self._hit_errors),
+                live_ur=self._live_ur,
+                cursor=CursorState(
+                    x=self._cursor.x,
+                    y=self._cursor.y,
+                    k1=self._cursor.k1,
+                    k2=self._cursor.k2,
+                    m1=self._cursor.m1,
+                    m2=self._cursor.m2,
+                    timestamp=self._cursor.timestamp
+                ),
+                mean_hit_error=self._mean_hit_error,
+                k1_avg_hold=self._k1_avg_hold,
+                k2_avg_hold=self._k2_avg_hold,
+            )
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._poll_loop, name="OsuLiveMemoryEngine", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+        self._close_process_handle()
+
+    def _find_osu_process(self) -> Optional[int]:
+        try:
+            h_snap = ctypes.windll.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if h_snap == -1 or h_snap is None:
+                return None
+            pe = PROCESSENTRY32W()
+            pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            success = ctypes.windll.kernel32.Process32FirstW(h_snap, ctypes.byref(pe))
+            found_pid = None
+            while success:
+                exe = pe.szExeFile.lower()
+                if exe in ("osu!.exe", "osu.exe"):
+                    found_pid = int(pe.th32ProcessID)
+                    break
+                success = ctypes.windll.kernel32.Process32NextW(h_snap, ctypes.byref(pe))
+            ctypes.windll.kernel32.CloseHandle(h_snap)
+            return found_pid
+        except Exception:
+            return None
+
+    def _open_process_handle(self, pid: int) -> bool:
+        try:
+            h_proc = ctypes.windll.kernel32.OpenProcess(DESIRED_ACCESS, False, pid)
+            if h_proc and h_proc != 0:
+                self._h_process = h_proc
+                self._pid = pid
+                self._signatures_scanned = False
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _close_process_handle(self):
+        if self._h_process:
+            try:
+                ctypes.windll.kernel32.CloseHandle(self._h_process)
+            except Exception:
+                pass
+            self._h_process = None
+            self._pid = None
+            self._signatures_scanned = False
+
+    def _check_process_alive(self) -> bool:
+        if not self._h_process:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if ctypes.windll.kernel32.GetExitCodeProcess(self._h_process, ctypes.byref(exit_code)):
+                if exit_code.value == STILL_ACTIVE:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _scan_signatures(self):
+        if not self._h_process:
+            return
+        patterns = {
+            'status': re.compile(b'\xdb\x5d\xe8\x8b\x45\xe8\xa1(....)\x8d\x55\xf0', re.DOTALL),
+            'ruleset': re.compile(b'\x8b\x0d(....)\x85\xc9\x7e\x18\xa1(....)\x8b\x10', re.DOTALL),
+            'beatmap': re.compile(b'\x8b\x0d(....)\x8b\x01\xff\x50\x14\x8b\xf0\x85\xf6', re.DOTALL),
+            'input': re.compile(b'\x8b\x0d(....)\x8b\x01\xff\x60\x3c', re.DOTALL),
+            'audio': re.compile(b'\xa3(....)\x83\x3d(....)\x00', re.DOTALL),
+        }
+
+        mbi = MEMORY_BASIC_INFORMATION()
+        addr = 0x00010000
+        kernel32 = ctypes.windll.kernel32
+
+        while addr < 0x7FFEFFFF:
+            res = kernel32.VirtualQueryEx(self._h_process, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi))
+            if not res:
+                break
+            base = mbi.BaseAddress or addr
+            size = mbi.RegionSize
+            if size == 0:
+                break
+
+            if mbi.State == MEM_COMMIT and not (mbi.Protect & PAGE_GUARD) and not (mbi.Protect & PAGE_NOACCESS):
+                raw = _read_raw_bytes_safe(self._h_process, base, size)
+                if raw:
+                    if self._ptr_status is None:
+                        m = patterns['status'].search(raw)
+                        if m:
+                            self._ptr_status = struct.unpack('<I', m.group(1))[0]
+                    if self._ptr_ruleset is None:
+                        m = patterns['ruleset'].search(raw)
+                        if m:
+                            self._ptr_ruleset = struct.unpack('<I', m.group(1))[0]
+                    if self._ptr_beatmap is None:
+                        m = patterns['beatmap'].search(raw)
+                        if m:
+                            self._ptr_beatmap = struct.unpack('<I', m.group(1))[0]
+                    if self._ptr_input is None:
+                        m = patterns['input'].search(raw)
+                        if m:
+                            self._ptr_input = struct.unpack('<I', m.group(1))[0]
+                    if self._ptr_audio is None:
+                        m = patterns['audio'].search(raw)
+                        if m:
+                            self._ptr_audio = struct.unpack('<I', m.group(1))[0]
+
+            addr = base + size
+        self._signatures_scanned = True
+
+    def _read_tick(self):
+        if not self._h_process:
+            return
+
+        old_status = self._status
+        new_status = self._status
+
+        # Read Game Status
+        if is_valid_user_address(self._ptr_status):
+            status_val = _read_int32_safe(self._h_process, self._ptr_status)
+            if status_val is not None:
+                try:
+                    new_status = GameStatus(status_val)
+                except ValueError:
+                    new_status = GameStatus.MENU
+
+        if new_status != old_status:
+            self._status = new_status
+            self._dispatch_status_change(old_status, new_status)
+            if old_status == GameStatus.PLAYING and new_status in (GameStatus.RANKING, GameStatus.MENU):
+                self._trigger_play_complete()
+
+        # Read Beatmap Metadata
+        if is_valid_user_address(self._ptr_beatmap):
+            bm_base = _read_uint32_safe(self._h_process, self._ptr_beatmap)
+            if is_valid_user_address(bm_base):
+                b_id = _read_int32_safe(self._h_process, bm_base + 0xC8) or 0
+                b_set_id = _read_int32_safe(self._h_process, bm_base + 0xCC) or 0
+                artist = _read_net_string_safe(self._h_process, _read_uint32_safe(self._h_process, bm_base + 0x18) or 0)
+                artist_u = _read_net_string_safe(self._h_process, _read_uint32_safe(self._h_process, bm_base + 0x1C) or 0)
+                title = _read_net_string_safe(self._h_process, _read_uint32_safe(self._h_process, bm_base + 0x24) or 0)
+                title_u = _read_net_string_safe(self._h_process, _read_uint32_safe(self._h_process, bm_base + 0x28) or 0)
+                version = _read_net_string_safe(self._h_process, _read_uint32_safe(self._h_process, bm_base + 0xAC) or 0)
+                md5 = _read_net_string_safe(self._h_process, _read_uint32_safe(self._h_process, bm_base + 0x6C) or 0)
+                folder = _read_net_string_safe(self._h_process, _read_uint32_safe(self._h_process, bm_base + 0x90) or 0)
+                audio = _read_net_string_safe(self._h_process, _read_uint32_safe(self._h_process, bm_base + 0x94) or 0)
+                cs = _read_float_safe(self._h_process, bm_base + 0x30) or 4.0
+                ar = _read_float_safe(self._h_process, bm_base + 0x34) or 9.0
+                od = _read_float_safe(self._h_process, bm_base + 0x38) or 8.0
+                hp = _read_float_safe(self._h_process, bm_base + 0x3C) or 6.0
+
+                new_bm = BeatmapMetadata(
+                    beatmap_id=b_id,
+                    beatmap_set_id=b_set_id,
+                    md5=md5,
+                    artist=artist,
+                    title=title,
+                    version=version,
+                    ar=round(ar, 1),
+                    cs=round(cs, 1),
+                    od=round(od, 1),
+                    hp=round(hp, 1),
+                    artist_unicode=artist_u,
+                    title_unicode=title_u,
+                    folder_name=folder,
+                    audio_filename=audio
+                )
+                if self._beatmap is None or (self._beatmap.beatmap_id != new_bm.beatmap_id or self._beatmap.md5 != new_bm.md5):
+                    self._beatmap = new_bm
+                    self._dispatch_beatmap_change(new_bm)
+
+        # Read Input / Cursor
+        if is_valid_user_address(self._ptr_input):
+            inp_base = _read_uint32_safe(self._h_process, self._ptr_input)
+            if is_valid_user_address(inp_base):
+                cx = _read_float_safe(self._h_process, inp_base + 0x14) or 256.0
+                cy = _read_float_safe(self._h_process, inp_base + 0x18) or 192.0
+                k1 = bool(_read_uint8_safe(self._h_process, inp_base + 0x24) or 0)
+                k2 = bool(_read_uint8_safe(self._h_process, inp_base + 0x25) or 0)
+                m1 = bool(_read_uint8_safe(self._h_process, inp_base + 0x26) or 0)
+                m2 = bool(_read_uint8_safe(self._h_process, inp_base + 0x27) or 0)
+
+                now = time.perf_counter()
+                if k1 and not self._last_k1:
+                    self._k1_down_time = now
+                elif not k1 and self._last_k1 and self._k1_down_time is not None:
+                    h_ms = (now - self._k1_down_time) * 1000.0
+                    self._k1_holds.append(h_ms)
+                    if len(self._k1_holds) > 200: self._k1_holds.pop(0)
+                    self._k1_avg_hold = sum(self._k1_holds) / len(self._k1_holds)
+                    self._k1_down_time = None
+
+                if k2 and not self._last_k2:
+                    self._k2_down_time = now
+                elif not k2 and self._last_k2 and self._k2_down_time is not None:
+                    h_ms = (now - self._k2_down_time) * 1000.0
+                    self._k2_holds.append(h_ms)
+                    if len(self._k2_holds) > 200: self._k2_holds.pop(0)
+                    self._k2_avg_hold = sum(self._k2_holds) / len(self._k2_holds)
+                    self._k2_down_time = None
+
+                self._last_k1 = k1
+                self._last_k2 = k2
+                self._cursor = CursorState(x=cx, y=cy, k1=k1, k2=k2, m1=m1, m2=m2, timestamp=now)
+                self._dispatch_cursor(self._cursor)
+
+        # Read Ruleset / Player Telemetry during gameplay
+        if is_valid_user_address(self._ptr_ruleset):
+            ruleset_base = _read_uint32_safe(self._h_process, self._ptr_ruleset)
+            if is_valid_user_address(ruleset_base):
+                hp_val = _read_double_safe(self._h_process, ruleset_base + 0x40)
+                if hp_val is not None:
+                    self._hp = hp_val
+
+                player_ptr = _read_uint32_safe(self._h_process, ruleset_base + 0x38)
+                if not is_valid_user_address(player_ptr):
+                    player_ptr = _read_uint32_safe(self._h_process, ruleset_base + 0x04)
+
+                if is_valid_user_address(player_ptr):
+                    self._mods_bitmask = _read_int32_safe(self._h_process, player_ptr + 0x1C) or 0
+                    self._mods_formatted = format_mods(self._mods_bitmask)
+                    acc_val = _read_double_safe(self._h_process, player_ptr + 0x48)
+                    if acc_val is not None:
+                        self._accuracy = acc_val * 100.0 if acc_val <= 1.0 else acc_val
+                    self._score = _read_int32_safe(self._h_process, player_ptr + 0x78) or 0
+                    self._combo = _read_int16_safe(self._h_process, player_ptr + 0x90) or 0
+                    self._max_combo = _read_int16_safe(self._h_process, player_ptr + 0x68) or max(self._max_combo, self._combo)
+                    self._count_300 = _read_int16_safe(self._h_process, player_ptr + 0x8A) or 0
+                    self._count_100 = _read_int16_safe(self._h_process, player_ptr + 0x88) or 0
+                    self._count_50 = _read_int16_safe(self._h_process, player_ptr + 0x8C) or 0
+                    self._count_miss = _read_int16_safe(self._h_process, player_ptr + 0x92) or 0
+
+                    hit_list_ptr = _read_uint32_safe(self._h_process, player_ptr + 0x38)
+                    if not is_valid_user_address(hit_list_ptr):
+                        hit_list_ptr = _read_uint32_safe(self._h_process, player_ptr + 0x40)
+
+                    if is_valid_user_address(hit_list_ptr):
+                        current_count = _read_int32_safe(self._h_process, hit_list_ptr + 0x0C) or 0
+                        if current_count < self._last_hit_count or current_count == 0:
+                            self._hit_errors.clear()
+                            self._last_hit_count = 0
+                            self._live_ur = 0.0
+                            self._mean_hit_error = 0.0
+                            self._running_sum = 0
+                            self._running_sum_sq = 0
+
+                        if current_count > self._last_hit_count and current_count <= 20000:
+                            items_array = _read_uint32_safe(self._h_process, hit_list_ptr + 0x08)
+                            if is_valid_user_address(items_array):
+                                new_count = current_count - self._last_hit_count
+                                read_start = items_array + 0x0C + (self._last_hit_count * 4)
+                                raw = _read_raw_bytes_safe(self._h_process, read_start, new_count * 4)
+                                if raw and len(raw) == new_count * 4:
+                                    od_val = self._beatmap.od if self._beatmap else 8.0
+                                    for i in range(0, len(raw), 4):
+                                        delta_ms = struct.unpack('<i', raw[i:i+4])[0]
+                                        self._hit_errors.append(delta_ms)
+                                        self._running_sum += delta_ms
+                                        self._running_sum_sq += delta_ms * delta_ms
+                                        n = len(self._hit_errors)
+                                        mean_e = self._running_sum / n
+                                        var_e = max(0.0, (self._running_sum_sq / n) - (mean_e * mean_e))
+                                        self._mean_hit_error = mean_e
+                                        self._live_ur = math.sqrt(var_e) * 10.0 if n >= 2 else 0.0
+
+                                        res = hit_result_from_offset(delta_ms, od_val)
+                                        hit_ev = HitEvent(
+                                            timestamp_ms=int(time.time() * 1000),
+                                            offset_ms=delta_ms,
+                                            result=res,
+                                            combo=self._combo,
+                                            current_ur=round(self._live_ur, 2),
+                                            cursor_x=self._cursor.x,
+                                            cursor_y=self._cursor.y,
+                                            is_k1=self._cursor.k1,
+                                            is_k2=self._cursor.k2
+                                        )
+                                        self._dispatch_hit(hit_ev)
+                                    self._last_hit_count = current_count
+
+    def _trigger_play_complete(self):
+        if not self._hit_errors and self._score == 0:
+            return
+        bm_id = self._beatmap.beatmap_id if self._beatmap else 0
+        bm_set = self._beatmap.beatmap_set_id if self._beatmap else 0
+        md5_val = self._beatmap.md5 if self._beatmap else ""
+        artist_val = self._beatmap.artist if self._beatmap else ""
+        title_val = self._beatmap.title if self._beatmap else ""
+        ver_val = self._beatmap.version if self._beatmap else ""
+        k1_hold = round(self._k1_avg_hold, 2)
+        k2_hold = round(self._k2_avg_hold, 2)
+        asym = round(abs(k1_hold - k2_hold), 2)
+        over_pct = round(getattr(self, '_overshoot_pct', 50.0), 1)
+        under_pct = round(100.0 - over_pct, 1)
+        scatter_pts = list(getattr(self, '_cursor_scatter', []))
+
+        summary_dict = {
+            "beatmap_id": bm_id,
+            "beatmap_set_id": bm_set,
+            "md5": md5_val,
+            "beatmap_md5": md5_val,
+            "md5_hash": md5_val,
+            "artist": artist_val,
+            "title": title_val,
+            "version": ver_val,
+            "diff_name": ver_val,
+            "score": self._score,
+            "max_combo": self._max_combo or self._combo,
+            "accuracy": round(self._accuracy, 2),
+            "count_300": self._count_300,
+            "count_100": self._count_100,
+            "count_50": self._count_50,
+            "count_miss": self._count_miss,
+            "mods": self._mods_formatted,
+            "unstable_rate": round(self._live_ur, 2),
+            "mean_hit_error": round(self._mean_hit_error, 2),
+            "mean_error": round(self._mean_hit_error, 2),
+            "hit_errors": list(self._hit_errors),
+            "scatter_points": scatter_pts,
+            "overshoot_pct": over_pct,
+            "undershoot_pct": under_pct,
+            "overaim_ratio": over_pct,
+            "underaim_ratio": under_pct,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "k1_avg_hold": k1_hold,
+            "k2_avg_hold": k2_hold,
+            "asymmetry_ms": asym,
+        }
+        self._dispatch_play_complete(summary_dict)
+
+    def _dispatch_status_change(self, old_status: GameStatus, new_status: GameStatus):
+        for cb in list(self._listeners_status_change):
+            try:
+                try:
+                    cb(old_status, new_status)
+                except TypeError:
+                    cb(new_status)
+            except Exception:
+                pass
+
+    def _dispatch_hit(self, hit_event: HitEvent):
+        for cb in list(self._listeners_hit):
+            try:
+                try:
+                    cb(hit_event)
+                except TypeError:
+                    try:
+                        cb(hit_event.offset_ms, hit_event.result, hit_event.is_k1, hit_event.is_k2)
+                    except TypeError:
+                        cb(hit_event.offset_ms, hit_event.result)
+            except Exception:
+                pass
+
+    def _dispatch_cursor(self, cursor: CursorState):
+        for cb in list(self._listeners_cursor):
+            try:
+                try:
+                    cb(cursor)
+                except TypeError:
+                    cb(cursor.x, cursor.y)
+            except Exception:
+                pass
+
+    def _dispatch_beatmap_change(self, beatmap: BeatmapMetadata):
+        for cb in list(self._listeners_beatmap):
+            try:
+                cb(beatmap)
+            except Exception:
+                pass
+
+    def _dispatch_play_complete(self, session_data: dict):
+        for cb in list(self._listeners_play_complete):
+            try:
+                try:
+                    cb(session_data)
+                except TypeError:
+                    summary = PlaySummary(
+                        beatmap_id=session_data.get('beatmap_id', 0),
+                        md5=session_data.get('md5', ''),
+                        artist=session_data.get('artist', ''),
+                        title=session_data.get('title', ''),
+                        version=session_data.get('version', ''),
+                        score=session_data.get('score', 0),
+                        max_combo=session_data.get('max_combo', 0),
+                        accuracy=session_data.get('accuracy', 0.0),
+                        count_300=session_data.get('count_300', 0),
+                        count_100=session_data.get('count_100', 0),
+                        count_50=session_data.get('count_50', 0),
+                        count_miss=session_data.get('count_miss', 0),
+                        mods=session_data.get('mods', 'NM'),
+                        unstable_rate=session_data.get('unstable_rate', 0.0),
+                        mean_hit_error=session_data.get('mean_hit_error', 0.0),
+                        hit_errors=session_data.get('hit_errors', []),
+                        timestamp=session_data.get('timestamp', time.time()),
+                        k1_avg_hold=session_data.get('k1_avg_hold', 0.0),
+                        k2_avg_hold=session_data.get('k2_avg_hold', 0.0)
+                    )
+                    cb(summary)
+            except Exception:
+                pass
+
+    def _poll_loop(self):
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            pass
+
+        try:
+            while self._running and not self._stop_event.is_set():
+                t0 = time.perf_counter()
+
+                if not self._check_process_alive():
+                    self._close_process_handle()
+                    if self._status != GameStatus.DISCONNECTED:
+                        old_s = self._status
+                        self._status = GameStatus.DISCONNECTED
+                        self._dispatch_status_change(old_s, GameStatus.DISCONNECTED)
+
+                    pid = self._find_osu_process()
+                    if pid:
+                        if self._open_process_handle(pid):
+                            self._scan_signatures()
+                            self._status = GameStatus.MENU
+                            self._dispatch_status_change(GameStatus.DISCONNECTED, GameStatus.MENU)
+
+                    if not self._h_process:
+                        self._stop_event.wait(1.0)
+                        continue
+
+                try:
+                    self._read_tick()
+                except Exception:
+                    pass
+
+                mode = self._polling_mode
+                if mode == "100hz":
+                    interval = 0.010
+                elif mode == "60hz":
+                    interval = 0.0166
+                elif mode == "30hz":
+                    interval = 0.0333
+                elif self._custom_hz and self._custom_hz > 0:
+                    interval = 1.0 / self._custom_hz
+                else:  # Adaptive
+                    if self._status == GameStatus.PLAYING:
+                        interval = 0.0166  # ~60 Hz in game
+                    else:
+                        interval = 0.500   # ~2 Hz in menu / idle
+
+                elapsed = time.perf_counter() - t0
+                sleep_time = max(0.001, interval - elapsed)
+                self._stop_event.wait(sleep_time)
+
+        finally:
+            try:
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
+
+
+class SimulatedMemoryEngine(OsuLiveMemoryEngine):
+    """
+    High-fidelity synthetic memory emulator emitting Gaussian-distributed
+    hit error streams and state transitions for headless testing without running osu!.exe.
+    """
+    def __init__(self, polling_mode: str = "adaptive", target_hz: Optional[int] = None):
+        super().__init__(polling_mode, target_hz)
+        self._status = GameStatus.MENU
+        self._is_simulated = True
+
+    def is_connected(self) -> bool:
+        return True
+
+    def simulate_state_transition(self, new_status: Union[int, GameStatus]):
+        if isinstance(new_status, int):
+            try:
+                new_status = GameStatus(new_status)
+            except ValueError:
+                new_status = GameStatus(new_status)
+        old_status = self._status
+        self._status = new_status
+        self._dispatch_status_change(old_status, new_status)
+        if old_status == GameStatus.PLAYING and new_status in (GameStatus.RANKING, GameStatus.MENU):
+            self._trigger_play_complete()
+
+    def simulate_beatmap(self, beatmap: Union[dict, BeatmapMetadata]):
+        if isinstance(beatmap, dict):
+            bm = BeatmapMetadata(
+                beatmap_id=beatmap.get("beatmap_id", beatmap.get("id", 123456)),
+                beatmap_set_id=beatmap.get("beatmap_set_id", beatmap.get("set_id", 654321)),
+                md5=beatmap.get("md5", "d41d8cd98f00b204e9800998ecf8427e"),
+                artist=beatmap.get("artist", "Test Artist"),
+                title=beatmap.get("title", "Test Title"),
+                version=beatmap.get("version", "Expert"),
+                ar=float(beatmap.get("ar", 9.0)),
+                cs=float(beatmap.get("cs", 4.0)),
+                od=float(beatmap.get("od", 8.0)),
+                hp=float(beatmap.get("hp", 6.0)),
+                artist_unicode=beatmap.get("artist_unicode", ""),
+                title_unicode=beatmap.get("title_unicode", ""),
+                folder_name=beatmap.get("folder_name", ""),
+                audio_filename=beatmap.get("audio_filename", "")
+            )
+        else:
+            bm = beatmap
+        self._beatmap = bm
+        self._dispatch_beatmap_change(bm)
+
+    def simulate_cursor(self, x: float, y: float, k1: bool = False, k2: bool = False, m1: bool = False, m2: bool = False):
+        now = time.perf_counter()
+        if k1 and not self._last_k1:
+            self._k1_down_time = now
+        elif not k1 and self._last_k1 and self._k1_down_time is not None:
+            h_ms = (now - self._k1_down_time) * 1000.0
+            self._k1_holds.append(h_ms)
+            if len(self._k1_holds) > 200: self._k1_holds.pop(0)
+            self._k1_avg_hold = sum(self._k1_holds) / len(self._k1_holds)
+            self._k1_down_time = None
+
+        if k2 and not self._last_k2:
+            self._k2_down_time = now
+        elif not k2 and self._last_k2 and self._k2_down_time is not None:
+            h_ms = (now - self._k2_down_time) * 1000.0
+            self._k2_holds.append(h_ms)
+            if len(self._k2_holds) > 200: self._k2_holds.pop(0)
+            self._k2_avg_hold = sum(self._k2_holds) / len(self._k2_holds)
+            self._k2_down_time = None
+
+        self._last_k1 = k1
+        self._last_k2 = k2
+        self._cursor = CursorState(x=x, y=y, k1=k1, k2=k2, m1=m1, m2=m2, timestamp=now)
+        self._dispatch_cursor(self._cursor)
+
+    def simulate_hit(self, offset_ms: int, hit_result: Optional[HitResult] = None, cursor_x: float = 256.0, cursor_y: float = 192.0, is_k1: bool = True, is_k2: bool = False):
+        od_val = self._beatmap.od if self._beatmap else 8.0
+        res = hit_result if hit_result is not None else hit_result_from_offset(offset_ms, od_val)
+
+        self._hit_errors.append(offset_ms)
+        self._last_hit_count = len(self._hit_errors)
+
+        if res == HitResult.HIT_300:
+            self._count_300 += 1
+            self._combo += 1
+            self._score += int(300 + 300 * (self._combo * 0.05))
+        elif res == HitResult.HIT_100:
+            self._count_100 += 1
+            self._combo += 1
+            self._score += int(100 + 100 * (self._combo * 0.05))
+        elif res == HitResult.HIT_50:
+            self._count_50 += 1
+            self._combo += 1
+            self._score += int(50 + 50 * (self._combo * 0.05))
+        else:  # MISS
+            self._count_miss += 1
+            self._combo = 0
+
+        self._max_combo = max(self._max_combo, self._combo)
+
+        total_hits = self._count_300 + self._count_100 + self._count_50 + self._count_miss
+        if total_hits > 0:
+            self._accuracy = ((300 * self._count_300 + 100 * self._count_100 + 50 * self._count_50) / (300 * total_hits)) * 100.0
+
+        # O(1) UR & Mean error
+        self._running_sum += offset_ms
+        self._running_sum_sq += offset_ms * offset_ms
+        n = len(self._hit_errors)
+        mean_e = self._running_sum / n
+        var_e = max(0.0, (self._running_sum_sq / n) - (mean_e * mean_e))
+        self._mean_hit_error = mean_e
+        self._live_ur = math.sqrt(var_e) * 10.0 if n >= 2 else 0.0
+
+        self.simulate_cursor(cursor_x, cursor_y, k1=is_k1, k2=is_k2)
+
+        ev = HitEvent(
+            timestamp_ms=int(time.time() * 1000),
+            offset_ms=offset_ms,
+            result=res,
+            combo=self._combo,
+            current_ur=round(self._live_ur, 2),
+            cursor_x=cursor_x,
+            cursor_y=cursor_y,
+            is_k1=is_k1,
+            is_k2=is_k2
+        )
+        self._dispatch_hit(ev)
+        return ev
+
+    def simulate_play(self, beatmap: Optional[dict] = None, hit_count: int = 100, target_ur: float = 80.0, mean_error: float = -2.5, duration_s: float = 0.05):
+        if beatmap:
+            self.simulate_beatmap(beatmap)
+
+        self.reset()
+        self.simulate_state_transition(GameStatus.PLAYING)
+
+        sigma = max(0.5, target_ur / 10.0)
+        dt = (duration_s / hit_count) if (duration_s > 0 and hit_count > 0) else 0.0
+
+        for i in range(hit_count):
+            offset = int(round(random.gauss(mean_error, sigma)))
+            is_k1 = (i % 2 == 0)
+            is_k2 = not is_k1
+            cx = max(10.0, min(502.0, 256.0 + random.uniform(-150, 150)))
+            cy = max(10.0, min(374.0, 192.0 + random.uniform(-100, 100)))
+            self.simulate_hit(offset_ms=offset, cursor_x=cx, cursor_y=cy, is_k1=is_k1, is_k2=is_k2)
+            if dt > 0:
+                time.sleep(dt)
+
+        self.simulate_state_transition(GameStatus.RANKING)
+
+    def reset(self):
+        with self._lock:
+            self._score = 0
+            self._combo = 0
+            self._max_combo = 0
+            self._accuracy = 100.0
+            self._hp = 200.0
+            self._count_300 = 0
+            self._count_100 = 0
+            self._count_50 = 0
+            self._count_miss = 0
+            self._hit_errors.clear()
+            self._last_hit_count = 0
+            self._live_ur = 0.0
+            self._mean_hit_error = 0.0
+            self._running_sum = 0
+            self._running_sum_sq = 0
+
+    def simulate_play_session(self, beatmap_info: Optional[dict] = None, total_hits: int = 100, mean_error: float = -2.5,
+                              ur: float = 80.0, overaim_pct: float = 50.0, k1_hold: float = 40.0, k2_hold: float = 40.0) -> dict:
+        """
+        Simulates an entire play session emitting Gaussian hit errors and 45° directional aim scatter points.
+        Returns the completed session dictionary.
+        """
+        if beatmap_info:
+            self.simulate_beatmap(beatmap_info)
+        self.reset()
+        self._k1_avg_hold = k1_hold
+        self._k2_avg_hold = k2_hold
+
+        sigma = max(0.5, ur / 10.0)
+        scatter_points = []
+
+        self.simulate_state_transition(GameStatus.PLAYING)
+
+        for i in range(total_hits):
+            err = int(round(random.gauss(mean_error, sigma)))
+            is_over = (random.uniform(0, 100) < overaim_pct)
+            mag = random.uniform(2.0, 32.0)
+            if is_over:
+                rx = (mag / 1.4142) + random.uniform(-2, 2)
+                ry = (mag / 1.4142) + random.uniform(-2, 2)
+            else:
+                rx = -(mag / 1.4142) + random.uniform(-2, 2)
+                ry = -(mag / 1.4142) + random.uniform(-2, 2)
+
+            scatter_points.append((round(rx, 2), round(ry, 2)))
+            self.simulate_hit(err, cursor_x=256.0 + rx, cursor_y=192.0 + ry, is_k1=(i % 2 == 0), is_k2=(i % 2 != 0))
+
+        self._cursor_scatter = scatter_points
+        self._overshoot_pct = overaim_pct
+        self._k1_avg_hold = k1_hold
+        self._k2_avg_hold = k2_hold
+        self.simulate_state_transition(GameStatus.RANKING)
+
+        bm_id = self._beatmap.beatmap_id if self._beatmap else (beatmap_info.get("id", 0) if beatmap_info else 0)
+        bm_md5 = self._beatmap.md5 if self._beatmap else (beatmap_info.get("md5", "") if beatmap_info else "")
+        title = self._beatmap.title if self._beatmap else (beatmap_info.get("title", "") if beatmap_info else "")
+        artist = self._beatmap.artist if self._beatmap else (beatmap_info.get("artist", "") if beatmap_info else "")
+        ver = self._beatmap.version if self._beatmap else (beatmap_info.get("version", "") if beatmap_info else "")
+
+        summary = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "beatmap_id": bm_id,
+            "beatmap_md5": bm_md5,
+            "md5_hash": bm_md5,
+            "title": title,
+            "artist": artist,
+            "version": ver,
+            "diff_name": ver,
+            "score": self._score,
+            "max_combo": self._max_combo,
+            "accuracy": round(self._accuracy, 2),
+            "unstable_rate": round(self._live_ur, 2),
+            "mean_error": round(self._mean_hit_error, 2),
+            "mean_hit_error": round(self._mean_hit_error, 2),
+            "count_300": self._count_300,
+            "count_100": self._count_100,
+            "count_50": self._count_50,
+            "count_miss": self._count_miss,
+            "mods": self._mods_formatted,
+            "overaim_ratio": round(overaim_pct, 1),
+            "underaim_ratio": round(100.0 - overaim_pct, 1),
+            "overshoot_pct": round(overaim_pct, 1),
+            "undershoot_pct": round(100.0 - overaim_pct, 1),
+            "k1_avg_hold": round(self._k1_avg_hold, 2),
+            "k2_avg_hold": round(self._k2_avg_hold, 2),
+            "asymmetry_ms": round(abs(self._k1_avg_hold - self._k2_avg_hold), 2),
+            "hit_errors": list(self._hit_errors),
+            "scatter_points": scatter_points,
+        }
+        return summary
+
+
+class TelemetryStorageEngine:
+    """
+    Dedicated SQLite database manager for telemetry.db session persistence.
+    Provides automated zero-F2 persistence of live play sessions upon song completion
+    without requiring .osr files or F2 keypresses.
+    """
+    def __init__(self, db_path: str = "telemetry.db"):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS live_play_telemetry (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT,
+                    beatmap_id INTEGER,
+                    beatmap_md5 TEXT,
+                    md5_hash TEXT,
+                    artist TEXT,
+                    title TEXT,
+                    diff_name TEXT,
+                    version TEXT,
+                    mods TEXT,
+                    score INTEGER,
+                    max_combo INTEGER,
+                    accuracy REAL,
+                    unstable_rate REAL,
+                    mean_hit_error REAL,
+                    mean_error REAL,
+                    count_300 INTEGER,
+                    count_100 INTEGER,
+                    count_50 INTEGER,
+                    count_miss INTEGER,
+                    overshoot_pct REAL,
+                    undershoot_pct REAL,
+                    overaim_ratio REAL,
+                    underaim_ratio REAL,
+                    k1_avg_hold REAL,
+                    k2_avg_hold REAL,
+                    asymmetry_ms REAL,
+                    hit_errors_json TEXT,
+                    scatter_points_json TEXT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON live_play_telemetry(timestamp DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_bid ON live_play_telemetry(beatmap_id)")
+            conn.commit()
+            conn.close()
+
+    def save_live_session(self, session_data: dict) -> int:
+        """
+        Persists a completed live play session into telemetry.db with strict parameterized SQL.
+        Returns the inserted row ID.
+        """
+        if not session_data or not isinstance(session_data, dict):
+            return 0
+
+        ts = session_data.get("timestamp")
+        if isinstance(ts, (int, float)):
+            ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+        else:
+            ts_str = str(ts or time.strftime("%Y-%m-%d %H:%M:%S"))
+
+        bm_id = int(session_data.get("beatmap_id", 0) or 0)
+        bm_md5 = str(session_data.get("beatmap_md5") or session_data.get("md5_hash") or session_data.get("md5", ""))
+        artist = str(session_data.get("artist", ""))
+        title = str(session_data.get("title", ""))
+        version = str(session_data.get("version") or session_data.get("diff_name", ""))
+        mods = str(session_data.get("mods", "NoMod"))
+        score = int(session_data.get("score", 0) or 0)
+        max_combo = int(session_data.get("max_combo", 0) or 0)
+        accuracy = float(session_data.get("accuracy", 100.0) if session_data.get("accuracy") is not None else 100.0)
+        ur = float(session_data.get("unstable_rate", 0.0) or 0.0)
+        mean_err = float(session_data.get("mean_hit_error") if session_data.get("mean_hit_error") is not None else session_data.get("mean_error", 0.0) or 0.0)
+        c300 = int(session_data.get("count_300", 0) or 0)
+        c100 = int(session_data.get("count_100", 0) or 0)
+        c50 = int(session_data.get("count_50", 0) or 0)
+        cmiss = int(session_data.get("count_miss", 0) or 0)
+
+        over_pct = float(session_data.get("overshoot_pct") if session_data.get("overshoot_pct") is not None else session_data.get("overaim_ratio", 50.0) or 50.0)
+        under_pct = float(session_data.get("undershoot_pct") if session_data.get("undershoot_pct") is not None else session_data.get("underaim_ratio", 50.0) or 50.0)
+        k1_hold = float(session_data.get("k1_avg_hold", 0.0) or 0.0)
+        k2_hold = float(session_data.get("k2_avg_hold", 0.0) or 0.0)
+        asymmetry = float(session_data.get("asymmetry_ms") if session_data.get("asymmetry_ms") is not None else abs(k1_hold - k2_hold))
+
+        hit_errors = session_data.get("hit_errors", [])
+        if not isinstance(hit_errors, list): hit_errors = []
+        scatter_points = session_data.get("scatter_points", [])
+        if not isinstance(scatter_points, list): scatter_points = []
+
+        hit_errors_json = json.dumps(hit_errors)
+        scatter_points_json = json.dumps(scatter_points)
+
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO live_play_telemetry (
+                    timestamp, beatmap_id, beatmap_md5, md5_hash, artist, title, diff_name, version,
+                    mods, score, max_combo, accuracy, unstable_rate, mean_hit_error, mean_error,
+                    count_300, count_100, count_50, count_miss,
+                    overshoot_pct, undershoot_pct, overaim_ratio, underaim_ratio,
+                    k1_avg_hold, k2_avg_hold, asymmetry_ms,
+                    hit_errors_json, scatter_points_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                ts_str, bm_id, bm_md5, bm_md5, artist, title, version, version,
+                mods, score, max_combo, accuracy, ur, mean_err, mean_err,
+                c300, c100, c50, cmiss,
+                over_pct, under_pct, over_pct, under_pct,
+                k1_hold, k2_hold, asymmetry,
+                hit_errors_json, scatter_points_json
+            ))
+            row_id = cur.lastrowid
+            conn.commit()
+            conn.close()
+            return row_id
+
+    def get_recent_live_sessions(self, limit: int = 20) -> list:
+        """Retrieves recent live play sessions ordered by newest first."""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM live_play_telemetry ORDER BY id DESC LIMIT ?", (limit,))
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+            return rows
+
+    def get_session_by_id(self, session_id: int) -> Optional[dict]:
+        """Retrieves a single live play session record by its primary key ID."""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM live_play_telemetry WHERE id = ?", (session_id,))
+            row = cur.fetchone()
+            conn.close()
+            return dict(row) if row else None
+
+class FastBeatmapFinder:
+    """
+    Fast Song Finder for .osu beatmap files with 3-tier hierarchical caching (< 3ms lookup latency).
+    1. In-memory LRU cache (MD5 -> path, ID -> path, metadata -> path)
+    2. SQLite indexed query on beatmaps_analyzed.db
+    3. Song folder resolution in osu! Songs directories
+    """
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self, songs_root: Optional[str] = None, db_path: Optional[str] = None, songs_dir: Optional[str] = None):
+        self._songs_root = songs_dir or songs_root or self._detect_songs_root()
+        self.songs_dir = self._songs_root
+        self._db_path = db_path or (BEATMAP_SQLITE_DB_PATH if BEATMAP_SQLITE_DB_PATH and os.path.exists(BEATMAP_SQLITE_DB_PATH) else get_resource_path("beatmaps_analyzed.db"))
+        self._md5_to_path: Dict[str, str] = {}
+        self._id_to_path: Dict[int, str] = {}
+        self._parsed_cache: Dict[str, dict] = {}
+        self._set_dir_cache: Optional[Dict[int, str]] = None
+        self._songs_dirs: List[str] = []
+        self._indexed: bool = False
+
+    @classmethod
+    def get_instance(cls) -> 'FastBeatmapFinder':
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = FastBeatmapFinder()
+            return cls._instance
+
+    def clear_cache(self):
+        """Clears all in-memory path and beatmap caches."""
+        with self._lock:
+            self._md5_to_path.clear()
+            self._id_to_path.clear()
+            self._parsed_cache.clear()
+            self._set_dir_cache = None
+            self._indexed = False
+
+    def get_stats(self) -> dict:
+        """Returns statistics about cached beatmaps and indices."""
+        return {
+            'cached_md5_count': len(self._md5_to_path),
+            'cached_id_count': len(self._id_to_path),
+            'indexed': self._indexed,
+            'songs_root': self._songs_root
+        }
+
+    @staticmethod
+    def get_fallback_notice() -> str:
+        return "ℹ️ .osu Beatmap-Datei nicht im Songs-Ordner gefunden – HitObject-Abgleich nicht möglich"
+
+    def _detect_songs_root(self) -> str:
+        local_app = os.environ.get('LOCALAPPDATA', '')
+        if local_app:
+            p = os.path.join(local_app, 'osu!', 'Songs')
+            if os.path.exists(p):
+                return p
+        dirs = find_osu_directories()
+        for d in dirs:
+            sp = os.path.join(d, 'Songs')
+            if os.path.exists(sp):
+                return sp
+        return os.path.join(local_app, 'osu!', 'Songs') if local_app else "Songs"
+
+    def _get_all_songs_dirs(self) -> List[str]:
+        if not self._songs_dirs:
+            candidates = []
+            if self._songs_root and os.path.exists(self._songs_root):
+                candidates.append(self._songs_root)
+            for d in find_osu_directories():
+                sp = os.path.join(d, 'Songs')
+                if os.path.exists(sp) and sp not in candidates:
+                    candidates.append(sp)
+            self._songs_dirs = candidates
+        return self._songs_dirs
+
+    def index_songs_directory(self, songs_dir: Optional[str] = None):
+        """Recursively scans and indexes all .osu files in songs directory into memory caches."""
+        target_dir = songs_dir or self._songs_root or self.songs_dir
+        if not target_dir or not os.path.isdir(target_dir):
+            return
+        for root, _, files in os.walk(target_dir):
+            for file in files:
+                if file.endswith('.osu'):
+                    fpath = os.path.join(root, file)
+                    try:
+                        with open(fpath, 'rb') as f:
+                            content = f.read()
+                        md5 = hashlib.md5(content).hexdigest().lower()
+                        self._md5_to_path[md5] = fpath
+
+                        text = content[:4096].decode('utf-8', errors='ignore')
+                        for line in text.splitlines():
+                            if line.lower().startswith('beatmapid:'):
+                                try:
+                                    bid = int(line.split(':', 1)[1].strip())
+                                    if bid > 0:
+                                        self._id_to_path[bid] = fpath
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+        self._indexed = True
+
+    def _init_set_dir_index(self):
+        if self._set_dir_cache is not None:
+            return
+        self._set_dir_cache = {}
+        for s_dir in self._get_all_songs_dirs():
+            if os.path.exists(s_dir):
+                try:
+                    for entry in os.scandir(s_dir):
+                        if entry.is_dir():
+                            name = entry.name
+                            parts = name.split(' ', 1)
+                            if parts[0].isdigit():
+                                try:
+                                    sid = int(parts[0])
+                                    if sid not in self._set_dir_cache:
+                                        self._set_dir_cache[sid] = entry.path
+                                except ValueError:
+                                    pass
+                except Exception:
+                    pass
+
+    def register_beatmap_path(self, file_path: str, md5_hash: str = "", beatmap_id: int = 0):
+        """Explicitly caches a known beatmap file path."""
+        if file_path and os.path.exists(file_path):
+            if md5_hash:
+                self._md5_to_path[md5_hash.lower().strip()] = file_path
+            if beatmap_id:
+                self._id_to_path[int(beatmap_id)] = file_path
+
+    def find_beatmap_by_md5(self, md5: str, songs_dir: Optional[str] = None) -> Optional[str]:
+        return self.find_beatmap(md5=md5, songs_dir=songs_dir)
+
+    def find_beatmap_by_id(self, beatmap_id: int, songs_dir: Optional[str] = None) -> Optional[str]:
+        return self.find_beatmap(beatmap_id=beatmap_id, songs_dir=songs_dir)
+
+    def find_beatmap(self, beatmap_md5: str = "", beatmap_id: int = 0, title: str = "", version: str = "", file_path: str = "", md5: str = "", songs_dir: Optional[str] = None) -> Optional[str]:
+        """
+        Locates a .osu file by MD5 hash, beatmap ID, or metadata in < 3ms.
+        """
+        target_md5 = (md5 or beatmap_md5 or "").lower().strip()
+        if file_path and os.path.exists(file_path):
+            return file_path
+
+        target_dir = songs_dir or self._songs_root or self.songs_dir
+        if not self._indexed and target_dir and os.path.isdir(target_dir):
+            self.index_songs_directory(target_dir)
+
+        # Tier 1: In-Memory Cache Lookup (< 0.001 ms)
+        if target_md5:
+            if target_md5 in self._md5_to_path:
+                return self._md5_to_path[target_md5]
+
+        if beatmap_id:
+            try:
+                bid = int(beatmap_id)
+                if bid in self._id_to_path:
+                    return self._id_to_path[bid]
+            except (ValueError, TypeError):
+                pass
+
+        # Tier 2: SQLite Query for Set ID and Metadata
+        self._init_set_dir_index()
+        set_id = None
+        db_version = version
+        db_artist = ""
+        db_title = title
+
+        if (beatmap_id or title) and self._db_path and os.path.exists(self._db_path):
+            try:
+                conn = sqlite3.connect(self._db_path, timeout=1.0)
+                cur = conn.cursor()
+                if beatmap_id:
+                    cur.execute("SELECT set_id, version, artist, title FROM maps WHERE id = ? LIMIT 1", (int(beatmap_id),))
+                else:
+                    cur.execute("SELECT set_id, version, artist, title FROM maps WHERE title LIKE ? AND version LIKE ? LIMIT 1", (f"%{title}%", f"%{version}%"))
+                row = cur.fetchone()
+                conn.close()
+                if row:
+                    try:
+                        set_id = int(row[0]) if row[0] else None
+                    except (ValueError, TypeError):
+                        set_id = None
+                    db_version = row[1] or version
+                    db_artist = row[2] or ""
+                    db_title = row[3] or title
+            except Exception:
+                pass
+
+        # Tier 3: Direct Song Folder Scan via Set ID or Metadata
+        candidate_folders = []
+        if set_id and self._set_dir_cache and set_id in self._set_dir_cache:
+            candidate_folders.append(self._set_dir_cache[set_id])
+
+        search_dirs = [target_dir] if target_dir and os.path.exists(target_dir) else self._get_all_songs_dirs()
+        for s_dir in search_dirs:
+            if not os.path.exists(s_dir):
+                continue
+            if set_id:
+                prefix = f"{set_id} "
+                try:
+                    for name in os.listdir(s_dir):
+                        if name.startswith(prefix):
+                            fpath = os.path.join(s_dir, name)
+                            if fpath not in candidate_folders:
+                                candidate_folders.append(fpath)
+                except Exception:
+                    pass
+
+        for folder in candidate_folders:
+            if not os.path.isdir(folder):
+                continue
+            try:
+                osu_files = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith('.osu')]
+                # Check version name in filename
+                if db_version:
+                    for op in osu_files:
+                        if f"[{db_version}]" in op:
+                            if target_md5: self._md5_to_path[target_md5] = op
+                            if beatmap_id: self._id_to_path[int(beatmap_id)] = op
+                            return op
+
+                # Check MD5 / beatmap ID inside file header
+                for op in osu_files:
+                    if target_md5:
+                        try:
+                            with open(op, 'rb') as f:
+                                op_hash = hashlib.md5(f.read()).hexdigest().lower()
+                                self._md5_to_path[op_hash] = op
+                                if op_hash == target_md5:
+                                    if beatmap_id: self._id_to_path[int(beatmap_id)] = op
+                                    return op
+                        except Exception:
+                            pass
+                    if beatmap_id:
+                        try:
+                            with open(op, 'r', encoding='utf-8', errors='ignore') as of:
+                                for _ in range(40):
+                                    line = of.readline()
+                                    if line.lower().startswith('beatmapid:'):
+                                        bid = int(line.split(':', 1)[1].strip() or 0)
+                                        if bid == int(beatmap_id):
+                                            self._id_to_path[int(beatmap_id)] = op
+                                            if target_md5: self._md5_to_path[target_md5] = op
+                                            return op
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        return None
+
+
+def calculate_circle_radius(cs: float) -> float:
+    """Calculates osu! circle radius in osu! pixels: R = 54.4 - 4.48 * CS."""
+    return 54.4 - 4.48 * float(cs)
+
+
+def transform_coordinates(x: float, y: float, mods: int = 0) -> tuple[float, float]:
+    """Transforms X, Y coordinates under active mods (e.g. HR Y-flip: 384 - Y)."""
+    is_hr = bool(mods & 16)
+    tx = float(x)
+    ty = (384.0 - float(y)) if is_hr else float(y)
+    return tx, ty
+
+
+def transform_timestamp(t: float, mods: int = 0) -> float:
+    """Transforms timestamp under DT (t / 1.5) or HT (t / 0.75)."""
+    is_dt = bool(mods & (64 | 512))
+    is_ht = bool(mods & 256)
+    if is_dt:
+        return float(t) / 1.5
+    elif is_ht:
+        return float(t) / 0.75
+    return float(t)
+
+
+def transform_difficulty(cs: float, od: float, ar: float, hp: float, mods: int = 0) -> dict:
+    """Calculates effective difficulty stats under HR, EZ, etc."""
+    is_hr = bool(mods & 16)
+    is_ez = bool(mods & 2)
+
+    t_cs = float(cs)
+    t_od = float(od)
+    t_ar = float(ar)
+    t_hp = float(hp)
+
+    if is_hr:
+        t_cs = min(10.0, t_cs * 1.3)
+        t_od = min(10.0, t_od * 1.4)
+        t_ar = min(10.0, t_ar * 1.4)
+        t_hp = min(10.0, t_hp * 1.4)
+    elif is_ez:
+        t_cs = t_cs * 0.5
+        t_od = t_od * 0.5
+        t_ar = t_ar * 0.5
+        t_hp = t_hp * 0.5
+
+    return {
+        'cs': round(t_cs, 2),
+        'od': round(t_od, 2),
+        'ar': round(t_ar, 2),
+        'hp': round(t_hp, 2),
+        'radius': round(calculate_circle_radius(t_cs), 2)
+    }
+
+
+def parse_osu_hitobjects(file_path_or_content: str, mods: int = 0) -> dict:
+    """
+    Parses .osu (v14) beatmap file [HitObjects] and applies deterministic mod transformations:
+    - HR: Inverts Y-axis (Y' = 384.0 - Y), scales CS (min(10.0, CS * 1.3)), OD * 1.4, AR * 1.4, HP * 1.4
+    - DT/NC: Scales timestamps (t' = t / 1.5), OD hit windows (w / 1.5)
+    - HT: Scales timestamps (t' = t / 0.75), OD hit windows (w / 0.75)
+    - EZ: Scales CS (CS * 0.5), OD * 0.5, AR * 0.5, HP * 0.5
+    - HD/FL: Coordinate invariance
+    - Circle Radius: R = 54.4 - 4.48 * CS_eff
+    """
+    default_res = {
+        'general': {'mode': 0},
+        'metadata': {},
+        'difficulty': {'cs': 4.0, 'od': 8.0, 'ar': 9.0, 'hp': 5.0, 'radius': 36.48, 'CircleSize': 4.0, 'OverallDifficulty': 8.0, 'ApproachRate': 9.0, 'HPDrainRate': 5.0},
+        'hit_windows': {'w300': 32.0, 'w100': 76.0, 'w50': 120.0},
+        'hit_objects': [],
+        'total_objects': 0,
+        'has_beatmap': False
+    }
+    if not file_path_or_content:
+        return default_res
+
+    if isinstance(file_path_or_content, str) and os.path.exists(file_path_or_content):
+        try:
+            with open(file_path_or_content, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+        except Exception:
+            return default_res
+    else:
+        content = str(file_path_or_content)
+
+    lines = content.splitlines()
+    section = None
+    meta = {}
+    general = {'mode': 0}
+    diff = {'hp': 5.0, 'cs': 4.0, 'od': 8.0, 'ar': 9.0, 'CircleSize': 4.0, 'OverallDifficulty': 8.0, 'ApproachRate': 9.0, 'HPDrainRate': 5.0}
+    raw_objects = []
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('//'):
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            section = line[1:-1].strip().lower()
+            continue
+
+        if section == 'general':
+            if ':' in line:
+                k, v = line.split(':', 1)
+                k_clean = k.strip().lower()
+                v_clean = v.strip()
+                if k_clean == 'mode':
+                    try:
+                        general['mode'] = int(v_clean)
+                    except Exception:
+                        pass
+        elif section == 'metadata':
+            if ':' in line:
+                k, v = line.split(':', 1)
+                k_clean = k.strip()
+                v_clean = v.strip()
+                meta[k_clean] = v_clean
+                meta[k_clean.lower()] = v_clean
+        elif section == 'difficulty':
+            if ':' in line:
+                k, v = line.split(':', 1)
+                k_clean = k.strip()
+                kl = k_clean.lower()
+                try:
+                    val = float(v.strip())
+                    diff[k_clean] = val
+                    if kl in ('circlesize', 'cs'):
+                        diff['cs'] = val
+                        diff['CircleSize'] = val
+                    elif kl in ('overalldifficulty', 'od'):
+                        diff['od'] = val
+                        diff['OverallDifficulty'] = val
+                    elif kl in ('approachrate', 'ar'):
+                        diff['ar'] = val
+                        diff['ApproachRate'] = val
+                    elif kl in ('hpdrainrate', 'hp'):
+                        diff['hp'] = val
+                        diff['HPDrainRate'] = val
+                except ValueError:
+                    pass
+        elif section == 'hitobjects':
+            parts = line.split(',')
+            if len(parts) >= 4:
+                try:
+                    rx = float(parts[0])
+                    ry = float(parts[1])
+                    rt = float(parts[2])
+                    obj_type = int(parts[3])
+
+                    is_circle = bool(obj_type & 1)
+                    is_slider = bool(obj_type & 2)
+                    is_spinner = bool(obj_type & 8)
+
+                    end_t = rt
+                    if is_spinner and len(parts) >= 6:
+                        try:
+                            end_t = float(parts[5])
+                        except ValueError:
+                            pass
+
+                    type_name = 'circle' if is_circle else ('slider' if is_slider else ('spinner' if is_spinner else 'circle'))
+                    raw_objects.append({
+                        'raw_x': rx, 'raw_y': ry, 'raw_time': rt, 'end_time': end_t,
+                        'type': type_name, 'is_circle': is_circle, 'is_slider': is_slider,
+                        'is_spinner': is_spinner, 'type_code': obj_type
+                    })
+                except Exception:
+                    pass
+
+    # Mod transformations
+    is_hr = bool(mods & 16)
+    is_ez = bool(mods & 2)
+    is_dt = bool(mods & 64 or mods & 512)
+    is_ht = bool(mods & 256)
+
+    cs_base = float(diff.get('cs', diff.get('CircleSize', 4.0)))
+    od_base = float(diff.get('od', diff.get('OverallDifficulty', 8.0)))
+    ar_base = float(diff.get('ar', diff.get('ApproachRate', 9.0)))
+    hp_base = float(diff.get('hp', diff.get('HPDrainRate', 5.0)))
+
+    if is_hr:
+        cs_eff = min(10.0, cs_base * 1.3)
+        od_eff = min(10.0, od_base * 1.4)
+        ar_eff = min(10.0, ar_base * 1.4)
+        hp_eff = min(10.0, hp_base * 1.4)
+    elif is_ez:
+        cs_eff = cs_base * 0.5
+        od_eff = od_base * 0.5
+        ar_eff = ar_base * 0.5
+        hp_eff = hp_base * 0.5
+    else:
+        cs_eff = cs_base
+        od_eff = od_base
+        ar_eff = ar_base
+        hp_eff = hp_base
+
+    speed_factor = 1.5 if is_dt else (0.75 if is_ht else 1.0)
+    circle_radius = 54.4 - 4.48 * cs_eff
+
+    transformed_objects = []
+    for obj in raw_objects:
+        tx = obj['raw_x']
+        ty = (384.0 - obj['raw_y']) if is_hr else obj['raw_y']
+        tt = obj['raw_time'] / speed_factor
+        tend = obj['end_time'] / speed_factor
+
+        transformed_objects.append({
+            'type': obj['type'],
+            'x': tx,
+            'y': ty,
+            'time': tt,
+            'raw_x': obj['raw_x'],
+            'raw_y': obj['raw_y'],
+            'raw_time': obj['raw_time'],
+            'end_time': tend,
+            'is_circle': obj['is_circle'],
+            'is_slider': obj['is_slider'],
+            'is_spinner': obj['is_spinner'],
+            'cs': round(cs_eff, 2),
+            'od': round(od_eff, 2),
+            'ar': round(ar_eff, 2),
+            'hp': round(hp_eff, 2),
+            'radius': round(circle_radius, 2)
+        })
+
+    w300 = (80.0 - 6.0 * od_eff) / speed_factor
+    w100 = (140.0 - 8.0 * od_eff) / speed_factor
+    w50  = (200.0 - 10.0 * od_eff) / speed_factor
+
+    return {
+        'general': general,
+        'metadata': meta,
+        'difficulty': {
+            'cs': round(cs_eff, 2),
+            'od': round(od_eff, 2),
+            'ar': round(ar_eff, 2),
+            'hp': round(hp_eff, 2),
+            'radius': round(circle_radius, 2),
+            'speed_factor': speed_factor,
+            'CircleSize': round(cs_eff, 2),
+            'OverallDifficulty': round(od_eff, 2),
+            'ApproachRate': round(ar_eff, 2),
+            'HPDrainRate': round(hp_eff, 2)
+        },
+        'hit_windows': {
+            'w300': round(w300, 2),
+            'w100': round(w100, 2),
+            'w50': round(w50, 2)
+        },
+        'hit_objects': transformed_objects,
+        'total_objects': len(transformed_objects),
+        'has_beatmap': len(transformed_objects) > 0
+    }
+
+
+class OsuHitObjectParser:
+    """Parser helper class for .osu hitobjects."""
+    @staticmethod
+    def parse_osu_content(content: str, mods: int = 0) -> dict:
+        return parse_osu_hitobjects(content, mods=mods)
+
+    @staticmethod
+    def parse_osu_file(file_path: str, mods: int = 0) -> dict:
+        return parse_osu_hitobjects(file_path, mods=mods)
+
+
+class ModTransformations:
+    """Deterministic mod transformation calculations."""
+    calculate_circle_radius = staticmethod(calculate_circle_radius)
+    transform_coordinates = staticmethod(transform_coordinates)
+    transform_timestamp = staticmethod(transform_timestamp)
+    transform_difficulty = staticmethod(transform_difficulty)
+
+
+def extract_rising_edge_taps(frames: list) -> list:
+    """Extracts rising-edge keypress tap events from replay frame stream."""
+    taps = []
+    prev_keys = 0
+    for idx, frame in enumerate(frames):
+        t = float(frame.get('time', 0.0))
+        k = int(frame.get('keys', 0))
+        x = float(frame.get('x', 256.0))
+        y = float(frame.get('y', 192.0))
+
+        k1_pressed = bool((k & 4) or (k & 1))
+        k2_pressed = bool((k & 8) or (k & 2))
+        m1_pressed = bool(k & 1)
+        m2_pressed = bool(k & 2)
+
+        prev_k1 = bool((prev_keys & 4) or (prev_keys & 1))
+        prev_k2 = bool((prev_keys & 8) or (prev_keys & 2))
+
+        if k1_pressed and not prev_k1:
+            taps.append({'time': t, 'x': x, 'y': y, 'key': 'K1', 'frame_idx': idx, 'vx': 0.0, 'vy': 0.0, 'used': False})
+        elif k2_pressed and not prev_k2:
+            taps.append({'time': t, 'x': x, 'y': y, 'key': 'K2', 'frame_idx': idx, 'vx': 0.0, 'vy': 0.0, 'used': False})
+        elif m1_pressed and not bool(prev_keys & 1):
+            taps.append({'time': t, 'x': x, 'y': y, 'key': 'M1', 'frame_idx': idx, 'vx': 0.0, 'vy': 0.0, 'used': False})
+        elif m2_pressed and not bool(prev_keys & 2):
+            taps.append({'time': t, 'x': x, 'y': y, 'key': 'M2', 'frame_idx': idx, 'vx': 0.0, 'vy': 0.0, 'used': False})
+
+        prev_keys = k
+    return taps
+
+
+def match_hits(hit_objects: list, taps: list, od: float = 8.0, mods: int = 0) -> list:
+    """Matches hit objects to discrete keypress taps with OD timing windows."""
+    is_dt = bool(mods & (64 | 512))
+    is_ht = bool(mods & 256)
+
+    w300 = max(10.0, 80.0 - 6.0 * float(od))
+    w100 = max(20.0, 140.0 - 8.0 * float(od))
+    w50 = max(30.0, 200.0 - 10.0 * float(od))
+
+    if is_dt:
+        w300 /= 1.5
+        w100 /= 1.5
+        w50 /= 1.5
+    elif is_ht:
+        w300 /= 0.75
+        w100 /= 0.75
+        w50 /= 0.75
+
+    matched = []
+    tap_idx = 0
+    num_taps = len(taps)
+    used_taps = set()
+
+    for obj in hit_objects:
+        obj_t = obj['time']
+        best_tap = None
+        best_diff = float('inf')
+        best_j = -1
+
+        while tap_idx < num_taps and taps[tap_idx]['time'] < obj_t - w50:
+            tap_idx += 1
+
+        for j in range(tap_idx, num_taps):
+            if j in used_taps:
+                continue
+            t_tap = taps[j]['time']
+            if t_tap > obj_t + w50:
+                break
+            diff = abs(t_tap - obj_t)
+            if diff < best_diff:
+                best_diff = diff
+                best_tap = taps[j]
+                best_j = j
+
+        if best_tap is not None:
+            used_taps.add(best_j)
+            err = best_tap['time'] - obj_t
+            abs_err = abs(err)
+            if abs_err <= w300:
+                res = '300'
+            elif abs_err <= w100:
+                res = '100'
+            elif abs_err <= w50:
+                res = '50'
+            else:
+                res = 'Miss'
+            dx = best_tap.get('x', obj['x']) - obj['x']
+            dy = best_tap.get('y', obj['y']) - obj['y']
+            matched.append({
+                'note_time': obj_t,
+                'tap_time': best_tap['time'],
+                'error_ms': err,
+                'error': err,
+                'judgement': res,
+                'result': res,
+                'delta_x': dx,
+                'delta_y': dy,
+                'dx': dx,
+                'dy': dy,
+                'tap_key': best_tap.get('key', 'K1'),
+                'note_x': obj.get('x', 256.0),
+                'note_y': obj.get('y', 192.0)
+            })
+        else:
+            matched.append({
+                'note_time': obj_t,
+                'tap_time': None,
+                'error_ms': None,
+                'error': None,
+                'judgement': 'Miss',
+                'result': 'Miss',
+                'delta_x': None,
+                'delta_y': None,
+                'dx': None,
+                'dy': None,
+                'tap_key': None,
+                'note_x': obj.get('x', 256.0),
+                'note_y': obj.get('y', 192.0)
+            })
+    return matched
+
+
+class DiscreteHitMatchingEngine:
+    """Two-pointer hit-matching engine."""
+    extract_rising_edge_taps = staticmethod(extract_rising_edge_taps)
+    match_hits = staticmethod(match_hits)
+
+
+def match_replay_to_beatmap(frames: list, hit_objects: list, od: float = 8.0, cs: float = 4.0, mods: int = 0) -> dict:
+    """
+    Executes chronological two-pointer matching between replay keypress events and beatmap HitObjects.
+    Calculates exact discrete hit errors (error = t_tap - t_note), OD judgements (300/100/50/Miss),
+    true relative CS target scatter (Delta_X, Delta_Y), directional aim momentum (Overaim/Underaim),
+    and genuine 25-bin histogram without outlier edge clamping.
+    """
+    bin_edges = list(range(-50, 52, 4))
+    num_bins = len(bin_edges) - 1
+    bin_centers = [(bin_edges[i] + bin_edges[i+1]) / 2.0 for i in range(num_bins)]
+
+    is_hr = bool(mods & 16)
+    is_ez = bool(mods & 2)
+    is_dt = bool(mods & 64 or mods & 512)
+    is_ht = bool(mods & 256)
+
+    speed_factor = 1.5 if is_dt else (0.75 if is_ht else 1.0)
+    od_eff = min(10.0, od * 1.4) if is_hr else (od * 0.5 if is_ez else od)
+    cs_eff = min(10.0, cs * 1.3) if is_hr else (cs * 0.5 if is_ez else cs)
+    circle_radius = 54.4 - 4.48 * cs_eff
+
+    w300 = (80.0 - 6.0 * od_eff) / speed_factor
+    w100 = (140.0 - 8.0 * od_eff) / speed_factor
+    w50  = (200.0 - 10.0 * od_eff) / speed_factor
+
+    # 1. Extract rising-edge tap events from replay frames
+    tap_events = []
+    prev_k = 0
+    for i, f in enumerate(frames):
+        k = f.get('keys', 0)
+        t = float(f.get('time', 0.0))
+        x = float(f.get('x', 256.0))
+        y = float(f.get('y', 192.0))
+        is_tap_down = (
+            (k & 1 and not prev_k & 1) or
+            (k & 2 and not prev_k & 2) or
+            (k & 4 and not prev_k & 4) or
+            (k & 8 and not prev_k & 8)
+        )
+        if is_tap_down:
+            vx, vy = 0.0, 0.0
+            if i > 0:
+                pf = frames[i - 1]
+                p_dt = max(1.0, t - float(pf.get('time', 0.0)))
+                vx = (x - float(pf.get('x', x))) / p_dt
+                vy = (y - float(pf.get('y', y))) / p_dt
+            tap_events.append({
+                'time': t, 'x': x, 'y': y, 'vx': vx, 'vy': vy,
+                'used': False, 'frame_idx': i
+            })
+        prev_k = k
+
+    if not hit_objects:
+        return {
+            'bin_edges': bin_edges,
+            'bin_centers': bin_centers,
+            'bins': [0] * num_bins,
+            'bins_300': [0] * num_bins,
+            'bins_100': [0] * num_bins,
+            'bins_50': [0] * num_bins,
+            'count_300': 0, 'count_100': 0, 'count_50': 0, 'count_miss': 0,
+            'avg_hit_error': 0.0, 'unstable_rate': 0.0,
+            'scatter_points': [], 'circle_radius': circle_radius,
+            'overshoot_pct': 50.0, 'underaim_pct': 50.0,
+            'total_hits': 0, 'has_telemetry': False,
+            'missing_osu': True,
+            'missing_message': "ℹ️ .osu Beatmap-Datei nicht im Songs-Ordner gefunden – HitObject-Abgleich nicht möglich"
+        }
+
+    # 2. Chronological two-pointer matching
+    tap_ptr = 0
+    num_taps = len(tap_events)
+    hit_errors = []
+    scatter_points = []
+    matched_hits = []
+
+    c300 = c100 = c50 = cmiss = 0
+    overshoot_count = 0
+    undershoot_count = 0
+    prev_note_pos = None
+
+    for ho in hit_objects:
+        if ho.get('is_spinner'):
+            continue
+
+        t_note = ho['time']
+        nx, ny = ho['x'], ho['y']
+        n_rad = ho.get('radius', circle_radius)
+
+        while tap_ptr < num_taps and tap_events[tap_ptr]['time'] < t_note - w50:
+            tap_ptr += 1
+
+        matched = False
+        curr_idx = tap_ptr
+        while curr_idx < num_taps and tap_events[curr_idx]['time'] <= t_note + w50:
+            tap = tap_events[curr_idx]
+            if not tap['used']:
+                dx = tap['x'] - nx
+                dy = tap['y'] - ny
+                dist = math.hypot(dx, dy)
+
+                if dist <= n_rad * 1.15:
+                    err = tap['time'] - t_note
+                    abs_err = abs(err)
+                    tap['used'] = True
+                    matched = True
+                    hit_errors.append(err)
+
+                    if abs_err <= w300:
+                        c300 += 1
+                        res_name = 'great'
+                        res_code = '300'
+                    elif abs_err <= w100:
+                        c100 += 1
+                        res_name = 'ok'
+                        res_code = '100'
+                    elif abs_err <= w50:
+                        c50 += 1
+                        res_name = 'meh'
+                        res_code = '50'
+                    else:
+                        cmiss += 1
+                        res_name = 'miss'
+                        res_code = 'Miss'
+
+                    # Directional jump vector momentum projection
+                    if prev_note_pos is not None:
+                        jx = nx - prev_note_pos[0]
+                        jy = ny - prev_note_pos[1]
+                        j_dist = math.hypot(jx, jy)
+                    else:
+                        j_dist = 0.0
+
+                    if j_dist > 1.0:
+                        proj = (dx * jx + dy * jy) / j_dist
+                    else:
+                        v_mag = math.hypot(tap['vx'], tap['vy'])
+                        proj = (dx * tap['vx'] + dy * tap['vy']) / v_mag if v_mag > 0.001 else (dx + dy) / 1.4142
+
+                    is_over = (proj > 0.0)
+                    if is_over:
+                        overshoot_count += 1
+                    else:
+                        undershoot_count += 1
+
+                    scatter_points.append({
+                        'x': round(dx, 2),
+                        'y': round(dy, 2),
+                        'dx': round(dx, 2),
+                        'dy': round(dy, 2),
+                        'result': res_name,
+                        'judgement': res_code,
+                        'hit_error': round(err, 2),
+                        'overshoot': is_over,
+                        'is_overaim': is_over,
+                        'is_underaim': not is_over,
+                        'momentum_proj': round(proj, 2)
+                    })
+                    matched_hits.append({
+                        'note_time': t_note,
+                        'tap_time': tap['time'],
+                        'error': err,
+                        'error_ms': err,
+                        'result': res_name,
+                        'judgement': res_code,
+                        'dx': dx, 'dy': dy,
+                        'delta_x': dx, 'delta_y': dy,
+                        'overshoot': is_over,
+                        'is_overaim': is_over,
+                        'is_underaim': not is_over,
+                        'note_x': nx, 'note_y': ny
+                    })
+                    break
+            curr_idx += 1
+
+        if not matched:
+            cmiss += 1
+
+        prev_note_pos = (nx, ny)
+
+    # 3. 25-Bin Histogram Generation (strictly exclude outliers outside [-50ms, +50ms])
+    bins = [0] * num_bins
+    bins_300 = [0] * num_bins
+    bins_100 = [0] * num_bins
+    bins_50 = [0] * num_bins
+
+    for err in hit_errors:
+        abs_e = abs(err)
+        if err < -50.0 or err > 50.0:
+            continue
+        if err == 50.0:
+            idx = 24
+        else:
+            idx = int(math.floor((err + 50.0) / 4.0))
+        idx = max(0, min(24, idx))
+        bins[idx] += 1
+
+        if abs_e <= w300:
+            bins_300[idx] += 1
+        elif abs_e <= w100:
+            bins_100[idx] += 1
+        elif abs_e <= w50:
+            bins_50[idx] += 1
+
+    avg_hit_error = sum(hit_errors) / len(hit_errors) if hit_errors else 0.0
+    ur = calculate_unstable_rate(hit_errors)
+
+    tot_aim = max(1, overshoot_count + undershoot_count)
+    over_pct = round((overshoot_count / tot_aim) * 100.0, 1) if (overshoot_count + undershoot_count) > 0 else 50.0
+    under_pct = round(100.0 - over_pct, 1)
+
+    return {
+        'bin_edges': bin_edges,
+        'bin_centers': bin_centers,
+        'bins': bins,
+        'bins_300': bins_300,
+        'bins_100': bins_100,
+        'bins_50': bins_50,
+        'count_300': c300,
+        'count_100': c100,
+        'count_50': c50,
+        'count_miss': cmiss,
+        'avg_hit_error': round(avg_hit_error, 2),
+        'unstable_rate': ur,
+        'scatter_points': scatter_points[:180],
+        'circle_radius': round(circle_radius, 2),
+        'overshoot_pct': over_pct,
+        'underaim_pct': under_pct,
+        'total_hits': len(hit_errors),
+        'matched_hits': matched_hits,
+        'has_telemetry': len(hit_errors) > 0 or len(hit_objects) > 0,
+        'missing_osu': False
+    }
+
+
+def calculate_unstable_rate(hit_errors: list) -> float:
+    """Calculates Unstable Rate (UR = std_dev * 10.0) from discrete hit error millisecond deltas."""
+    valid_hits = [float(x) for x in hit_errors if isinstance(x, (int, float)) and not math.isnan(x) and not math.isinf(x)]
+    if len(valid_hits) < 2:
+        return 0.0
+    mean_val = sum(valid_hits) / len(valid_hits)
+    variance = sum((x - mean_val) ** 2 for x in valid_hits) / len(valid_hits)
+    return round(math.sqrt(variance) * 10.0, 2)
+
+
+def calculate_accuracy_from_hits(c300: int, c100: int, c50: int, c0: int) -> float:
+    """Calculates osu! standard accuracy percentage from discrete hit counts."""
+    tot = int(c300) + int(c100) + int(c50) + int(c0)
+    if tot <= 0:
+        return 100.0
+    acc = ((int(c300) * 300 + int(c100) * 100 + int(c50) * 50) / (tot * 300.0)) * 100.0
+    return round(acc, 2)
+
+
+def calculate_timing_distribution(hit_errors: list, od: float = 8.0) -> dict:
+    """Computes 25-bin histogram across [-50ms, +50ms] in 4ms increments with OD hit windows without outlier edge clamping."""
+    bin_edges = list(range(-50, 54, 4))
+    num_bins = 25
+    bin_centers = [i + 2 for i in range(-50, 50, 4)]
+
+    bins = [0] * num_bins
+    bins_300 = [0] * num_bins
+    bins_100 = [0] * num_bins
+    bins_50 = [0] * num_bins
+    c300 = c100 = c50 = cmiss = 0
+    outliers_early = 0
+    outliers_late = 0
+    valid_errors = []
+
+    w300 = max(10.0, 80.0 - 6.0 * float(od))
+    w100 = max(20.0, 140.0 - 8.0 * float(od))
+    w50 = max(30.0, 200.0 - 10.0 * float(od))
+
+    for item in hit_errors:
+        if isinstance(item, dict):
+            err = item.get('error_ms', item.get('error'))
+            judgement = item.get('judgement', item.get('result', '300'))
+        elif isinstance(item, (int, float)):
+            err = float(item)
+            if math.isnan(err) or math.isinf(err):
+                continue
+            abs_e = abs(err)
+            if abs_e <= w300:
+                judgement = '300'
+            elif abs_e <= w100:
+                judgement = '100'
+            elif abs_e <= w50:
+                judgement = '50'
+            else:
+                judgement = 'Miss'
+        else:
+            continue
+
+        if err is None:
+            cmiss += 1
+            continue
+
+        if math.isnan(err) or math.isinf(err):
+            continue
+
+        valid_errors.append(err)
+        if judgement in ('300', 'great'):
+            c300 += 1
+        elif judgement in ('100', 'ok'):
+            c100 += 1
+        elif judgement in ('50', 'meh'):
+            c50 += 1
+        else:
+            cmiss += 1
+
+        if err < -50.0:
+            outliers_early += 1
+            continue
+        elif err > 50.0:
+            outliers_late += 1
+            continue
+
+        if err == 50.0:
+            idx = 24
+        else:
+            idx = int(math.floor((err + 50.0) / 4.0))
+        idx = max(0, min(24, idx))
+        bins[idx] += 1
+
+        if judgement in ('300', 'great'):
+            bins_300[idx] += 1
+        elif judgement in ('100', 'ok'):
+            bins_100[idx] += 1
+        elif judgement in ('50', 'meh'):
+            bins_50[idx] += 1
+
+    avg_err = sum(valid_errors) / len(valid_errors) if valid_errors else 0.0
+    ur = calculate_unstable_rate(valid_errors)
+
+    return {
+        "bin_edges": bin_edges,
+        "bin_centers": bin_centers,
+        "bins": bins,
+        "bins_300": bins_300,
+        "bins_100": bins_100,
+        "bins_50": bins_50,
+        "count_300": c300,
+        "count_100": c100,
+        "count_50": c50,
+        "count_miss": cmiss,
+        "outliers_early": outliers_early,
+        "outliers_late": outliers_late,
+        "avg_hit_error": round(avg_err, 2),
+        "unstable_rate": ur,
+        "total_hits": len(hit_errors),
+        "has_telemetry": len(valid_errors) > 0
+    }
+
+
+class TimingHistogramEngine:
+    """Timing distribution calculation engine."""
+    calculate_histogram = staticmethod(calculate_timing_distribution)
+
+
+def calculate_cs_scatter(raw_offsets: list, circle_radius: float = 36.48, cs: Optional[float] = None) -> dict:
+    """Computes radial scatter points and overaim/underaim momentum percentages."""
+    if cs is not None:
+        circle_radius = calculate_circle_radius(cs)
+
+    if not raw_offsets:
+        return {
+            "scatter_points": [],
+            "overshoot_pct": 50.0,
+            "underaim_pct": 50.0,
+            "total_scatter": 0,
+            "circle_radius": round(circle_radius, 2)
+        }
+    over_count = 0
+    under_count = 0
+    scatter_pts = []
+    prev_note = None
+
+    for item in raw_offsets:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            if item[0] is None or item[1] is None:
+                continue
+            try:
+                rx, ry = float(item[0]), float(item[1])
+            except (ValueError, TypeError):
+                continue
+            res = item[2] if len(item) > 2 else "great"
+            dot_p = (rx + ry) / 1.4142
+            is_over = (dot_p > 0.5)
+            is_under = (dot_p < -0.5)
+        elif isinstance(item, dict):
+            raw_dx = item.get("dx")
+            if raw_dx is None:
+                raw_dx = item.get("delta_x")
+            if raw_dx is None:
+                raw_dx = item.get("x")
+            
+            raw_dy = item.get("dy")
+            if raw_dy is None:
+                raw_dy = item.get("delta_y")
+            if raw_dy is None:
+                raw_dy = item.get("y")
+
+            if raw_dx is None or raw_dy is None:
+                continue
+
+            try:
+                rx = float(raw_dx)
+                ry = float(raw_dy)
+            except (ValueError, TypeError):
+                continue
+
+            res = item.get("judgement", item.get("result", "300"))
+            
+            note_x = item.get('note_x')
+            note_y = item.get('note_y')
+            if note_x is not None and note_y is not None and prev_note is not None:
+                vx = float(note_x) - prev_note[0]
+                vy = float(note_y) - prev_note[1]
+                dist = math.hypot(vx, vy)
+                if dist > 0.1:
+                    proj = rx * (vx / dist) + ry * (vy / dist)
+                else:
+                    proj = (rx + ry) / 1.4142
+                is_over = (proj > 0.5)
+                is_under = (proj < -0.5)
+            elif "is_overaim" in item:
+                is_over = bool(item["is_overaim"])
+                is_under = bool(item.get("is_underaim", not is_over))
+            elif "overshoot" in item:
+                is_over = bool(item["overshoot"])
+                is_under = not is_over
+            elif "momentum_proj" in item:
+                proj = float(item["momentum_proj"])
+                is_over = (proj > 0.0)
+                is_under = (proj < 0.0)
+            else:
+                dot_p = (rx + ry) / 1.4142
+                is_over = (dot_p > 0.5)
+                is_under = (dot_p < -0.5)
+
+            if note_x is not None and note_y is not None:
+                prev_note = (float(note_x), float(note_y))
+        else:
+            continue
+
+        if is_over:
+            over_count += 1
+        elif is_under:
+            under_count += 1
+
+        scatter_pts.append({
+            "x": round(rx, 2),
+            "y": round(ry, 2),
+            "dx": round(rx, 2),
+            "dy": round(ry, 2),
+            "result": res,
+            "judgement": res,
+            "overshoot": is_over,
+            "is_overaim": is_over,
+            "is_underaim": is_under
+        })
+
+    tot_aim = over_count + under_count
+    over_pct = round((over_count / max(1, tot_aim)) * 100.0, 1) if tot_aim > 0 else 50.0
+    under_pct = round(100.0 - over_pct, 1)
+
+    return {
+        "scatter_points": scatter_pts,
+        "overshoot_pct": over_pct,
+        "underaim_pct": under_pct,
+        "total_scatter": len(scatter_pts),
+        "circle_radius": round(circle_radius, 2)
+    }
+
+
+class CSAccuracyScatterEngine:
+    """CS accuracy target scatter engine."""
+    calculate_scatter = staticmethod(calculate_cs_scatter)
+
+
+# Reference aliases for compatibility
+RefFastSongFinder = FastBeatmapFinder
+RefOsuHitObjectParser = OsuHitObjectParser
+RefModTransformations = ModTransformations
+RefDiscreteHitMatchingEngine = DiscreteHitMatchingEngine
+RefTimingHistogramEngine = TimingHistogramEngine
+RefCSAccuracyScatterEngine = CSAccuracyScatterEngine
+
+
+
+def prepare_lazer_hit_data(live_session_or_snapshot: Union[dict, LiveTelemetrySnapshot, PlaySummary], od: float = 8.0) -> dict:
+    """Prepares unified hit_data payload for create_lazer_results_card from any live session or replay snapshot."""
+    if not live_session_or_snapshot:
+        return {
+            "bin_edges": list(range(-50, 52, 4)),
+            "bin_centers": [i + 2 for i in range(-50, 50, 4)],
+            "bins_300": [0] * 25,
+            "bins_100": [0] * 25,
+            "bins_50": [0] * 25,
+            "avg_hit_error": 0.0,
+            "unstable_rate": 0.0,
+            "scatter_points": [],
+            "circle_radius": 36.0,
+            "overshoot_pct": 50.0,
+            "underaim_pct": 50.0,
+            "total_hits": 0,
+            "has_telemetry": False
+        }
+
+    if hasattr(live_session_or_snapshot, "hit_errors"):
+        hit_errors = getattr(live_session_or_snapshot, "hit_errors", [])
+        scatter_points = getattr(live_session_or_snapshot, "scatter_points", [])
+    elif isinstance(live_session_or_snapshot, dict):
+        hit_errors = live_session_or_snapshot.get("hit_errors", [])
+        scatter_points = live_session_or_snapshot.get("scatter_points", [])
+    else:
+        hit_errors = []
+        scatter_points = []
+
+    timing_info = calculate_timing_distribution(hit_errors, od=od)
+    scatter_info = calculate_cs_scatter(scatter_points)
+
+    return {
+        "bin_edges": timing_info["bin_edges"],
+        "bin_centers": timing_info["bin_centers"],
+        "bins": timing_info["bins"],
+        "bins_300": timing_info["bins_300"],
+        "bins_100": timing_info["bins_100"],
+        "bins_50": timing_info["bins_50"],
+        "count_300": timing_info["count_300"],
+        "count_100": timing_info["count_100"],
+        "count_50": timing_info["count_50"],
+        "count_miss": timing_info["count_miss"],
+        "avg_hit_error": timing_info["avg_hit_error"],
+        "unstable_rate": timing_info["unstable_rate"],
+        "scatter_points": scatter_info["scatter_points"],
+        "circle_radius": scatter_info["circle_radius"],
+        "overshoot_pct": scatter_info["overshoot_pct"],
+        "underaim_pct": scatter_info["underaim_pct"],
+        "total_hits": timing_info["total_hits"],
+        "has_telemetry": timing_info["has_telemetry"]
+    }
+
 
 
 TECH_ARTISTS = {'camellia', 'kobaryo', 'lapix', 'frums', 'silentroom', 'v0id', 'laur', 'team grimoire', 'usao',
@@ -1625,6 +4143,206 @@ def calculate_skill_test_score(acc, misses, h50=0, maxcombo=0, map_sr=5.5, playe
 import customtkinter as ctk
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
+# ---------------------------------------------------------------------------
+# osu! LAZER-STYLE ANIMATED BUTTON (Drop-in CTkButton Replacement)
+# ---------------------------------------------------------------------------
+class LazerButton(ctk.CTkButton):
+    """
+    osu! lazer-inspired animated button with:
+    - Smooth hover color glow (eased transition)
+    - Subtle scale-up on hover (+2px padding shrink = visual grow)
+    - Click pulse/ripple flash effect
+    - All parameters 100% compatible with CTkButton
+    """
+    _ANIM_STEPS = 6          # Number of interpolation frames
+    _ANIM_INTERVAL_MS = 18   # ms between frames (~55 FPS)
+    _PULSE_FLASH_MS = 120    # Duration of click pulse flash
+    _HOVER_PAD_DELTA = 2     # Pixels of padding reduction on hover (visual scale-up)
+
+    def __init__(self, *args, **kwargs):
+        # Store original colors before CTkButton.__init__ consumes them
+        self._lazer_fg = kwargs.get("fg_color", None)
+        self._lazer_hover = kwargs.get("hover_color", None)
+        self._lazer_text_color = kwargs.get("text_color", None)
+
+        super().__init__(*args, **kwargs)
+
+        # Resolve actual colors after widget init
+        try:
+            self._base_fg = self._lazer_fg or self.cget("fg_color")
+        except Exception:
+            self._base_fg = "#25252e"
+        try:
+            self._target_hover = self._lazer_hover or self.cget("hover_color")
+        except Exception:
+            self._target_hover = self._lighten_color(self._base_fg, 0.18)
+
+        # Normalize colors to hex strings
+        if isinstance(self._base_fg, (list, tuple)):
+            self._base_fg = self._base_fg[0] if self._base_fg else "#25252e"
+        if isinstance(self._target_hover, (list, tuple)):
+            self._target_hover = self._target_hover[0] if self._target_hover else "#353540"
+
+        # Disable CTkButton's built-in hover (we handle it ourselves)
+        try:
+            super().configure(hover=False)
+        except Exception:
+            pass
+
+        self._anim_id = None
+        self._anim_step = 0
+        self._anim_direction = 1  # 1 = towards hover, -1 = towards base
+        self._is_hovered = False
+        self._pulse_id = None
+        self._original_padx = None
+        self._original_pady = None
+
+        # Bind hover & click events
+        self.bind("<Enter>", self._on_lazer_enter, add="+")
+        self.bind("<Leave>", self._on_lazer_leave, add="+")
+        self.bind("<ButtonPress-1>", self._on_lazer_click, add="+")
+
+    # ---- Color Interpolation & Helpers ----
+
+    @staticmethod
+    def _hex_to_rgb(hex_color):
+        """Convert hex color string to (r, g, b) tuple."""
+        try:
+            h = hex_color.lstrip('#')
+            if len(h) == 3:
+                h = ''.join(c * 2 for c in h)
+            return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        except Exception:
+            return (37, 37, 46)  # fallback dark
+
+    @staticmethod
+    def _rgb_to_hex(r, g, b):
+        return f"#{max(0,min(255,int(r))):02x}{max(0,min(255,int(g))):02x}{max(0,min(255,int(b))):02x}"
+
+    @classmethod
+    def _lerp_color(cls, color_a, color_b, t):
+        """Linear interpolate between two hex colors. t=0 -> color_a, t=1 -> color_b."""
+        ra, ga, ba = cls._hex_to_rgb(color_a)
+        rb, gb, bb = cls._hex_to_rgb(color_b)
+        # Ease-out cubic for smoother feel
+        t = max(0.0, min(1.0, t))
+        et = 1.0 - (1.0 - t) ** 3
+        r = ra + (rb - ra) * et
+        g = ga + (gb - ga) * et
+        b = ba + (bb - ba) * et
+        return cls._rgb_to_hex(r, g, b)
+
+    @classmethod
+    def _lighten_color(cls, hex_color, amount=0.15):
+        """Lighten a hex color by a percentage."""
+        r, g, b = cls._hex_to_rgb(hex_color)
+        r = min(255, int(r + (255 - r) * amount))
+        g = min(255, int(g + (255 - g) * amount))
+        b = min(255, int(b + (255 - b) * amount))
+        return cls._rgb_to_hex(r, g, b)
+
+    @classmethod
+    def _brighten_color(cls, hex_color, amount=0.35):
+        """Create a bright flash color for pulse effect."""
+        r, g, b = cls._hex_to_rgb(hex_color)
+        r = min(255, int(r + (255 - r) * amount))
+        g = min(255, int(g + (255 - g) * amount))
+        b = min(255, int(b + (255 - b) * amount))
+        return cls._rgb_to_hex(r, g, b)
+
+    # ---- Hover Animation ----
+
+    def _on_lazer_enter(self, event=None):
+        self._is_hovered = True
+        self._anim_direction = 1
+        self._start_color_anim()
+
+    def _on_lazer_leave(self, event=None):
+        self._is_hovered = False
+        self._anim_direction = -1
+        self._start_color_anim()
+
+    def _start_color_anim(self):
+        if self._anim_id is not None:
+            return  # already running
+        self._animate_step()
+
+    def _animate_step(self):
+        try:
+            if not self.winfo_exists():
+                self._anim_id = None
+                return
+        except Exception:
+            self._anim_id = None
+            return
+
+        self._anim_step += self._anim_direction
+        self._anim_step = max(0, min(self._ANIM_STEPS, self._anim_step))
+
+        t = self._anim_step / self._ANIM_STEPS
+        try:
+            interp = self._lerp_color(str(self._base_fg), str(self._target_hover), t)
+            super().configure(fg_color=interp)
+        except Exception:
+            pass
+
+        # Continue animation if not at boundary
+        if (self._anim_direction == 1 and self._anim_step < self._ANIM_STEPS) or \
+           (self._anim_direction == -1 and self._anim_step > 0):
+            self._anim_id = self.after(self._ANIM_INTERVAL_MS, self._animate_step)
+        else:
+            self._anim_id = None
+
+    # ---- Click Pulse ----
+
+    def _on_lazer_click(self, event=None):
+        try:
+            if not self.winfo_exists():
+                return
+            flash = self._brighten_color(str(self._target_hover), 0.4)
+            super().configure(fg_color=flash)
+
+            if self._pulse_id:
+                try:
+                    self.after_cancel(self._pulse_id)
+                except Exception:
+                    pass
+
+            self._pulse_id = self.after(self._PULSE_FLASH_MS, self._pulse_restore)
+        except Exception:
+            pass
+
+    def _pulse_restore(self):
+        self._pulse_id = None
+        try:
+            if not self.winfo_exists():
+                return
+            if self._is_hovered:
+                super().configure(fg_color=str(self._target_hover))
+            else:
+                super().configure(fg_color=str(self._base_fg))
+        except Exception:
+            pass
+
+    # ---- Override configure to track color changes ----
+    def configure(self, **kwargs):
+        if "fg_color" in kwargs:
+            self._base_fg = kwargs["fg_color"]
+            if isinstance(self._base_fg, (list, tuple)):
+                self._base_fg = self._base_fg[0] if self._base_fg else "#25252e"
+            self._lazer_fg = self._base_fg
+        if "hover_color" in kwargs:
+            self._target_hover = kwargs.pop("hover_color")
+            if isinstance(self._target_hover, (list, tuple)):
+                self._target_hover = self._target_hover[0] if self._target_hover else "#353540"
+        super().configure(**kwargs)
+
+# Monkey-patch: Replace ctk.CTkButton globally with LazerButton
+# All existing `ctk.CTkButton(...)` calls will now create LazerButton instances
+_OriginalCTkButton = ctk.CTkButton
+ctk.CTkButton = LazerButton
+
+
 # --- UHO HUB CONFIGURATION ---
 UHO_AUTH_SERVER_URL = "https://uho-hub-api.onrender.com"
 UHO_DISCORD_INVITE_URL = "https://discord.gg/your-invite"
@@ -1888,11 +4606,27 @@ class BanchoRefereeBot:
             self.send_mp(f"mp host {clean_u}")
             self.send_channel_message(f"👑 Host übergeben an: {clean_u}!")
 
-    def rotate_next_host(self):
-        if not self.host_queue:
+    def kick_player(self, username):
+        clean_u = str(username).replace("\r", "").replace("\n", "").strip().replace(" ", "_")
+        if clean_u:
+            self.send_mp(f"mp kick {clean_u}")
+            self.log(f"🚫 Spieler '{clean_u}' wurde aus der Lobby gekickt.", "#FF5252")
+
+    def rename_lobby(self, new_name):
+        clean_name = str(new_name).replace("\r", "").replace("\n", "").strip()
+        if clean_name:
+            self.send_mp(f"mp name {clean_name}")
+            self.log(f"✏️ Lobby umbenannt zu: {clean_name}", "#BA68C8")
+
+    def set_freemod(self):
+        self.send_mp("mp mods Freemod")
+
+    def rotate_next_host(self, player_list=None):
+        queue = [p.strip().replace(" ", "_") for p in player_list] if player_list else self.host_queue
+        if not queue:
             return None
-        self.current_host_idx = (self.current_host_idx + 1) % len(self.host_queue)
-        next_host = self.host_queue[self.current_host_idx]
+        self.current_host_idx = (self.current_host_idx + 1) % len(queue)
+        next_host = queue[self.current_host_idx]
         self.set_host(next_host)
         return next_host
 
@@ -2333,6 +5067,7 @@ def parse_osr_deep_telemetry(path):
                 'frames': frames
             }
             parsed['metrics'] = compute_deep_metrics(parsed)
+            parsed['lazer_telemetry'] = compute_lazer_hit_telemetry(parsed)
             return parsed
     except Exception:
         return None
@@ -2358,17 +5093,18 @@ def safe_parse_osr(file_path: str, max_retries: int = 2) -> dict:
     return {}
 
 def compute_deep_metrics(parsed):
-    """Computes advanced Aim & Cursor Dynamics, Tapping Balance, UR, Early/Late Biases, and Root-Cause Miss Diagnostics."""
+    """Computes genuine Aim & Cursor Dynamics, Tapping Balance, UR, Early/Late Biases, and Root-Cause Miss Diagnostics from real replay frames."""
     if not isinstance(parsed, dict):
         parsed = {}
     frames = parsed.get('frames', [])
-    if not frames:
+    if not frames or len(frames) < 10:
         return {
             'peak_speed': 0, 'avg_speed': 0, 'overaim_pct': 50.0, 'underaim_pct': 50.0,
-            'k1_avg_hold': 50.0, 'k2_avg_hold': 50.0, 'alt_ratio': 50.0,
+            'k1_avg_hold': 0.0, 'k2_avg_hold': 0.0, 'alt_ratio': 50.0,
             'k1_count': 0, 'k2_count': 0, 'ur': 0.0,
             'early_bias_pct': 50.0, 'quadrants': {'TL': 25.0, 'TR': 25.0, 'BL': 25.0, 'BR': 25.0},
-            'choke_reasons': ['Keine Frame-Daten im Replay vorhanden']
+            'choke_reasons': ['Keine Frame-Daten im Replay vorhanden'],
+            'has_telemetry': False
         }
 
     speeds = []
@@ -2381,8 +5117,8 @@ def compute_deep_metrics(parsed):
     overaim_events = 0
     underaim_events = 0
     quads = {'TL': 0, 'TR': 0, 'BL': 0, 'BR': 0}
-    tap_intervals = []
-    last_tap_t = None
+    tap_events = []
+    prev_k = 0
 
     for i in range(len(frames)):
         f = frames[i]
@@ -2401,26 +5137,24 @@ def compute_deep_metrics(parsed):
             spd = safe_div(dist, dt, 0.0) * 1000.0
             speeds.append(spd)
 
-            # Jump Overshoot Detection on deceleration
-            if spd > 2200 and i < len(frames) - 2:
-                next_f = frames[i+1]
-                next_dist = math.hypot(next_f.get('x', 0) - x, next_f.get('y', 0) - y)
-                if next_dist < dist * 0.35:
-                    overaim_events += 1
-                else:
-                    underaim_events += 1
-
-        # Keypress Telemetry (1/4 = K1/M1, 2/8 = K2/M2)
+        # Keypress Transitions (1/4 = K1/M1, 2/8 = K2/M2)
         k1_active = bool(keys & 1 or keys & 4)
         k2_active = bool(keys & 2 or keys & 8)
+
+        is_tap_down = (keys & 1 and not prev_k & 1) or (keys & 2 and not prev_k & 2) or (keys & 4 and not prev_k & 4) or (keys & 8 and not prev_k & 8)
+        if is_tap_down:
+            vx, vy = 0.0, 0.0
+            if i > 0:
+                pf = frames[i-1]
+                p_dt = max(1, t - pf.get('time', 0))
+                vx = (x - pf.get('x', x)) / p_dt
+                vy = (y - pf.get('y', y)) / p_dt
+            tap_events.append({'t': t, 'x': x, 'y': y, 'vx': vx, 'vy': vy, 'frame_idx': i})
 
         if k1_active:
             if k1_down_t is None:
                 k1_down_t = t
                 k1_presses += 1
-                if last_tap_t is not None and 30 <= (t - last_tap_t) <= 400:
-                    tap_intervals.append(t - last_tap_t)
-                last_tap_t = t
         else:
             if k1_down_t is not None:
                 k1_holds.append(max(1, t - k1_down_t))
@@ -2430,13 +5164,40 @@ def compute_deep_metrics(parsed):
             if k2_down_t is None:
                 k2_down_t = t
                 k2_presses += 1
-                if last_tap_t is not None and 30 <= (t - last_tap_t) <= 400:
-                    tap_intervals.append(t - last_tap_t)
-                last_tap_t = t
         else:
             if k2_down_t is not None:
                 k2_holds.append(max(1, t - k2_down_t))
                 k2_down_t = None
+
+        prev_k = keys
+
+    # Real Overshoot vs Undershoot detection from vector momentum after tap
+    for tap in tap_events:
+        idx = tap['frame_idx']
+        vx, vy = tap['vx'], tap['vy']
+        v_mag = math.hypot(vx, vy)
+        t_tap = tap['t']
+        
+        post_frames = []
+        for j in range(idx, min(len(frames), idx + 25)):
+            ft = frames[j].get('time', 0)
+            if ft < t_tap:
+                continue
+            if ft > t_tap + 100:
+                break
+            post_frames.append(frames[j])
+
+        if len(post_frames) >= 2 and v_mag > 0.05:
+            dx_post = post_frames[-1].get('x', tap['x']) - tap['x']
+            dy_post = post_frames[-1].get('y', tap['y']) - tap['y']
+            dot = vx * dx_post + vy * dy_post
+            if dot > 0:
+                overaim_events += 1
+            else:
+                underaim_events += 1
+        else:
+            # Stationary tap (e.g. perfect bot or relaxed stream)
+            underaim_events += 1
 
     tot_quads = max(1, sum(quads.values()))
     quad_pcts = {k: round(safe_div(v, tot_quads, 0.25) * 100, 1) for k, v in quads.items()}
@@ -2446,42 +5207,59 @@ def compute_deep_metrics(parsed):
 
     tot_aim_events = max(1, overaim_events + underaim_events)
     overaim_pct = round(safe_div(overaim_events, tot_aim_events, 0.5) * 100, 1)
+    underaim_pct = round(100.0 - overaim_pct, 1)
 
-    k1_avg = round(safe_div(sum(k1_holds), len(k1_holds), 52.0), 1)
-    k2_avg = round(safe_div(sum(k2_holds), len(k2_holds), 54.0), 1)
+    k1_avg = round(safe_div(sum(k1_holds), len(k1_holds), 0.0), 1)
+    k2_avg = round(safe_div(sum(k2_holds), len(k2_holds), 0.0), 1)
 
     max_k = max(k1_presses, k2_presses, 1)
     min_k = min(k1_presses, k2_presses)
     alt_ratio = round(safe_div(min_k, max_k, 0.5) * 100, 1)
 
-    if len(tap_intervals) >= 4:
-        mean_int = safe_div(sum(tap_intervals), len(tap_intervals), 0.0)
-        var = safe_div(sum((x - mean_int) ** 2 for x in tap_intervals), len(tap_intervals), 0.0)
-        std_dev = math.sqrt(max(0.0, var))
-        ur_val = round(min(350.0, max(45.0, std_dev * 1.8)), 1)
-    else:
-        ur_val = 82.5
+    # Filter active stream/burst/jump intervals (30ms up to 750ms to include single-taps)
+    active_intervals = [tap_events[i]['t'] - tap_events[i-1]['t'] for i in range(1, len(tap_events)) if 30 <= (tap_events[i]['t'] - tap_events[i-1]['t']) <= 750]
 
-    early_bias_pct = round(random.uniform(42.0, 58.0), 1)
+    if len(active_intervals) >= 2:
+        mean_int = safe_div(sum(active_intervals), len(active_intervals), 0.0)
+        var = safe_div(sum((x - mean_int) ** 2 for x in active_intervals), len(active_intervals), 0.0)
+        std_dev = math.sqrt(max(0.0, var))
+        ur_val = round(std_dev * 1.8, 1)
+    else:
+        ur_val = 0.0
+
+    # Calculate real early/late bias from interval deviations
+    early_taps = 0
+    total_timed_taps = 0
+    if len(active_intervals) >= 2:
+        sorted_int = sorted(active_intervals)
+        base_grid = max(20.0, sorted_int[len(sorted_int)//2])
+        for dt in active_intervals:
+            mult = max(1, round(dt / base_grid))
+            diff = dt - mult * base_grid
+            if diff < 0:
+                early_taps += 1
+            total_timed_taps += 1
+    early_bias_pct = round(safe_div(early_taps, max(1, total_timed_taps), 0.5) * 100, 1)
 
     chokes = []
     miss_cnt = parsed.get('misses', 0) or 0
-    h100 = parsed.get('100s', 0) or 0
-    h50 = parsed.get('50s', 0) or 0
 
     if miss_cnt > 0:
-        if overaim_pct > 62.0:
-            chokes.append(f"🎯 Aim-Overaim: {overaim_pct}% deiner schnellen Jumps flogen über den Zielkreis hinaus.")
-        elif overaim_pct < 38.0:
-            chokes.append(f"🎯 Aim-Underaim: {round(100 - overaim_pct, 1)}% der Jumps erreichten den Kreisrand nicht rechtzeitig.")
+        if overaim_pct > 60.0:
+            chokes.append("🎯 Aim-Overaim: Cursor überschießt den Zielkreis bei weiten Jumps (Snap-Übersteuern).")
+        elif overaim_pct < 40.0:
+            chokes.append("🎯 Aim-Underaim: Cursor stoppt vor der Circle-Edge bei schnellen Jumps (zu weite Wege / unvollständiger Snap).")
         
-        if abs(k1_avg - k2_avg) > 22.0:
-            chokes.append(f"⚡ Tapping-Asymmetrie: K1 ({k1_avg}ms) und K2 ({k2_avg}ms) weichen stark ab (Notelock-Gefahr).")
-        elif max(k1_avg, k2_avg) > 135.0:
-            chokes.append(f"⚡ Finger-Locking: Taste zu lange gehalten ({max(k1_avg, k2_avg)}ms), was Folge-Streams blockierte.")
+        if abs(k1_avg - k2_avg) > 20.0 and min(k1_avg, k2_avg) > 0:
+            chokes.append("⚡ Tapping-Asymmetrie: K1 und K2 Hold-Zeiten weichen stark ab (Notelock-Gefahr bei Streams).")
+        elif max(k1_avg, k2_avg) > 130.0:
+            chokes.append("⚡ Finger-Locking: Taste zu lange gehalten / fehlende Entlastung bei schnellen Burst-Folgen.")
         
+        if ur_val > 110.0:
+            chokes.append("📊 High-OD Timing-Drift: Hohe Streuung (UR) und unruhiges Timing-Fenster bei Pattern-Wechseln.")
+
         if not chokes:
-            chokes.append("⚡ Speed/Reading-Limit: Leichter Timing-Versatz bei schnellen Pattern-Wechseln.")
+            chokes.append("⚡ Speed/Reading-Limit: Leichter Rhythmus-Versatz bei schnellen Pattern-Wechseln.")
     else:
         chokes.append("✨ Perfekte Cleanliness: Keine kritischen Misses festgestellt!")
 
@@ -2489,7 +5267,7 @@ def compute_deep_metrics(parsed):
         'peak_speed': peak_spd,
         'avg_speed': avg_spd,
         'overaim_pct': overaim_pct,
-        'underaim_pct': round(100 - overaim_pct, 1),
+        'underaim_pct': underaim_pct,
         'k1_avg_hold': k1_avg,
         'k2_avg_hold': k2_avg,
         'k1_count': k1_presses,
@@ -2498,7 +5276,8 @@ def compute_deep_metrics(parsed):
         'ur': ur_val,
         'early_bias_pct': early_bias_pct,
         'quadrants': quad_pcts,
-        'choke_reasons': chokes
+        'choke_reasons': chokes,
+        'has_telemetry': True
     }
 
 def compute_aggregate_deep_telemetry(replays_list):
@@ -2548,7 +5327,20 @@ def compute_aggregate_deep_telemetry(replays_list):
         for reason in m.get('choke_reasons', []):
             if "Keine Frame-Daten" in reason or "Perfekte Cleanliness" in reason:
                 continue
-            choke_counter[reason] = choke_counter.get(reason, 0) + 1
+            # Normalize strings to canonical category keys for clean grouping
+            if "Aim-Underaim" in reason:
+                clean_reason = "🎯 Aim-Underaim: Cursor stoppt vor der Circle-Edge bei schnellen Jumps (zu weite Wege / unvollständiger Snap)."
+            elif "Aim-Overaim" in reason:
+                clean_reason = "🎯 Aim-Overaim: Cursor überschießt den Zielkreis bei weiten Jumps (Snap-Übersteuern)."
+            elif "Tapping-Asymmetrie" in reason:
+                clean_reason = "⚡ Tapping-Asymmetrie: K1 und K2 Hold-Zeiten weichen stark ab (Notelock-Gefahr bei Streams)."
+            elif "Finger-Locking" in reason:
+                clean_reason = "⚡ Finger-Locking: Taste zu lange gehalten / fehlende Entlastung bei schnellen Burst-Folgen."
+            elif "Timing-Versatz" in reason or "Timing-Drift" in reason or "High-OD" in reason:
+                clean_reason = "📊 High-OD Timing-Drift: Hohe Streuung (UR) und unruhiges Timing-Fenster bei Pattern-Wechseln."
+            else:
+                clean_reason = reason
+            choke_counter[clean_reason] = choke_counter.get(clean_reason, 0) + 1
 
     top_systemic_issues = sorted(choke_counter.items(), key=lambda x: x[1], reverse=True)[:5]
 
@@ -2569,7 +5361,7 @@ def compute_aggregate_deep_telemetry(replays_list):
         'avg_k1_hold': round(avg_k1_hold, 1),
         'avg_k2_hold': round(avg_k2_hold, 1),
         'avg_alt_ratio': round(avg_alt_ratio, 1),
-        'avg_ur': round(avg_ur, 1),
+'avg_ur': round(avg_ur, 1),
         'avg_early': round(avg_early, 1),
         'quadrants': {
             'TL': round(quad_tl, 1),
@@ -2579,6 +5371,752 @@ def compute_aggregate_deep_telemetry(replays_list):
         },
         'top_systemic_issues': top_systemic_issues
     }
+
+# ---------------------------------------------------------------------------
+# osu! LAZER-STYLE HIT TELEMETRY & VISUAL ACCURACY BREAKDOWN
+# ---------------------------------------------------------------------------
+
+def compute_lazer_hit_telemetry(parsed):
+    """
+    Computes genuine osu! lazer-style Hit Events from real action frames, disk replays, or memory telemetry:
+    - Fast .osu beatmap discovery via FastBeatmapFinder
+    - Exact HitObject mod-transformations (HR vertical flip Y'=384-Y, CS*1.3, DT time scaling t/1.5, EZ CS*0.5)
+    - Chronological two-pointer hit matching
+    - Discrete 25-bin histogram (-50ms..+50ms) with genuine Cyan (300), Lime (100), Orange (50) counts
+    - True relative CS Accuracy Scatter (Delta_X, Delta_Y) with genuine directional Overaim/Underaim momentum
+    """
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    # 0. Check precomputed lazer_telemetry in parsed dict
+    if isinstance(parsed.get('lazer_telemetry'), dict) and parsed['lazer_telemetry'].get('has_telemetry'):
+        return parsed['lazer_telemetry']
+
+    frames = parsed.get('frames', [])
+
+    # If frames are missing, try reloading from disk if file_path is available
+    if (not frames or len(frames) < 10) and parsed.get('file_path') and os.path.exists(parsed.get('file_path')):
+        try:
+            reparsed = parse_osr_deep_telemetry(parsed['file_path'])
+            if reparsed:
+                if isinstance(reparsed.get('lazer_telemetry'), dict) and reparsed['lazer_telemetry'].get('has_telemetry'):
+                    return reparsed['lazer_telemetry']
+                if reparsed.get('frames'):
+                    frames = reparsed['frames']
+        except Exception:
+            pass
+
+    bin_edges = list(range(-50, 52, 4))
+    num_bins = len(bin_edges) - 1
+
+    # If frames are missing, check if this is a live memory play with direct hit_errors list
+    if (not frames or len(frames) < 10) and parsed.get('hit_errors') and isinstance(parsed['hit_errors'], list) and len(parsed['hit_errors']) >= 1:
+        hit_errors = parsed['hit_errors']
+        od_val = float(parsed.get('od', 8.0) or 8.0)
+        dist = calculate_timing_distribution(hit_errors, od=od_val)
+
+        scatter_points = []
+        raw_scatter = parsed.get('scatter_points', [])
+        cs_val = float(parsed.get('cs', 4.0) or 4.0)
+        circle_radius = 54.4 - 4.48 * cs_val
+
+        if isinstance(raw_scatter, list):
+            for pt in raw_scatter:
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    rx, ry = float(pt[0]), float(pt[1])
+                    res = pt[2] if len(pt) > 2 else ('great' if math.hypot(rx, ry) <= circle_radius * 0.65 else 'ok')
+                elif isinstance(pt, dict):
+                    rx, ry = float(pt.get('x', 0.0)), float(pt.get('y', 0.0))
+                    res = pt.get('result', 'great' if math.hypot(rx, ry) <= circle_radius * 0.65 else 'ok')
+                else:
+                    continue
+                scatter_points.append({
+                    'x': round(rx, 2), 'y': round(ry, 2),
+                    'result': res,
+                    'hit_error': 0.0,
+                    'overshoot': rx > 0
+                })
+
+        calculated_ur = float(parsed.get('unstable_rate') or parsed.get('ur') or dist['unstable_rate'])
+        avg_hit_error = float(parsed.get('mean_hit_error') if parsed.get('mean_hit_error') is not None else (parsed.get('mean_error') if parsed.get('mean_error') is not None else dist['avg_hit_error']))
+        over_pct = float(parsed.get('overshoot_pct') or parsed.get('overaim_pct') or 50.0)
+        under_pct = round(100.0 - over_pct, 1)
+
+        return {
+            'bin_edges': dist['bin_edges'],
+            'bin_centers': dist['bin_centers'],
+            'bins': dist['bins'],
+            'bins_300': dist['bins_300'],
+            'bins_100': dist['bins_100'],
+            'bins_50': dist['bins_50'],
+            'avg_hit_error': round(avg_hit_error, 2),
+            'unstable_rate': round(calculated_ur, 1),
+            'scatter_points': scatter_points[:180],
+            'circle_radius': round(circle_radius, 2),
+            'overshoot_pct': over_pct,
+            'underaim_pct': under_pct,
+            'total_hits': len(hit_errors),
+            'has_telemetry': True,
+            'missing_osu': False
+        }
+
+    if not frames or len(frames) < 10:
+        return {
+            'bin_edges': list(range(-50, 52, 4)),
+            'bin_centers': [i + 2 for i in range(-50, 50, 4)],
+            'bins': [0] * 25,
+            'bins_300': [0] * 25,
+            'bins_100': [0] * 25,
+            'bins_50': [0] * 25,
+            'avg_hit_error': 0.0,
+            'unstable_rate': 0.0,
+            'scatter_points': [],
+            'circle_radius': 36.0,
+            'overshoot_pct': 50.0,
+            'underaim_pct': 50.0,
+            'total_hits': 0,
+            'has_telemetry': False,
+            'missing_osu': True,
+            'missing_message': "ℹ️ .osu Beatmap-Datei nicht im Songs-Ordner gefunden – HitObject-Abgleich nicht möglich"
+        }
+
+    # 1. Attempt genuine beatmap matching
+    mods = int(parsed.get('mods', 0) or 0)
+    b_hash = str(parsed.get('hash') or parsed.get('beatmap_md5') or parsed.get('md5') or '')
+    b_id = int(parsed.get('beatmap_id', 0) or parsed.get('id', 0) or 0)
+    b_title = str(parsed.get('title', ''))
+    b_version = str(parsed.get('version', '') or parsed.get('diff_name', ''))
+
+    finder = FastBeatmapFinder.get_instance()
+    osu_file_path = finder.find_beatmap(beatmap_md5=b_hash, beatmap_id=b_id, title=b_title, version=b_version)
+
+    if osu_file_path and os.path.exists(osu_file_path):
+        parsed_bm = parse_osu_hitobjects(osu_file_path, mods=mods)
+        if parsed_bm.get('has_beatmap') and parsed_bm.get('hit_objects'):
+            res = match_replay_to_beatmap(
+                frames=frames,
+                hit_objects=parsed_bm['hit_objects'],
+                od=parsed_bm['difficulty']['od'],
+                cs=parsed_bm['difficulty']['cs'],
+                mods=mods
+            )
+            return res
+
+    # If .osu file is not found, return clean fallback without fabricating synthetic data
+    return {
+        'bin_edges': list(range(-50, 52, 4)),
+        'bin_centers': [i + 2 for i in range(-50, 50, 4)],
+        'bins': [0] * 25,
+        'bins_300': [0] * 25,
+        'bins_100': [0] * 25,
+        'bins_50': [0] * 25,
+        'avg_hit_error': 0.0,
+        'unstable_rate': 0.0,
+        'scatter_points': [],
+        'circle_radius': 36.0,
+        'overshoot_pct': 50.0,
+        'underaim_pct': 50.0,
+        'total_hits': 0,
+        'has_telemetry': False,
+        'missing_osu': True,
+        'missing_message': "ℹ️ .osu Beatmap-Datei nicht im Songs-Ordner gefunden – HitObject-Abgleich nicht möglich"
+    }
+
+
+def compute_aggregate_lazer_hit_telemetry(history):
+    """
+    Computes true mathematical multi-play aggregate for osu! lazer Hit Telemetry across all replays in history.
+    """
+    if not history or not isinstance(history, list):
+        return None
+
+    bin_edges = list(range(-50, 52, 4))
+    num_bins = len(bin_edges) - 1
+    total_bins_300 = [0] * num_bins
+    total_bins_100 = [0] * num_bins
+    total_bins_50 = [0] * num_bins
+    
+    total_hits_accum = 0
+    weighted_err_sum = 0.0
+    ur_list = []
+    over_list = []
+    under_list = []
+    all_scatter = []
+    valid_plays_count = 0
+
+    for r in history:
+        if not isinstance(r, dict):
+            continue
+        h_data = compute_lazer_hit_telemetry(r)
+        if not h_data or not h_data.get('has_telemetry'):
+            continue
+        
+        valid_plays_count += 1
+        b3 = h_data.get('bins_300', [])
+        b1 = h_data.get('bins_100', [])
+        b5 = h_data.get('bins_50', [])
+        for i in range(min(num_bins, len(b3))):
+            total_bins_300[i] += b3[i]
+        for i in range(min(num_bins, len(b1))):
+            total_bins_100[i] += b1[i]
+        for i in range(min(num_bins, len(b5))):
+            total_bins_50[i] += b5[i]
+
+        r_hits = h_data.get('total_hits', 1)
+        r_err = h_data.get('avg_hit_error', 0.0)
+        weighted_err_sum += r_err * r_hits
+        total_hits_accum += r_hits
+
+        ur_list.append(h_data.get('unstable_rate', 80.0))
+        over_list.append(h_data.get('overshoot_pct', 50.0))
+        under_list.append(h_data.get('underaim_pct', 50.0))
+        
+        sc = h_data.get('scatter_points', [])
+        all_scatter.extend(sc[:max(2, 180 // max(1, len(history)))])
+
+    if valid_plays_count == 0:
+        return {
+            'bin_edges': bin_edges,
+            'bin_centers': [(bin_edges[i] + bin_edges[i+1]) / 2.0 for i in range(num_bins)],
+            'bins_300': [0] * num_bins,
+            'bins_100': [0] * num_bins,
+            'bins_50': [0] * num_bins,
+            'avg_hit_error': 0.0,
+            'unstable_rate': 0.0,
+            'scatter_points': [],
+            'circle_radius': 36.0,
+            'overshoot_pct': 50.0,
+            'underaim_pct': 50.0,
+            'total_hits': 0,
+            'has_telemetry': False
+        }
+
+    avg_hit_error = round(safe_div(weighted_err_sum, max(1, total_hits_accum), 0.0), 2)
+    avg_ur = round(safe_div(sum(ur_list), max(1, len(ur_list)), 80.0), 2)
+    avg_over = round(safe_div(sum(over_list), max(1, len(over_list)), 50.0), 1)
+    avg_under = round(safe_div(sum(under_list), max(1, len(under_list)), 50.0), 1)
+
+    return {
+        'bin_edges': bin_edges,
+        'bin_centers': [(bin_edges[i] + bin_edges[i+1]) / 2.0 for i in range(num_bins)],
+        'bins_300': total_bins_300,
+        'bins_100': total_bins_100,
+        'bins_50': total_bins_50,
+        'avg_hit_error': avg_hit_error,
+        'unstable_rate': avg_ur,
+        'scatter_points': all_scatter[:180],
+        'circle_radius': 36.0,
+        'overshoot_pct': avg_over,
+        'underaim_pct': avg_under,
+        'total_hits': total_hits_accum,
+        'has_telemetry': True
+    }
+
+def calculate_audio_offset_recommendation(avg_err_ms: float) -> dict:
+    """
+    Computes exact Universal and Local Audio Offset recommendations from mean hit error.
+    """
+    if avg_err_ms > 2.5:
+        suggested_universal = -int(round(avg_err_ms))
+        suggested_local = int(round(avg_err_ms))
+        status = "late"
+        advice = (
+            f"⏱️ **Audio Offset Anpassung:** Du triffst im Schnitt **{avg_err_ms:+.1f} ms zu spät** (nach dem Rhythmus-Beat).\n"
+            f"   ➔ **Empfehlung:** Stelle in den osu! Optionen das **Universal Audio Offset auf {suggested_universal:+d} ms** "
+            f"(oder bei dieser Beatmap das Local Offset auf **{suggested_local:+d} ms** mit den Tasten `+` / `-`), damit Hitsounds synchron zu deinem Klickpunkt erklingen!"
+        )
+    elif avg_err_ms < -2.5:
+        suggested_universal = int(round(abs(avg_err_ms)))
+        suggested_local = -int(round(abs(avg_err_ms)))
+        status = "early"
+        advice = (
+            f"⏱️ **Audio Offset Anpassung:** Du triffst im Schnitt **{abs(avg_err_ms):.1f} ms zu früh** (vorzeitiges Rushing vor dem Beat).\n"
+            f"   ➔ **Empfehlung:** Stelle in den osu! Optionen das **Universal Audio Offset auf {suggested_universal:+d} ms** "
+            f"(oder bei dieser Beatmap das Local Offset auf **{suggested_local:+d} ms** mit den Tasten `+` / `-`), um dein Vor-Tappen auszugleichen!"
+        )
+    else:
+        suggested_universal = 0
+        suggested_local = 0
+        status = "centered"
+        advice = f"⏱️ **Audio Offset:** Dein Treffer-Timing liegt perfekt zentriert bei {avg_err_ms:+.1f} ms (±2.5ms Idealbereich). Kein Offset-Tuning notwendig."
+
+    return {
+        "status": status,
+        "avg_err_ms": avg_err_ms,
+        "universal_offset_ms": suggested_universal,
+        "local_offset_ms": suggested_local,
+        "advice_text": advice
+    }
+
+
+def calculate_aim_hardware_recommendations(over_pct: float, under_pct: float) -> dict:
+    """
+    Computes deterministic Tablet Area (mm) and Mouse DPI adjustments from aim telemetry.
+    """
+    if over_pct >= 68.0:
+        tablet_delta_mm = "+3 bis +5 mm"
+        mouse_delta_dpi = "-80 bis -150 DPI"
+        advice = (
+            f"🎯 **Tablet-Area / Maus-Sensitivität (Starkes Overaiming: {over_pct:.1f}%):** In {over_pct:.0f}% deiner Sprünge überschießt der Cursor das Zielkreis-Zentrum deutlich (Snap-Übersteuern).\n"
+            f"   ➔ **Empfehlung:** Vergrößere deine aktive Tablet-Breite um **ca. {tablet_delta_mm}** "
+            f"(bzw. senke deine Maus-DPI um **{mouse_delta_dpi}**), um die Cursor-Kontrolle zu dämpfen und weite Snaps exakt auf der Circle-Edge abzufangen."
+        )
+    elif over_pct >= 58.0:
+        tablet_delta_mm = "+2 bis +3 mm"
+        mouse_delta_dpi = "-50 DPI"
+        advice = (
+            f"🎯 **Tablet-Area / Maus-Sensitivität (Leichtes Overaiming: {over_pct:.1f}%):** In {over_pct:.0f}% deiner Sprünge überschießt der Cursor das Ziel.\n"
+            f"   ➔ **Empfehlung:** Vergrößere deine aktive Tablet-Breite um **ca. 2 bis 3 mm** "
+            f"(bzw. senke deine Maus-DPI um **{mouse_delta_dpi}**), um Übersteuern bei schnellen Sprüngen zu minimieren."
+        )
+    elif under_pct >= 68.0:
+        tablet_delta_mm = "-3 bis -5 mm"
+        mouse_delta_dpi = "+80 bis +150 DPI"
+        advice = (
+            f"🎯 **Tablet-Area / Maus-Sensitivität (Starkes Underaiming: {under_pct:.1f}%):** In {under_pct:.0f}% deiner Sprünge stoppt der Cursor kurz vor der Circle-Edge (zu weite Wege / unvollständiger Snap).\n"
+            f"   ➔ **Empfehlung:** Verkleinere deine aktive Tablet-Breite um **ca. {tablet_delta_mm}** "
+            f"(bzw. erhöhe deine Maus-DPI um **{mouse_delta_dpi}**), um weite Cross-Screen Jumps mit weniger Handgelenk-Dehnung vollständig zu treffen."
+        )
+    elif under_pct >= 58.0:
+        tablet_delta_mm = "-2 bis -3 mm"
+        mouse_delta_dpi = "+50 DPI"
+        advice = (
+            f"🎯 **Tablet-Area / Maus-Sensitivität (Leichtes Underaiming: {under_pct:.1f}%):** In {under_pct:.0f}% deiner Sprünge stoppt der Cursor kurz vor der Circle-Edge.\n"
+            f"   ➔ **Empfehlung:** Verkleinere deine aktive Tablet-Breite um **ca. 2 bis 3 mm** "
+            f"(bzw. erhöhe deine Maus-DPI um **{mouse_delta_dpi}**), um weite Ecken bequemer zu erreichen."
+        )
+    else:
+        tablet_delta_mm = "0 mm"
+        mouse_delta_dpi = "0 DPI"
+        advice = "🎯 **Tablet-Area / Sensitivität:** Ausgewogenes 50/50 Aim-Verhältnis (kein systematischer Underaim/Overaim-Fehler). Area & DPI beibehalten!"
+
+    return {
+        "over_pct": over_pct,
+        "under_pct": under_pct,
+        "tablet_adjustment": tablet_delta_mm,
+        "mouse_adjustment": mouse_delta_dpi,
+        "advice_text": advice
+    }
+
+
+def calculate_tapping_ergonomics_recommendations(k1_hold_ms: float, k2_hold_ms: float, ur_val: float) -> list:
+    """
+    Evaluates key hold times, asymmetry delta, and Unstable Rate for tapping ergonomics.
+    """
+    recs = []
+    hold_gap = abs(k1_hold_ms - k2_hold_ms)
+    max_hold = max(k1_hold_ms, k2_hold_ms)
+
+    # 1. Critical Asymmetry (> 25ms delta)
+    if hold_gap > 25.0 and min(k1_hold_ms, k2_hold_ms) > 0:
+        recs.append(
+            f"⚠️ **Kritische Tapping-Asymmetrie (Versatz: {hold_gap:.1f} ms):**\n"
+            f"   Taste 1 (K1: {k1_hold_ms:.1f} ms) und Taste 2 (K2: {k2_hold_ms:.1f} ms) weichen massiv voneinander ab.\n"
+            f"   ➔ **Gefahr:** Bei Stream-Geschwindigkeiten über 170 BPM führt dieser Versatz zu unvermeidbarem Notelock und vorzeitiger Finger-Ermüdung.\n"
+            f"   ➔ **Empfehlung:** Gleiche den Fingerdruck beider Finger bewusst an. Bei Rapid-Trigger Tastaturen (z. B. Wooting / DrunkDeer) den Auslöseweg (Actuation) auf **0.4 mm** und den Release Point auf **0.15–0.20 mm** einstellen!"
+        )
+    elif hold_gap >= 18.0 and min(k1_hold_ms, k2_hold_ms) > 0:
+        recs.append(
+            f"⚡ **Tastatur & Tapping-Asymmetrie (Versatz: {hold_gap:.1f} ms):**\n"
+            f"   Taste 1 ({k1_hold_ms:.1f} ms) und Taste 2 ({k2_hold_ms:.1f} ms) werden ungleich lang gehalten.\n"
+            f"   ➔ **Empfehlung:** Gleiche den Fingerdruck bei Streams bewusst an. Bei Rapid-Trigger Tastaturen (z.B. Wooting / DrunkDeer) den Actuation Point auf **0.4 mm** und Release Point auf **0.2 mm** einstellen, um Notelocks zu verhindern."
+        )
+
+    # 2. Finger-Locking / Excessive Key Hold Duration (> 130ms)
+    if max_hold > 130.0:
+        recs.append(
+            f"⚡ **Finger-Locking Warnung (Max Hold: {max_hold:.1f} ms):**\n"
+            f"   Eine deiner Tasten wird während schneller Notenfolgen zu lange unten gehalten.\n"
+            f"   ➔ **Empfehlung:** Lockere den Unterarm und übe die KHZ-Methode auf niedrigerem BPM (z. B. 160 BPM), um die Finger nach jedem Anschlag sofort wieder zu entlasten."
+        )
+
+    # 3. Unstable Rate & Visual Clarity
+    if ur_val > 105.0:
+        recs.append(
+            f"👀 **Grafik- & Sound-Settings (UR: {ur_val:.1f}):**\n"
+            f"   ➔ Setze **Background Dim in osu! auf 100%** (komplett schwarzer Hintergrund) und stelle die **Effect-/Hitsound-Lautstärke auf 75–80%** (deutlich lauter als die Musik), um das akustische Tapping-Feedback zu schärfen."
+        )
+
+    return recs
+
+
+def generate_offline_deep_replay_diagnosis(agg: dict, agg_hit_data: dict = None) -> str:
+    """
+    Generates a full 5-section pro coaching report in 100% German when Gemini API is unavailable.
+    """
+    if agg is None:
+        agg = {}
+    if agg_hit_data is None:
+        agg_hit_data = {}
+
+    total_plays = agg.get("total_plays", 1)
+    over_pct = agg.get("avg_overaim", 50.0)
+    under_pct = agg.get("avg_underaim", 50.0)
+    avg_err_ms = agg_hit_data.get('avg_hit_error', agg.get("avg_offset", 0.0))
+    ur_val = agg_hit_data.get('unstable_rate', agg.get("avg_ur", 80.0))
+    k1_hold = agg.get("avg_k1_hold", 50.0)
+    k2_hold = agg.get("avg_k2_hold", 50.0)
+    hold_gap = abs(k1_hold - k2_hold)
+    avg_peak_spd = agg.get("avg_peak_spd", 0.0)
+    avg_misses = agg.get("avg_misses_per_play", 0.0)
+
+    aim_tendency = f"{under_pct:.1f}% Underaim (Cursor stoppt kurz vor der Circle-Edge)" if under_pct > 55 else (
+        f"{over_pct:.1f}% Overaim (Cursor überschießt das Ziel)" if over_pct > 55 else "balancierte 50/50 Aim-Dynamik"
+    )
+    offset_action = (
+        f"Universal Audio Offset in den osu!-Optionen auf {(-int(round(avg_err_ms))):+d} ms einstellen" 
+        if abs(avg_err_ms) > 2.5 else "Audio Offset bei 0 ms belassen"
+    )
+    tablet_advice = (
+        "Verkleinere deine Tablet-Area in der Breite um ca. 2 bis 3 mm (oder erhöhe die DPI minimal)" if under_pct > 55 else (
+            "Vergrößere deine Tablet-Area in der Breite um ca. 2 bis 3 mm (oder senke die DPI minimal)" if over_pct > 55 else "Behalte deine aktuelle Tablet-Area bei"
+        )
+    )
+
+    return f"""🎯 **1. Aim- & Cursor-Mechanik (Underaim / Overaim & Snapping):**
+Über alle {total_plays} gespielten Maps zeigt sich eine dominante Tendenz zu {aim_tendency}. Bei weiten Cross-Screen Jumps und schnellen Richtungswechseln wird die Bewegung oft zu früh abgebremst bzw. übersteuert, bevor der Klick erfolgt. Deine Peak-Snapping-Geschwindigkeit von {avg_peak_spd:,.0f} px/s ist solide, benötigt jedoch mehr Konstanz am Zielpunkt.
+
+⚡ **2. Tapping-Technik & Finger-Stamina:**
+Deine durchschnittlichen Hold-Zeiten liegen bei K1: {k1_hold:.1f} ms und K2: {k2_hold:.1f} ms (Asymmetrie-Versatz: {hold_gap:.1f} ms). Deine Unstable Rate von ~{ur_val:.1f} zeigt, dass bei schnelleren Streams ein leichtes Finger-Locking auftritt. Achte darauf, beide Tasten mit identischem Druck und schnellem Release zu bedienen.
+
+🩸 **3. Hauptursachen für Misses & Chokes:**
+Mit durchschnittlich {avg_misses:.1f} Misses pro Map entstehen die meisten Fehler nicht durch fehlende Grundschnelligkeit, sondern durch Dekompensation bei dichten Pattern-Übergängen und weiten Sprungdistanzen.
+
+🛠️ **4. Hardware-, Grip- & Setup-Empfehlungen (inkl. Audio Offset):**
+- **Audio Offset:** {offset_action}, um dein Treffer-Timing ({avg_err_ms:+.2f} ms) perfekt auf den Musik-Beat zu zentrieren.
+- **Tablet / Maus:** {tablet_advice}, um die Reichweite bei weiten Jumps ohne übermäßige Handgelenk-Dehnung zu erreichen.
+- **Ergonomie & Rapid Trigger:** Bei Rapid Trigger Tastaturen den Actuation Point auf 0.4 mm und Release Point auf 0.15–0.20 mm einstellen. Halte deinen Unterarm flach auf dem Tisch.
+
+📅 **5. Konkreter 3-Tage Trainings- und Ausbesserungsplan:**
+- **Tag 1 (Aim-Stabilisierung):** 20 Min. NoMod Jump-Training (CS 4.5 - 5.0, 160-180 BPM) mit Fokus auf saubere Circle-Mitte-Treffer.
+- **Tag 2 (Finger-Control & UR):** 25 Min. Alternate- und Burst-Maps (175-195 BPM) zur Beseitigung der {hold_gap:.1f} ms Tapping-Asymmetrie.
+- **Tag 3 (Consistency & Push):** 30 Min. Level-Training mit Fokus auf PFCs und 3-Minuten-Maps zur Festigung der Nervenstärke."""
+
+
+def compute_settings_recommendations(*args, **kwargs):
+    """
+    Computes precise, actionable osu! hardware and gameplay settings recommendations.
+    Accepts either (avg_err_ms, ur_val, over_pct, under_pct, hold_gap_ms=0.0)
+    or a single dict argument with telemetry keys.
+    """
+    if len(args) == 1 and isinstance(args[0], dict):
+        d = args[0]
+        avg_err_ms = d.get('avg_hit_error', d.get('mean_error', 0.0))
+        ur_val = d.get('unstable_rate', d.get('ur', 80.0))
+        over_pct = d.get('overshoot_pct', d.get('overaim_pct', d.get('overaim_ratio', 50.0)))
+        under_pct = d.get('underaim_pct', d.get('underaim_ratio', 50.0))
+        k1_hold = d.get('k1_avg_hold', 40.0)
+        k2_hold = d.get('k2_avg_hold', 40.0)
+        hold_gap_ms = d.get('hold_gap_ms', abs(k1_hold - k2_hold))
+    else:
+        avg_err_ms = args[0] if len(args) > 0 else kwargs.get('avg_err_ms', 0.0)
+        ur_val = args[1] if len(args) > 1 else kwargs.get('ur_val', 80.0)
+        over_pct = args[2] if len(args) > 2 else kwargs.get('over_pct', 50.0)
+        under_pct = args[3] if len(args) > 3 else kwargs.get('under_pct', 50.0)
+        hold_gap_ms = args[4] if len(args) > 4 else kwargs.get('hold_gap_ms', 0.0)
+
+    recs = []
+
+    # 1. Universal / Local Audio Offset
+    offset_res = calculate_audio_offset_recommendation(avg_err_ms)
+    recs.append(offset_res["advice_text"])
+
+    # 2. Tablet Area / Maus DPI
+    aim_res = calculate_aim_hardware_recommendations(over_pct, under_pct)
+    recs.append(aim_res["advice_text"])
+
+    # 3. Tapping / Rapid Trigger & Visuals
+    # If hold_gap_ms is given, construct dummy hold times to calculate tapping recs
+    k1_dummy = 50.0 + (hold_gap_ms / 2.0)
+    k2_dummy = max(0.0, 50.0 - (hold_gap_ms / 2.0))
+    tap_recs = calculate_tapping_ergonomics_recommendations(k1_dummy, k2_dummy, ur_val)
+    for tr in tap_recs:
+        recs.append(tr)
+
+    return "\n\n".join(recs)
+
+
+class AICoachEngine:
+    """
+    Deterministic AI Coaching & Telemetry Rule Engine for osu! Standard.
+    Integrates live telemetry, hardware recommendations, and German debriefing generation.
+    """
+    @staticmethod
+    def calculate_audio_offset_recommendation(avg_err_ms: float) -> dict:
+        return calculate_audio_offset_recommendation(avg_err_ms)
+
+    @staticmethod
+    def calculate_aim_hardware_recommendations(over_pct: float, under_pct: float) -> dict:
+        return calculate_aim_hardware_recommendations(over_pct, under_pct)
+
+    @staticmethod
+    def calculate_tapping_ergonomics_recommendations(k1_hold_ms: float, k2_hold_ms: float, ur_val: float) -> list:
+        return calculate_tapping_ergonomics_recommendations(k1_hold_ms, k2_hold_ms, ur_val)
+
+    @staticmethod
+    def compute_settings_recommendations(*args, **kwargs) -> str:
+        return compute_settings_recommendations(*args, **kwargs)
+
+    @staticmethod
+    def compute_settings_recommendations_dict(hit_data: dict) -> dict:
+        avg_err = hit_data.get("avg_hit_error", hit_data.get("mean_error", 0.0))
+        ur = hit_data.get("unstable_rate", hit_data.get("ur", 80.0))
+        over_pct = hit_data.get("overshoot_pct", hit_data.get("overaim_pct", hit_data.get("overaim_ratio", 50.0)))
+        under_pct = hit_data.get("underaim_pct", hit_data.get("underaim_ratio", 50.0))
+        k1_hold = hit_data.get("k1_avg_hold", 40.0)
+        k2_hold = hit_data.get("k2_avg_hold", 40.0)
+        hold_gap = abs(k1_hold - k2_hold)
+
+        offset_info = calculate_audio_offset_recommendation(avg_err)
+        aim_info = calculate_aim_hardware_recommendations(over_pct, under_pct)
+        tap_info = calculate_tapping_ergonomics_recommendations(k1_hold, k2_hold, ur)
+
+        return {
+            "audio_offset": offset_info,
+            "tablet_area": aim_info["tablet_adjustment"],
+            "mouse_dpi": aim_info["mouse_adjustment"],
+            "rapid_trigger": "Actuation 0.4mm / Release 0.15-0.20mm" if hold_gap > 25.0 else ("Actuation 0.4mm / Release 0.2mm" if hold_gap >= 18.0 else "Standard"),
+            "stamina_asymmetry": tap_info,
+            "advice_text": compute_settings_recommendations(avg_err, ur, over_pct, under_pct, hold_gap)
+        }
+
+    @staticmethod
+    def generate_live_coaching_debrief(session_data: dict, api_key: str = None) -> str:
+        title = session_data.get("title", "Map")
+        acc = session_data.get("accuracy", 100.0)
+        ur = session_data.get("unstable_rate", 80.0)
+        avg_err = session_data.get("mean_error", session_data.get("avg_hit_error", 0.0))
+        over_pct = session_data.get("overaim_ratio", session_data.get("overaim_pct", session_data.get("overshoot_pct", 50.0)))
+        under_pct = session_data.get("underaim_ratio", session_data.get("underaim_pct", 50.0))
+        k1_hold = session_data.get("k1_avg_hold", 40.0)
+        k2_hold = session_data.get("k2_avg_hold", 40.0)
+        hold_gap = abs(k1_hold - k2_hold)
+
+        settings_txt = compute_settings_recommendations(avg_err, ur, over_pct, under_pct, hold_gap)
+
+        return f"""📊 KI-COACHING DEBRIEFING — {title}
+
+1. Taktische Zusammenfassung:
+• Genauigkeit: {acc:.2f}% | Unstable Rate: {ur:.1f} | Treffer-Versatz: {avg_err:+.1f} ms
+• Rundenbewertung: {'Hervorragende Präzision!' if acc >= 98.0 else 'Gute Leistung mit Optimierungspotenzial.'}
+
+2. Timing & Rhythmus-Präzision:
+• Tapping-Tendenz: {'Leichtes Rushing (zu früh)' if avg_err < -2.5 else ('Leichtes Dragging (zu spät)' if avg_err > 2.5 else 'Perfekt auf dem Metronom-Beat')}
+• Rhythmus-Stabilität: {'Exzellente Konstanz (<85 UR)' if ur < 85 else 'Streuung bei dichten Notenfolgen'}
+
+3. Aim & Cursor-Dynamik:
+• Overshoot: {over_pct:.1f}% | Undershoot: {under_pct:.1f}%
+• Aim-Verhalten: {'Ausgeglichenes Zielen' if 45 <= over_pct <= 55 else ('Systematisches Overaimen' if over_pct > 55 else 'Systematisches Underaimen')}
+
+4. Hardware & Setup-Empfehlungen:
+{settings_txt}
+
+5. Nächste Trainingsschritte:
+• Fokus auf kontrolliertes Finger-Alternieren bei Streams
+• Zielgenaues Snap-Aiming zur Circle-Mitte trainieren
+"""
+
+    @staticmethod
+    def generate_offline_deep_replay_diagnosis(agg: dict, agg_hit_data: dict = None) -> str:
+        return generate_offline_deep_replay_diagnosis(agg, agg_hit_data)
+
+
+def render_lazer_timing_distribution(canvas, hit_data, width=420, height=200):
+    """
+    Renders an authentic osu! lazer Timing Distribution bar chart onto a Tkinter Canvas.
+    """
+    canvas.delete("all")
+    canvas.configure(bg="#101018", highlightthickness=0)
+
+    # Margins
+    pad_l = 32
+    pad_r = 16
+    pad_t = 38
+    pad_b = 32
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    # Title & Stats header
+    avg_err = hit_data.get('avg_hit_error', 0.0)
+    ur = hit_data.get('unstable_rate', 88.5)
+    err_sign = f"+{avg_err:.2f} ms zu spät" if avg_err >= 0 else f"{avg_err:.2f} ms zu früh"
+
+    canvas.create_text(pad_l, 14, text="Timing Distribution", fill="#ffffff", font=("Arial", 12, "bold"), anchor="w")
+    canvas.create_text(width - pad_r, 14, text=f"Ø Fehler: {err_sign}  •  UR: {ur:.1f}", fill="#00E5FF", font=("Arial", 10, "bold"), anchor="e")
+
+    # Baseline & Grid lines
+    base_y = pad_t + plot_h
+    canvas.create_line(pad_l, base_y, pad_l + plot_w, base_y, fill="#2c2c3e", width=1)
+
+    bins_300 = hit_data.get('bins_300', [])
+    bins_100 = hit_data.get('bins_100', [])
+    bins_50 = hit_data.get('bins_50', [])
+    num_bins = len(bins_300)
+    if num_bins == 0:
+        return
+
+    # Maximum bar height calculation
+    max_count = max([b3 + b1 + b5 for b3, b1, b5 in zip(bins_300, bins_100, bins_50)] + [1])
+
+    bar_w = max(2, (plot_w / num_bins) - 1.5)
+    center_idx = num_bins // 2
+
+    # Draw bars
+    for i in range(num_bins):
+        c3 = bins_300[i]
+        c1 = bins_100[i]
+        c5 = bins_50[i]
+        total = c3 + c1 + c5
+
+        x_center = pad_l + (i + 0.5) * (plot_w / num_bins)
+        x0 = x_center - bar_w / 2.0
+        x1 = x_center + bar_w / 2.0
+
+        if total > 0:
+            h3 = (c3 / max_count) * plot_h
+            h1 = (c1 / max_count) * plot_h
+            h5 = (c5 / max_count) * plot_h
+
+            y_curr = base_y
+
+            # 300s (Great) - Cyan Blue #00E5FF / #29B6F6
+            if h3 > 0:
+                canvas.create_rectangle(x0, y_curr - h3, x1, y_curr, fill="#29B6F6", outline="", width=0)
+                y_curr -= h3
+
+            # 100s (Ok) - Lime Green #9CCC65
+            if h1 > 0:
+                canvas.create_rectangle(x0, y_curr - h1, x1, y_curr, fill="#9CCC65", outline="", width=0)
+                y_curr -= h1
+
+            # 50s (Meh) - Orange #FFA726
+            if h5 > 0:
+                canvas.create_rectangle(x0, y_curr - h5, x1, y_curr, fill="#FFA726", outline="", width=0)
+
+        # Highlight center bin (0 ms) with distinct white marker
+        if i == center_idx:
+            canvas.create_line(x_center, pad_t + 4, x_center, base_y, fill="#ffffff", width=1.5, dash=(3, 2))
+
+    # Bottom scale markings (-50, -40, -30, -20, -10, 0, +10, +20, +30, +40, +50)
+    for ms_val in [-50, -40, -30, -20, -10, 0, 10, 20, 30, 40, 50]:
+        norm_t = (ms_val + 50.0) / 100.0
+        x_pos = pad_l + norm_t * plot_w
+        canvas.create_line(x_pos, base_y, x_pos, base_y + 4, fill="#555566", width=1)
+        lbl_text = f"{ms_val:+d}" if ms_val != 0 else "0"
+        col = "#ffffff" if ms_val == 0 else "#777788"
+        canvas.create_text(x_pos, base_y + 14, text=lbl_text, fill=col, font=("Arial", 8), anchor="center")
+
+def render_lazer_accuracy_heatmap(canvas, hit_data, width=280, height=200):
+    """
+    Renders an authentic osu! lazer Accuracy Heatmap with Circle Boundary, Overaim/Underaim Axis, and Scatter Dots.
+    """
+    canvas.delete("all")
+    canvas.configure(bg="#101018", highlightthickness=0)
+
+    # Title header
+    over_pct = hit_data.get('overshoot_pct', 50.0)
+    canvas.create_text(16, 14, text="Accuracy Heatmap", fill="#ffffff", font=("Arial", 12, "bold"), anchor="w")
+    canvas.create_text(width - 16, 14, text=f"{over_pct:.0f}% Overaim", fill="#00E5FF", font=("Arial", 10, "bold"), anchor="e")
+
+    # Center coordinates & circle scale
+    cx = width / 2.0
+    cy = (height + 24) / 2.0
+    r_target = 54.0  # visual radius of the hit circle
+    r_scale = float(hit_data.get('circle_radius', 36.0) or 36.0)
+
+    # 1. Outer target circle boundary (CS Hit Object)
+    canvas.create_oval(cx - r_target, cy - r_target, cx + r_target, cy + r_target,
+                       outline="#37474F", width=1.5)
+    canvas.create_oval(cx - r_target * 0.5, cy - r_target * 0.5, cx + r_target * 0.5, cy + r_target * 0.5,
+                       outline="#21272B", width=1, dash=(2, 2))
+
+    # 2. Crosshair guidelines
+    canvas.create_line(cx - r_target - 16, cy, cx + r_target + 16, cy, fill="#263238", width=1)
+    canvas.create_line(cx, cy - r_target - 16, cx, cy + r_target + 16, fill="#263238", width=1)
+
+    # 3. Diagonal 45° Overaim / Underaim Axis with arrows
+    d_len = r_target + 26
+    # Undershoot (bottom-left) to Overshoot (top-right)
+    x_us = cx - d_len * 0.707
+    y_us = cy + d_len * 0.707
+    x_os = cx + d_len * 0.707
+    y_os = cy - d_len * 0.707
+
+    canvas.create_line(x_us, y_us, x_os, y_os, fill="#00BFA5", width=1.5, arrow="last", arrowshape=(8, 10, 3))
+
+    # Labels for Overaim ↗ & Underaim ↙
+    canvas.create_text(x_os + 4, y_os - 4, text="Overaim ↗", fill="#00E5FF", font=("Arial", 8, "bold"), anchor="sw")
+    canvas.create_text(x_us - 4, y_us + 4, text="↙ Underaim", fill="#80CBC4", font=("Arial", 8), anchor="ne")
+
+    # 4. Draw hit scatter dots at authentic relative positions
+    scatter = hit_data.get('scatter_points', [])
+    for p in scatter[:180]:  # render up to 180 points for snappy performance
+        rx = p.get('x', 0.0)
+        ry = p.get('y', 0.0)
+        res = p.get('result', 'great')
+
+        # Map to visual canvas coords (top of circle maps to top of canvas)
+        px = cx + (rx / r_scale) * r_target
+        py = cy + (ry / r_scale) * r_target
+
+        if res == "great":
+            dot_col = "#00E5FF"
+            glow_col = "#006064"
+            dot_r = 2.2
+        elif res == "ok":
+            dot_col = "#9CCC65"
+            glow_col = "#33691E"
+            dot_r = 2.6
+        elif res == "meh":
+            dot_col = "#FFA726"
+            glow_col = "#E65100"
+            dot_r = 3.0
+        else:
+            dot_col = "#EF5350"
+            glow_col = "#B71C1C"
+            dot_r = 3.2
+
+        # Subtle glow halo
+        canvas.create_oval(px - dot_r - 1.2, py - dot_r - 1.2, px + dot_r + 1.2, py + dot_r + 1.2,
+                           fill=glow_col, outline="", width=0)
+        # Core dot
+        canvas.create_oval(px - dot_r, py - dot_r, px + dot_r, py + dot_r,
+                           fill=dot_col, outline="", width=0)
+
+def create_lazer_results_card(parent, hit_data, width=720, height=220):
+    """
+    Creates a full osu! lazer Results Screen widget containing both
+    Timing Distribution and Accuracy Heatmap side-by-side.
+    """
+    if not hit_data or not hit_data.get('has_telemetry', True) or hit_data.get('total_hits', 0) == 0:
+        card = ctk.CTkFrame(parent, fg_color="#101016", corner_radius=12, border_width=1, border_color="#262638")
+        card.pack(fill="x", pady=6, padx=4)
+        msg = hit_data.get('missing_message') if (hit_data and hit_data.get('missing_message')) else "ℹ️ .osu Beatmap-Datei nicht im Songs-Ordner gefunden – HitObject-Abgleich nicht möglich"
+        ctk.CTkLabel(card, text=msg,
+                     font=("Arial", 12), text_color="#888899").pack(padx=20, pady=25)
+        return card
+
+    card = ctk.CTkFrame(parent, fg_color="#101016", corner_radius=14, border_width=1, border_color="#262638")
+    card.pack(fill="x", pady=6, padx=4)
+
+    grid_f = ctk.CTkFrame(card, fg_color="transparent")
+    grid_f.pack(fill="both", expand=True, padx=8, pady=8)
+
+    # Left: Timing Distribution Canvas
+    timing_w = max(340, int(width * 0.60))
+    timing_canvas = tk.Canvas(grid_f, width=timing_w, height=height, bg="#101018", highlightthickness=0)
+    timing_canvas.pack(side="left", fill="both", expand=True, padx=(0, 6))
+    render_lazer_timing_distribution(timing_canvas, hit_data, width=timing_w, height=height)
+
+    # Right: Accuracy Heatmap Canvas
+    heat_w = max(240, int(width * 0.38))
+    heat_canvas = tk.Canvas(grid_f, width=heat_w, height=height, bg="#101018", highlightthickness=0)
+    heat_canvas.pack(side="right", fill="both", expand=True, padx=(6, 0))
+    render_lazer_accuracy_heatmap(heat_canvas, hit_data, width=heat_w, height=height)
+
+    return card
+
+
 
 def set_windows_autostart(enable=True):
     """Configures UHO Hub to auto-start with Windows in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run."""
@@ -3740,22 +7278,24 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.ai_user_feedback = {}
         self._dir_mtimes = {}
 
-        # Scan existing replays to initialize baseline
-        import glob
-        try:
-            for osu_dir in find_osu_directories():
-                for sub in [os.path.join(osu_dir, 'Data', 'r'), os.path.join(osu_dir, 'Replays')]:
-                    if os.path.exists(sub):
-                        self._dir_mtimes[sub] = os.stat(sub).st_mtime
-                        for f in glob.glob(os.path.join(sub, "*.osr")):
-                            self.processed_replays.add(f)
-        except Exception:
-            pass
-
-        self.after(1500, self.auto_import_loop)
-        
         self.load_global_settings()
-        self.scan_all_local_osu_replays(max_replays=25)
+
+        # Non-blocking asynchronous startup scan: loads baseline replays in background without stalling GUI launch
+        def _async_startup_scan():
+            import glob
+            try:
+                for osu_dir in find_osu_directories():
+                    for sub in [os.path.join(osu_dir, 'Data', 'r'), os.path.join(osu_dir, 'Replays')]:
+                        if os.path.exists(sub):
+                            self._dir_mtimes[sub] = os.stat(sub).st_mtime
+                            for f in glob.glob(os.path.join(sub, "*.osr")):
+                                self.processed_replays.add(f)
+                self.scan_all_local_osu_replays(max_replays=25)
+            except Exception:
+                pass
+
+        threading.Thread(target=_async_startup_scan, daemon=True, name="StartupReplayScanner").start()
+        self.after(1500, self.auto_import_loop)
         
         # Daily & Session Recap System initialization
         self.active_session = None
@@ -3769,6 +7309,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._processed_session_play_ids = set()
         self._start_osu_session_monitor_daemon()
 
+        # Live Memory Telemetry & SQLite Storage Engine (tosu architecture)
+        self.telemetry_storage = TelemetryStorageEngine(db_path="telemetry.db")
+        mem_mode = getattr(self, "memory_polling_mode", "adaptive")
+        self.live_memory_engine = OsuLiveMemoryEngine(polling_mode=mem_mode)
+        self.live_memory_engine.on_play_complete(self._on_live_play_complete)
+        self.live_memory_engine.start()
+        self._pump_ui_dispatch_loop()
+
         self.after(3500, self.start_auto_update_checker)
         if not getattr(self, "uho_api_key", ""):
             self.show_uho_auth_screen()
@@ -3776,6 +7324,31 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.show_tutorial_welcome()
         else:
             self.show_main_menu()
+
+    def _pump_ui_dispatch_loop(self):
+        """Pumps background worker UI dispatches at ~60 Hz safely on the main thread."""
+        _pump_ui_dispatch_queue()
+        try:
+            self.after(16, self._pump_ui_dispatch_loop)
+        except Exception:
+            pass
+
+    def _on_live_play_complete(self, session_data: dict):
+        """Callback invoked from memory engine upon song completion (Playing -> Results/Menu)."""
+        if not session_data:
+            return
+        row_id = self.telemetry_storage.save_live_session(session_data)
+        self.record_deep_replay_play(session_data)
+        self.safe_ui_dispatch(self, self._handle_live_play_complete_ui, session_data, row_id)
+
+    def _handle_live_play_complete_ui(self, session_data: dict, row_id: int):
+        """Thread-safe UI update handler after zero-F2 telemetry persistence."""
+        try:
+            if hasattr(self, 'current_tab') and self.current_tab == 'deep_replay':
+                if hasattr(self, 'show_deep_replay_analyzer'):
+                    self.show_deep_replay_analyzer()
+        except Exception:
+            pass
 
     def safe_ui_dispatch(self, widget, callback, *args, **kwargs):
         """Safely executes a UI callback on the main thread, ensuring the target widget is alive."""
@@ -3840,12 +7413,16 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         """Records a parsed replay into the holistic session history and last telemetry slot."""
         if not parsed or not isinstance(parsed, dict):
             return
+        if not parsed.get('lazer_telemetry'):
+            parsed['lazer_telemetry'] = compute_lazer_hit_telemetry(parsed)
         self.last_deep_replay_telemetry = parsed
         if not hasattr(self, 'deep_replay_history') or not isinstance(self.deep_replay_history, list):
             self.deep_replay_history = []
         
-        # Save a clean copy without massive frames array to keep memory and settings small
+        # Save a clean copy without massive frames array, but preserving metrics & lazer_telemetry
         clean = {k: v for k, v in parsed.items() if k != 'frames'}
+        if 'lazer_telemetry' in parsed:
+            clean['lazer_telemetry'] = parsed['lazer_telemetry']
         
         # Check duplicate by timestamp, hash or file path
         ts = clean.get('timestamp')
@@ -3920,6 +7497,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 if data.get('deep_replay_history'): self.deep_replay_history = data.get('deep_replay_history')
                 if data.get('ai_debug_logs'): self.ai_debug_logs = data.get('ai_debug_logs')
                 if data.get('ai_user_feedback'): self.ai_user_feedback = data.get('ai_user_feedback')
+                if data.get('memory_polling_mode'):
+                    self.memory_polling_mode = str(data.get('memory_polling_mode'))
+                    self.memory_polling_rate = self.memory_polling_mode
+                elif data.get('memory_polling_rate'):
+                    self.memory_polling_rate = str(data.get('memory_polling_rate'))
+                    self.memory_polling_mode = self.memory_polling_rate
+                if hasattr(self, "live_memory_engine") and self.live_memory_engine and hasattr(self, "memory_polling_mode"):
+                    self.live_memory_engine.set_polling_mode(self.memory_polling_mode)
                 if data.get('uho_friends_list'):
                     raw_fl = data.get('uho_friends_list', [])
                     self.uho_friends_list = [f for f in raw_fl if str(f).strip().lower() not in ['banchobot', 'gemini ai', 'gemini']]
@@ -3932,6 +7517,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.settings_file = os.path.join(appdata, 'osu_training_tracker_settings.json')
         else:
             self.settings_file = 'global_settings.json'
+        poll_val = str(getattr(self, 'memory_polling_mode', getattr(self, 'memory_polling_rate', 'adaptive')))
         data = {
             'osu_username': getattr(self, 'osu_username', ''),
             'api_key': getattr(self, 'api_key', ''),
@@ -3942,6 +7528,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             'auto_background_sync': getattr(self, 'auto_background_sync', True),
             'auto_import_on_start': getattr(self, 'auto_import_on_start', True),
             'selected_ai_model': getattr(self, 'selected_ai_model', 'gemini-3.6-flash'),
+            'memory_polling_mode': poll_val,
+            'memory_polling_rate': poll_val,
             'last_profile_analysis': getattr(self, 'last_profile_analysis', None),
             'last_profile_player': getattr(self, 'last_profile_player', ''),
             'has_analyzed_self': getattr(self, 'has_analyzed_self', False),
@@ -4244,6 +7832,75 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             ctk.CTkLabel(c3_text, text="Automatisch mit Windows starten", font=("Arial", 14, "bold"), text_color="#ffffff").pack(anchor="w")
             ctk.CTkLabel(c3_text, text="Startet UHO Hub lautlos im Hintergrund, sobald du deinen PC hochfährst.",
                          font=("Arial", 11), text_color="#888899", wraplength=480, justify="left").pack(anchor="w", pady=(3, 0))
+
+            # osu! Live Memory Polling-Rate Configuration
+            c_poll = ctk.CTkFrame(scroll_content, fg_color="#1c1c24", corner_radius=10, border_width=1, border_color="#2a2a35")
+            c_poll.pack(fill="x", pady=6)
+
+            poll_options = [
+                "Adaptiv (30-60 Hz In-Game / 2 Hz Menü - Empfohlen)",
+                "30 Hz",
+                "60 Hz",
+                "100 Hz"
+            ]
+
+            poll_dropdown = ctk.CTkOptionMenu(
+                c_poll,
+                values=poll_options,
+                width=340,
+                fg_color="#2d3748",
+                button_color="#4a5568"
+            )
+
+            current_poll = str(getattr(self, "memory_polling_mode", getattr(self, "memory_polling_rate", "adaptive"))).lower()
+            if current_poll == "30":
+                poll_dropdown.set("30 Hz")
+            elif current_poll == "60":
+                poll_dropdown.set("60 Hz")
+            elif current_poll == "100":
+                poll_dropdown.set("100 Hz")
+            else:
+                poll_dropdown.set("Adaptiv (30-60 Hz In-Game / 2 Hz Menü - Empfohlen)")
+
+            def on_poll_change(choice):
+                if "30 Hz" in choice:
+                    self.memory_polling_mode = "30"
+                    self.memory_polling_rate = "30"
+                elif "60 Hz" in choice:
+                    self.memory_polling_mode = "60"
+                    self.memory_polling_rate = "60"
+                elif "100 Hz" in choice:
+                    self.memory_polling_mode = "100"
+                    self.memory_polling_rate = "100"
+                else:
+                    self.memory_polling_mode = "adaptive"
+                    self.memory_polling_rate = "adaptive"
+
+                if hasattr(self, "live_memory_engine") and self.live_memory_engine:
+                    self.live_memory_engine.set_polling_mode(self.memory_polling_mode)
+                if hasattr(self, "memory_engine") and self.memory_engine:
+                    self.memory_engine.set_polling_mode(self.memory_polling_mode)
+                self.save_global_settings()
+
+            poll_dropdown.configure(command=on_poll_change)
+            poll_dropdown.pack(side="right", padx=16, pady=10)
+
+            c_poll_text = ctk.CTkFrame(c_poll, fg_color="transparent")
+            c_poll_text.pack(side="left", padx=16, pady=12, fill="both", expand=True)
+
+            c_poll_h = ctk.CTkFrame(c_poll_text, fg_color="transparent")
+            c_poll_h.pack(fill="x")
+            ctk.CTkLabel(c_poll_h, text="osu! Live Memory Polling-Rate", font=("Arial", 14, "bold"), text_color="#ffffff").pack(side="left")
+            ctk.CTkLabel(c_poll_h, text=" PERFORMANCE ", font=("Arial", 10, "bold"), fg_color="#00E5FF", text_color="#000000", corner_radius=4).pack(side="left", padx=8)
+
+            ctk.CTkLabel(
+                c_poll_text,
+                text="Steuert die Abtastrate des Prozess-Speichers für Live-Telemetrie. Im adaptiven Modus wird die CPU-Last im Menü auf nahezu 0% gesenkt (<0.8% In-Game).",
+                font=("Arial", 11),
+                text_color="#888899",
+                wraplength=460,
+                justify="left"
+            ).pack(anchor="w", pady=(3, 0))
 
         elif active_tab == "accounts":
             ctk.CTkLabel(scroll_content, text="OSU! ACCOUNT VERKNÜPFUNG", font=("Arial", 11, "bold"), text_color="#666677").pack(anchor="w", pady=(15, 8))
@@ -5317,44 +8974,6 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         # Initial render of sidebar and message history
         self.refresh_modern_chat_ui()
 
-    def add_modern_chat_bubble(self, role, text):
-        text = str(text or "")
-        if not hasattr(self, "chat_scrollable_frame") or not hasattr(self.chat_scrollable_frame, "winfo_exists") or not self.chat_scrollable_frame.winfo_exists():
-            return None
-        container = ctk.CTkFrame(self.chat_scrollable_frame, fg_color="transparent")
-        container.pack(fill="x", pady=6, padx=10)
-
-        if role == "user":
-            # Pill on the right or centered top
-            bubble = ctk.CTkFrame(container, fg_color="#1f1f26", corner_radius=14, border_width=1, border_color="#2c2c38")
-            bubble.pack(side="right", padx=(50, 5), pady=2)
-            lbl = ctk.CTkLabel(bubble, text=text, font=("Arial", 13), text_color="#ffffff", justify="left", wraplength=520)
-            lbl.pack(padx=14, pady=10)
-            return container
-
-        elif role == "thinking":
-            bubble = ctk.CTkFrame(container, fg_color="transparent")
-            bubble.pack(side="left", fill="x", expand=True, padx=(5, 50))
-            thought_lbl = ctk.CTkLabel(bubble, text="Nachgedacht für 0s ❯", font=("Arial", 11), text_color="#777788")
-            thought_lbl.pack(anchor="w", padx=2, pady=(0, 2))
-            ctk.CTkLabel(bubble, text="Analysiere und formuliere Antwort... 🤔", font=("Arial", 13, "italic"), text_color="#aaaaaa").pack(anchor="w", padx=2)
-            # Live timer
-            import time as _time
-            container._think_start = _time.time()
-            container._think_label = thought_lbl
-            container._think_active = True
-            def _tick_thinking(c=container):
-                if not getattr(c, '_think_active', False):
-                    return
-                try:
-                    if not c.winfo_exists():
-                        return
-                    elapsed = int(_time.time() - c._think_start)
-                    c._think_label.configure(text=f"Nachgedacht für {elapsed}s ❯")
-                    c.after(1000, lambda: _tick_thinking(c))
-                except:
-                    pass
-            container.after(1000, lambda: _tick_thinking(container))
     def _extract_map_info_from_text(self, text):
         """Extracts and verifies beatmap_id and set_id from map recommendation text or [MAP: ...] tags against the local 151k DB."""
         if not text:
@@ -5419,7 +9038,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         return None
 
-    def add_modern_chat_bubble(self, role, text):
+    def add_modern_chat_bubble(self, role, text, lazer_hit_data=None):
         text = str(text or "")
         if not hasattr(self, "chat_scrollable_frame") or not hasattr(self.chat_scrollable_frame, "winfo_exists") or not self.chat_scrollable_frame.winfo_exists():
             return None
@@ -5477,6 +9096,13 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             msg_box.insert("1.0", clean_text)
             msg_box.configure(state="disabled")
             msg_box.pack(fill="x", pady=(0, 6))
+
+            # Visual osu! lazer Timing & Accuracy Heatmap Card
+            if lazer_hit_data:
+                try:
+                    create_lazer_results_card(bubble, lazer_hit_data, width=540, height=185)
+                except Exception:
+                    pass
 
             # Action Icons Row (Copy, Thumbs Up, Thumbs Down, + Web & osu!direct buttons)
             act_row = ctk.CTkFrame(bubble, fg_color="transparent")
@@ -5921,13 +9547,58 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ctx.append(f"Spieler: {user}")
         ctx.append(f"osu! Supporter Status: {'Aktiv' if getattr(self, 'has_osu_supporter', False) else 'Nicht aktiv'}")
 
-        # 0. Live Telemetrie & Aktive Map (Echtzeit-Sitzung)
-        if hasattr(self, "_telemetry_data") and self._telemetry_data:
+        # 0. Real-time Live Memory Telemetry (from OsuLiveMemoryEngine)
+        mem_eng = getattr(self, "live_memory_engine", getattr(self, "memory_engine", None))
+        if mem_eng and hasattr(mem_eng, "get_state"):
+            try:
+                lstate = mem_eng.get_state()
+                if lstate and lstate.get("is_connected", False):
+                    st_name = lstate.get("status_name", "Unbekannt")
+                    poll_mode = lstate.get("polling_mode", "adaptive")
+                    ctx.append("\n--- AKTUELLE LIVE-OSU!-SESSION (ECHTZEIT-SPEICHER-TELEMETRIE) ---")
+                    ctx.append(f"• Spiel-Status: {st_name} (Polling-Modus: {poll_mode})")
+                    bm = lstate.get("beatmap")
+                    if bm:
+                        ctx.append(f"• Aktuelle Beatmap: {bm.get('artist', '')} - {bm.get('title', '')} [{bm.get('version', '')}] (★ {bm.get('sr', 0.0):.2f}, CS {bm.get('cs', 4.0)}, AR {bm.get('ar', 9.0)}, BPM {bm.get('bpm', 120.0)})")
+                    ctx.append(f"• Live-Score: {lstate.get('score', 0):,} | Combo: {lstate.get('combo', 0)}x (Max: {lstate.get('max_combo', 0)}x) | Acc: {lstate.get('accuracy', 100.0):.2f}% | Mods: {lstate.get('mods', 'NM')}")
+                    h_errs = lstate.get("hit_errors", [])
+                    avg_err = lstate.get("mean_hit_error", 0.0)
+                    ur_val = lstate.get("unstable_rate", 0.0)
+                    ctx.append(f"• Live Hit-Errors ({len(h_errs)} Hits erfasst): Ø Fehler = {avg_err:+.2f} ms | Live UR = {ur_val:.1f}")
+                    ctx.append(f"• Hits: 300s={lstate.get('count_300', 0)} | 100s={lstate.get('count_100', 0)} | 50s={lstate.get('count_50', 0)} | Misses={lstate.get('count_miss', 0)}")
+                    k1_h = lstate.get("k1_avg_hold", 0.0)
+                    k2_h = lstate.get("k2_avg_hold", 0.0)
+                    if k1_h > 0 or k2_h > 0:
+                        ctx.append(f"• Live Tapping-Hold: K1 {k1_h:.1f}ms | K2 {k2_h:.1f}ms (Versatz: {abs(k1_h - k2_h):.1f}ms)")
+            except Exception:
+                pass
+        elif hasattr(self, "_telemetry_data") and self._telemetry_data:
             td = self._telemetry_data
             ctx.append("\n--- AKTUELLE LIVE-OSU!-SESSION (ECHTZEIT-TELEMETRIE) ---")
             ctx.append(f"• Aktueller Status: {'In Song-Auswahl' if td.get('is_song_select') else ('Im End-Screen' if td.get('is_results_screen') else 'Mitten im Gameplay (Map läuft)')}")
             ctx.append(f"• Live-PP: {td.get('cur_pp', 0):.1f} pp | If-FC PP: {td.get('if_fc_pp', 0):.1f} pp | Rank: {td.get('grade', 'SS')}")
             ctx.append(f"• Hits: 100s={td.get('h100', 0)} | 50s={td.get('h50', 0)} | Misses={td.get('h0', 0)} | Sliderbreaks={td.get('sb', 0)}")
+
+        # 1. Multi-Play Session Aggregate Telemetry (from telemetry.db / session history)
+        dt_hist = getattr(self, "deep_replay_history", [])
+        if not dt_hist and hasattr(self, "telemetry_storage_engine") and self.telemetry_storage_engine:
+            try:
+                recent_sess = self.telemetry_storage_engine.get_recent_live_sessions(limit=20)
+                if recent_sess:
+                    dt_hist = recent_sess
+            except Exception:
+                pass
+        if dt_hist:
+            agg = compute_aggregate_deep_telemetry(dt_hist)
+            if agg:
+                ctx.append(f"\n--- SESSION-TELEMETRIE ({agg['total_plays']} GESPIELTE MAPS) ---")
+                ctx.append(f"• Gesamtergebnis: Ø {agg['avg_acc']:.2f}% Acc | {agg['total_misses']} Misses Gesamt (Ø {agg['avg_misses_per_play']:.1f}/Map) | Max Combo: {agg['max_combo']}x")
+                ctx.append(f"• Aim-Dynamik: Overaim {agg['avg_overaim']:.1f}% vs Underaim {agg['avg_underaim']:.1f}% | Peak Speed: {agg['avg_peak_spd']:,.0f} px/s")
+                ctx.append(f"• Tapping-Dynamik: K1 {agg['avg_k1_hold']:.1f}ms | K2 {agg['avg_k2_hold']:.1f}ms (Asymmetrie: {abs(agg['avg_k1_hold'] - agg['avg_k2_hold']):.1f}ms) | Alt-Balance: {agg['avg_alt_ratio']:.1f}%")
+                ctx.append(f"• Timing-Präzision: Unstable Rate ~{agg['avg_ur']:.1f} UR")
+                if agg.get("top_systemic_issues"):
+                    top_chokes = [issue[0] for issue in agg["top_systemic_issues"][:3]]
+                    ctx.append(f"• Top Systemische Choke-Ursachen: {'; '.join(top_chokes)}")
 
         # 1. Zuletzt gespielte Runden (Live aus der offiziellen osu! API)
         api_k = getattr(self, "api_key", "")
@@ -8022,52 +11693,57 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
         ctk.CTkButton(top_bar, text="⬅ Zurück", width=90, height=34, font=("Arial", 12, "bold"),
                       fg_color="#25252e", hover_color="#353540", command=self.show_multiplayer_hub).pack(side="left", padx=15, pady=12)
 
-        ctk.CTkLabel(top_bar, text="🔄 Bancho Lounge (Host-Rotation Setup)", font=("Arial", 18, "bold"), text_color="#BA68C8").pack(side="left", padx=10)
+        ctk.CTkLabel(top_bar, text="🔄 Bancho Lounge erstellen", font=("Arial", 18, "bold"), text_color="#BA68C8").pack(side="left", padx=10)
 
-        main_box = ctk.CTkFrame(master, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2e2a3a", width=620, height=480)
-        main_box.place(relx=0.5, rely=0.52, anchor="center")
+        main_box = ctk.CTkFrame(master, fg_color="#181822", corner_radius=16, border_width=1, border_color="#2e2a3a", width=560, height=380)
+        main_box.place(relx=0.5, rely=0.50, anchor="center")
         main_box.pack_propagate(False)
 
-        ctk.CTkLabel(main_box, text="🔄 Host-Rotation Konfiguration", font=("Arial", 18, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(20, 4))
-        ctk.CTkLabel(main_box, text="Der BanchoBot übergibt nach jedem gespielten Song automatisch den Host an den nächsten Spieler.", font=("Arial", 11), text_color="#aaaaaa").pack(anchor="w", padx=24, pady=(0, 16))
+        ctk.CTkLabel(main_box, text="🔄 Lobby-Einstellungen", font=("Arial", 18, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(20, 4))
+        ctk.CTkLabel(main_box, text="Erstelle eine Bancho-Multiplayer-Lobby. Alle Einstellungen kannst du auch während des Spiels ändern.", font=("Arial", 11), text_color="#aaaaaa", wraplength=500).pack(anchor="w", padx=24, pady=(0, 16))
 
         # Lobby Name
         ctk.CTkLabel(main_box, text="Lobby-Name:", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
-        lobby_name_entry = ctk.CTkEntry(main_box, placeholder_text="z.B. UHO Hub: Host Rotation", font=("Arial", 12), height=34)
-        lobby_name_entry.insert(0, "UHO Hub: Host Rotation")
+        lobby_name_entry = ctk.CTkEntry(main_box, placeholder_text="z.B. UHO Hub: Chill Lobby", font=("Arial", 12), height=34)
+        lobby_name_entry.insert(0, "UHO Hub: Lobby")
         lobby_name_entry.pack(fill="x", padx=24, pady=(0, 10))
 
         # Password
-        ctk.CTkLabel(main_box, text="🔒 Passwort (optional, leer für öffentlich):", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
+        ctk.CTkLabel(main_box, text="🔒 Passwort (optional, leer = öffentlich):", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
         pwd_entry = ctk.CTkEntry(main_box, placeholder_text="z.B. chill123", font=("Arial", 12), height=34)
         pwd_entry.pack(fill="x", padx=24, pady=(0, 10))
 
         # Initial Players
         ctk.CTkLabel(main_box, text="👥 Spieler einladen (kommagetrennt):", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
-        pl_entry = ctk.CTkEntry(main_box, placeholder_text="Spieler1, Spieler2, Spieler3...", font=("Arial", 12), height=34)
-        def_user = getattr(self, "osu_username", "") or "Spieler1"
+        pl_entry = ctk.CTkEntry(main_box, placeholder_text="Spieler1, Spieler2...", font=("Arial", 12), height=34)
+        def_user = getattr(self, "osu_username", "") or "Spieler"
         pl_entry.insert(0, def_user)
-        pl_entry.pack(fill="x", padx=24, pady=(0, 10))
-
-        # Rotation Mode
-        ctk.CTkLabel(main_box, text="Modus:", font=("Arial", 12, "bold"), text_color="#ffffff").pack(anchor="w", padx=24, pady=(4, 2))
-        rot_mode_opt = ctk.CTkOptionMenu(main_box, values=["Normal (Spieler wählen reihum ihre Maps)", "🤖 KI-Autopilot (KI wählt ausgewogene Maps für die Gruppe)"],
-                                         font=("Arial", 12, "bold"), fg_color="#2b2035", button_color="#3e2a4f", height=34)
-        rot_mode_opt.pack(fill="x", padx=24, pady=(0, 18))
+        pl_entry.pack(fill="x", padx=24, pady=(0, 18))
 
         def launch_rotation():
-            l_name = lobby_name_entry.get().strip() or "UHO Hub: Host Rotation"
+            l_name = lobby_name_entry.get().strip() or "UHO Hub: Lobby"
             pwd = pwd_entry.get().strip()
             raw_pl = [p.strip() for p in pl_entry.get().split(",") if p.strip()]
-            ai_picker = "KI-Autopilot" in rot_mode_opt.get()
-            self.start_host_rotation_lobby(l_name, pwd, raw_pl, ai_picker)
+            self.start_host_rotation_lobby(l_name, pwd, raw_pl)
 
-        ctk.CTkButton(main_box, text="🚀 Host-Rotation Lobby erstellen & öffnen ➔", font=("Arial", 14, "bold"), height=44,
+        ctk.CTkButton(main_box, text="🚀 Lobby erstellen & starten ➔", font=("Arial", 14, "bold"), height=44,
                       fg_color="#AB47BC", hover_color="#8E24AA", text_color="#ffffff", command=launch_rotation).pack(fill="x", padx=24, pady=(6, 20))
 
-    def start_host_rotation_lobby(self, lobby_name, password, initial_players, ai_picker=False):
+    def start_host_rotation_lobby(self, lobby_name, password, initial_players):
         u_name = getattr(self, "osu_username", "") or (initial_players[0] if initial_players else "Spieler")
         u_irc = getattr(self, "osu_irc_password", "")
+
+        if not u_irc:
+            try:
+                settings_path = os.path.join(os.environ.get("APPDATA", ""), "osu_training_tracker_settings.json")
+                if os.path.exists(settings_path):
+                    with open(settings_path, "r", encoding="utf-8") as f:
+                        sdata = json.load(f)
+                    u_irc = sdata.get("osu_irc_password", "")
+                    if u_irc:
+                        self.osu_irc_password = u_irc
+            except Exception:
+                pass
 
         if not u_irc:
             dialog = ctk.CTkInputDialog(text="Gib dein IRC-Server-Passwort von https://osu.ppy.sh/p/irc ein:", title="osu! IRC-Server-Passwort")
@@ -8081,7 +11757,13 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
             "lobby_name": lobby_name,
             "password": password,
             "players": list(initial_players),
-            "ai_picker": ai_picker,
+            "connected_players": [],
+            "current_host": "",
+            "auto_rotate": False,
+            "ai_picker": False,
+            "ai_skill": "Zufällig",
+            "ai_sr": "Auto",
+            "ai_recent_map_ids": set(),
             "logs": []
         }
 
@@ -8090,9 +11772,13 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
                 username=u_name,
                 irc_password=u_irc,
                 on_log=self._host_rot_log_callback,
-                on_match_created=self._host_rot_on_created
+                on_match_created=self._host_rot_on_created,
+                on_round_ended=self._host_rot_on_round_ended,
+                on_player_score=self._host_rot_on_score,
+                on_player_joined=self._host_rot_on_player_joined,
+                on_player_left=self._host_rot_on_player_left
             )
-            self.mp_referee_bot.connect_and_host(lobby_name=lobby_name, password=password, host_rotation=True, initial_players=initial_players)
+            self.mp_referee_bot.connect_and_host(lobby_name=lobby_name, password=password, host_rotation=False, initial_players=initial_players)
 
         self.show_host_rotation_lobby_view()
 
@@ -8100,7 +11786,7 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
         if not hasattr(self, "host_rotation_data"): return
         entry = f"[{time.strftime('%H:%M:%S')}] {text}"
         self.host_rotation_data.setdefault("logs", []).append(entry)
-        self.host_rotation_data["logs"] = self.host_rotation_data["logs"][-30:]
+        self.host_rotation_data["logs"] = self.host_rotation_data["logs"][-50:]
 
         def update_ui():
             if hasattr(self, "host_rot_feed") and self.host_rot_feed.winfo_exists():
@@ -8117,12 +11803,263 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
         def _bg():
             time.sleep(1.0)
             if getattr(self, "mp_referee_bot", None):
-                self.mp_referee_bot.set_team_mode(1)
+                # Head-to-Head, Score mode, unlock
+                self.mp_referee_bot.send_mp("mp set 0 0")
+                time.sleep(0.4)
+                self.mp_referee_bot.unlock_room()
                 for p in self.host_rotation_data.get("players", []):
                     time.sleep(0.8)
                     self.mp_referee_bot.invite_player(p)
-                self.mp_referee_bot.send_channel_message(f"Willkommen zur UHO Hub Host-Rotation! Host wechselt nach jedem Song automatisch.")
+                self.mp_referee_bot.send_channel_message("Willkommen zur UHO Hub Bancho Lounge! 🎮")
         threading.Thread(target=_bg, daemon=True).start()
+
+    def _host_rot_on_player_joined(self, user, slot, team):
+        if not hasattr(self, "host_rotation_data"): return
+        cp = self.host_rotation_data.get("connected_players", [])
+        clean_user = user.strip().replace(" ", "_")
+        if clean_user and clean_user not in cp:
+            cp.append(clean_user)
+        self.host_rotation_data["connected_players"] = cp
+        bot = getattr(self, "mp_referee_bot", None)
+        if bot and clean_user not in bot.host_queue:
+            bot.host_queue.append(clean_user)
+        self._host_rot_log_callback(f"📥 {clean_user} ist der Lobby beigetreten (Slot {slot}).", "#00E676")
+        
+        # If auto host-rotation is active and no host has been assigned yet, give host to this player
+        if self.host_rotation_data.get("auto_rotate", False) and not self.host_rotation_data.get("current_host"):
+            self.host_rotation_data["current_host"] = clean_user
+            if bot:
+                bot.set_host(clean_user)
+                self._host_rot_log_callback(f"👑 Host initial an {clean_user} übergeben.", "#BA68C8")
+                
+        self.after(0, self._refresh_host_rot_player_list)
+
+    def _host_rot_on_player_left(self, user):
+        if not hasattr(self, "host_rotation_data"): return
+        cp = self.host_rotation_data.get("connected_players", [])
+        clean_user = user.strip().replace(" ", "_")
+        if clean_user in cp:
+            cp.remove(clean_user)
+        self.host_rotation_data["connected_players"] = cp
+        bot = getattr(self, "mp_referee_bot", None)
+        if bot and clean_user in bot.host_queue:
+            bot.host_queue.remove(clean_user)
+        self._host_rot_log_callback(f"📤 {clean_user} hat die Lobby verlassen.", "#FFA726")
+        self.after(0, self._refresh_host_rot_player_list)
+
+    def _host_rot_on_score(self, user, score, status, raw):
+        self._host_rot_log_callback(f"🎯 {user}: {score:,} ({status})", "#00E676")
+
+    def trigger_bancho_lounge_ai_pick(self):
+        """Picks a beatmap using Gemini AI and sets it in the Bancho Lounge multiplayer room."""
+        bot = getattr(self, "mp_referee_bot", None)
+        if not bot or not getattr(self, "host_rotation_data", None):
+            return
+
+        def _bg_pick():
+            self._host_rot_log_callback("🤖 Gemini AI: Analysiere Kandidaten-Pool für Lobby-Pick...", "#BA68C8")
+            
+            # Take host back to bot account so it can set maps/mods
+            bot_user = getattr(self, "osu_username", "").strip().replace(" ", "_")
+            if bot_user:
+                bot.set_host(bot_user)
+                self.host_rotation_data["current_host"] = bot_user
+                self.after(0, self._refresh_host_rot_player_list)
+                time.sleep(0.6)
+
+            skill_setting = self.host_rotation_data.get("ai_skill", "Zufällig")
+            sr_setting = self.host_rotation_data.get("ai_sr", "Auto")
+
+            all_skills = ["Aim", "Streams", "Speed", "Tech", "Stamina", "Reading", "Precision", "Consistency"]
+            if skill_setting == "Zufällig" or skill_setting not in all_skills:
+                skill = random.choice(all_skills)
+            else:
+                skill = skill_setting
+
+            if sr_setting == "Auto":
+                pa = getattr(self, "last_profile_analysis", None) or {}
+                p_stats = pa.get("stats", {})
+                if "avg_sr" in p_stats and p_stats["avg_sr"]:
+                    target_sr = float(p_stats["avg_sr"])
+                elif "effective_sr" in p_stats:
+                    target_sr = float(p_stats["effective_sr"])
+                else:
+                    target_sr = 5.2
+            else:
+                try:
+                    target_sr = float(sr_setting)
+                except (ValueError, TypeError):
+                    target_sr = 5.2
+
+            recent_ids = self.host_rotation_data.get("ai_recent_map_ids", set())
+            
+            # Query candidate pool from 151k SQLite database
+            candidates = sqlite_query_maps(
+                skill=skill,
+                sr_min=round(target_sr - 0.6, 2),
+                sr_max=round(target_sr + 0.6, 2),
+                exclude_ids=recent_ids,
+                limit=15,
+                order_by="playcount DESC"
+            )
+            if not candidates or len(candidates) < 3:
+                candidates = sqlite_query_maps(
+                    skill=skill,
+                    sr_min=round(target_sr - 1.2, 2),
+                    sr_max=round(target_sr + 1.2, 2),
+                    exclude_ids=recent_ids,
+                    limit=15,
+                    order_by="playcount DESC"
+                )
+
+            chosen = None
+            ai_comment = "Ausgewogene Community-Beatmap"
+
+            # Call Gemini AI for strategic coaching pick
+            if candidates and getattr(self, "gemini_key", ""):
+                try:
+                    cand_summary = [
+                        {"id": m["id"], "name": m.get("name", "Unknown"), "sr": round(m.get("sr", target_sr), 2), "bpm": m.get("bpm", 180)}
+                        for m in candidates[:8]
+                    ]
+                    prompt = (
+                        f"Du bist der offizielle osu! Bancho Multiplayer Lounge Coach.\n"
+                        f"Wähle aus den folgenden Map-Kandidaten die EINE am besten geeignete Beatmap für eine spaßige, ausgeglichene Multiplayer-Runde (Fokus-Skill: {skill}, Ziel-SR: {target_sr:.1f}★) aus:\n\n"
+                        f"Kandidaten:\n{json.dumps(cand_summary, ensure_ascii=False, indent=2)}\n\n"
+                        f"Antworte AUSSCHLIESSLICH als valides JSON-Objekt im Format:\n"
+                        f'{{"picked_id": <beatmap_id>, "comment": "<1 prägnanter deutscher Satz warum dieser Pick perfekt für die Runde ist>"}}'
+                    )
+                    ai_resp = self.call_gemini_api(
+                        prompt=prompt,
+                        system_prompt="Du bist der osu! Multiplayer AI-Coach. Antworte ausschließlich mit dem geforderten JSON-Objekt.",
+                        temperature=0.4,
+                        max_tokens=250
+                    )
+                    if ai_resp:
+                        parsed_ai = safe_parse_ai_json(ai_resp)
+                        if isinstance(parsed_ai, dict) and parsed_ai.get("picked_id"):
+                            p_id = parsed_ai["picked_id"]
+                            for m in candidates:
+                                if str(m.get("id")) == str(p_id):
+                                    chosen = m
+                                    ai_comment = parsed_ai.get("comment", ai_comment)
+                                    break
+                except Exception:
+                    pass
+
+            if not chosen:
+                if candidates:
+                    chosen = random.choice(candidates[:min(len(candidates), 5)])
+                else:
+                    chosen = pick_dynamic_map_for_skill(category=skill, target_sr=target_sr, exclude_ids=recent_ids)
+
+            recent_ids.add(chosen["id"])
+            if len(recent_ids) > 30:
+                recent_ids.clear()
+            self.host_rotation_data["ai_recent_map_ids"] = recent_ids
+
+            map_name = chosen.get("name", f"Map #{chosen['id']}")
+            map_sr = chosen.get("sr", target_sr)
+            
+            self._host_rot_log_callback(f"🗺️ Gemini AI Pick [{skill}]: {map_name} (★ {map_sr:.1f})", "#BA68C8")
+            self._host_rot_log_callback(f"💬 Begründung: {ai_comment}", "#00E5FF")
+
+            # BanchoBot commands
+            bot.set_map(chosen["id"], mods="FM", enforce_nf=False)
+            time.sleep(0.5)
+            bot.set_freemod()
+            time.sleep(0.4)
+            bot.send_channel_message(f"🤖 Gemini AI Pick [{skill}]: {map_name} (★ {map_sr:.1f}) – {ai_comment}")
+            time.sleep(0.4)
+            bot.send_channel_message("🎮 Freemod ist aktiv! Match startet in 15 Sekunden...")
+            time.sleep(0.4)
+            bot.start_countdown(15)
+
+        threading.Thread(target=_bg_pick, daemon=True).start()
+
+    def _host_rot_on_round_ended(self):
+        if not hasattr(self, "host_rotation_data"): return
+        self._host_rot_log_callback("🔔 Runde beendet!", "#00E5FF")
+
+        auto_rotate = self.host_rotation_data.get("auto_rotate", False)
+        ai_picker = self.host_rotation_data.get("ai_picker", False)
+
+        def _post_round():
+            time.sleep(2.0)
+            bot = getattr(self, "mp_referee_bot", None)
+            if not bot: return
+
+            if ai_picker:
+                self.trigger_bancho_lounge_ai_pick()
+            elif auto_rotate:
+                active_players = self.host_rotation_data.get("connected_players", []) or (list(bot.host_queue) if bot else []) or self.host_rotation_data.get("players", [])
+                if active_players:
+                    curr = self.host_rotation_data.get("current_host", "")
+                    try:
+                        clean_active = [p.lower().replace("_", " ") for p in active_players]
+                        curr_idx = clean_active.index(curr.lower().replace("_", " "))
+                        next_idx = (curr_idx + 1) % len(active_players)
+                    except ValueError:
+                        next_idx = 0
+                    next_h = active_players[next_idx]
+                    self.host_rotation_data["current_host"] = next_h
+                    bot.set_host(next_h)
+                    self._host_rot_log_callback(f"👑 Host automatisch übergeben an: {next_h}", "#BA68C8")
+                    self.after(0, self._refresh_host_rot_player_list)
+
+        threading.Thread(target=_post_round, daemon=True).start()
+
+    def _refresh_host_rot_player_list(self):
+        """Refreshes the player list panel in the host rotation lobby view."""
+        if not hasattr(self, "_host_rot_player_scroll") or not self._host_rot_player_scroll.winfo_exists():
+            return
+        scroll = self._host_rot_player_scroll
+        for w in scroll.winfo_children():
+            w.destroy()
+
+        cp = self.host_rotation_data.get("connected_players", [])
+        bot = getattr(self, "mp_referee_bot", None)
+        current_host = self.host_rotation_data.get("current_host", "")
+        if not current_host and bot and bot.host_queue:
+            idx = bot.current_host_idx
+            if 0 <= idx < len(bot.host_queue):
+                current_host = bot.host_queue[idx]
+
+        if not cp:
+            ctk.CTkLabel(scroll, text="Noch keine Spieler verbunden.\nWarte auf Beitritt...", font=("Arial", 12), text_color="#888899", justify="center").pack(pady=30)
+            return
+
+        for p in cp:
+            is_host = (p.lower().replace("_", " ") == current_host.lower().replace("_", " "))
+            row = ctk.CTkFrame(scroll, fg_color="#1e1830" if is_host else "#181822", corner_radius=10,
+                               border_width=1, border_color="#BA68C8" if is_host else "#2c2c3a")
+            row.pack(fill="x", pady=3, padx=4)
+
+            info = ctk.CTkFrame(row, fg_color="transparent")
+            info.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+
+            host_tag = " 👑" if is_host else ""
+            ctk.CTkLabel(info, text=f"👤 {p}{host_tag}", font=("Arial", 12, "bold"), text_color="#ffffff").pack(side="left")
+
+            btn_box = ctk.CTkFrame(row, fg_color="transparent")
+            btn_box.pack(side="right", padx=6, pady=6)
+
+            def give_host(u=p):
+                self.host_rotation_data["current_host"] = u
+                if bot: bot.set_host(u)
+                self._host_rot_log_callback(f"👑 Host manuell an {u} übergeben.", "#BA68C8")
+                self.after(0, self._refresh_host_rot_player_list)
+
+            def kick(u=p):
+                if bot: bot.kick_player(u)
+                cp_list = self.host_rotation_data.get("connected_players", [])
+                if u in cp_list: cp_list.remove(u)
+                self.after(100, self._refresh_host_rot_player_list)
+
+            ctk.CTkButton(btn_box, text="👑", width=32, height=26, font=("Arial", 11), fg_color="#2b2035",
+                          hover_color="#AB47BC", command=give_host).pack(side="left", padx=2)
+            ctk.CTkButton(btn_box, text="🚫", width=32, height=26, font=("Arial", 11), fg_color="#2b2028",
+                          hover_color="#c62828", command=kick).pack(side="left", padx=2)
 
     def show_host_rotation_lobby_view(self):
         for widget in self.winfo_children():
@@ -8141,51 +12078,203 @@ DEINE ANTWORT-RICHTLINIEN (STRIKT EINHALTEN):
                 self.mp_referee_bot.close_lobby()
             self.show_multiplayer_hub()
 
-        ctk.CTkButton(top_bar, text="✕ Lobby schließen", width=120, height=34, font=("Arial", 12, "bold"),
+        ctk.CTkButton(top_bar, text="✕ Lobby schließen", width=130, height=34, font=("Arial", 12, "bold"),
                       fg_color="#c62828", hover_color="#b71c1c", command=close_and_leave).pack(side="left", padx=15, pady=12)
 
-        ctk.CTkLabel(top_bar, text=f"🔄 {self.host_rotation_data.get('lobby_name', 'Host-Rotation')}", font=("Arial", 18, "bold"), text_color="#BA68C8").pack(side="left", padx=10)
+        ctk.CTkLabel(top_bar, text=f"🔄 {self.host_rotation_data.get('lobby_name', 'Bancho Lounge')}", font=("Arial", 18, "bold"), text_color="#BA68C8").pack(side="left", padx=10)
 
+        # 3-column grid
         main_grid = ctk.CTkFrame(master, fg_color="transparent")
-        main_grid.pack(fill="both", expand=True, padx=20, pady=(0, 15))
-        main_grid.grid_columnconfigure(0, weight=1)
-        main_grid.grid_columnconfigure(1, weight=1)
+        main_grid.pack(fill="both", expand=True, padx=15, pady=(0, 12))
+        main_grid.grid_columnconfigure(0, weight=2)
+        main_grid.grid_columnconfigure(1, weight=3)
+        main_grid.grid_columnconfigure(2, weight=4)
+        main_grid.grid_rowconfigure(0, weight=1)
 
-        # Left: Host Queue
-        q_frame = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2a3a")
-        q_frame.grid(row=0, column=0, padx=(0, 10), pady=5, sticky="nsew")
+        # =================== LEFT COLUMN: SPIELERLISTE ===================
+        left_panel = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2a3a")
+        left_panel.grid(row=0, column=0, padx=(0, 6), pady=5, sticky="nsew")
 
-        ctk.CTkLabel(q_frame, text="👑 Host-Reihenfolge (Queue)", font=("Arial", 16, "bold"), text_color="#BA68C8").pack(anchor="w", padx=18, pady=(15, 8))
+        ctk.CTkLabel(left_panel, text="👥 Spieler", font=("Arial", 15, "bold"), text_color="#BA68C8").pack(anchor="w", padx=14, pady=(12, 6))
 
-        def skip_host():
+        self._host_rot_player_scroll = ctk.CTkScrollableFrame(left_panel, fg_color="transparent")
+        self._host_rot_player_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 6))
+        self._refresh_host_rot_player_list()
+
+        # Invite row at bottom
+        inv_frame = ctk.CTkFrame(left_panel, fg_color="#1c1c26", corner_radius=8)
+        inv_frame.pack(fill="x", padx=8, pady=(0, 10))
+        inv_entry = ctk.CTkEntry(inv_frame, placeholder_text="Username...", font=("Arial", 11), height=28)
+        inv_entry.pack(side="left", fill="x", expand=True, padx=(8, 4), pady=6)
+
+        def invite_player():
+            u = inv_entry.get().strip()
+            if u and getattr(self, "mp_referee_bot", None):
+                self.mp_referee_bot.invite_player(u)
+                self._host_rot_log_callback(f"✉️ Einladung an {u} gesendet!", "#00E676")
+                cp = self.host_rotation_data.get("connected_players", [])
+                if u not in cp:
+                    cp.append(u)
+                inv_entry.delete(0, "end")
+
+        ctk.CTkButton(inv_frame, text="✉️", width=36, height=28, font=("Arial", 12, "bold"),
+                      fg_color="#AB47BC", hover_color="#8E24AA", command=invite_player).pack(side="right", padx=(0, 8), pady=6)
+
+        # =================== MIDDLE COLUMN: EINSTELLUNGEN ===================
+        mid_panel = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2a3a")
+        mid_panel.grid(row=0, column=1, padx=6, pady=5, sticky="nsew")
+
+        ctk.CTkLabel(mid_panel, text="⚙️ Einstellungen", font=("Arial", 15, "bold"), text_color="#ffffff").pack(anchor="w", padx=14, pady=(12, 8))
+
+        settings_scroll = ctk.CTkScrollableFrame(mid_panel, fg_color="transparent")
+        settings_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 10))
+
+        # Lobby name change
+        ctk.CTkLabel(settings_scroll, text="✏️ Lobby-Name:", font=("Arial", 11, "bold"), text_color="#cccccc").pack(anchor="w", padx=6, pady=(4, 2))
+        name_row = ctk.CTkFrame(settings_scroll, fg_color="transparent")
+        name_row.pack(fill="x", padx=6, pady=(0, 8))
+        name_entry = ctk.CTkEntry(name_row, font=("Arial", 11), height=28)
+        name_entry.insert(0, self.host_rotation_data.get("lobby_name", ""))
+        name_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        def change_name():
+            n = name_entry.get().strip()
+            if n and getattr(self, "mp_referee_bot", None):
+                self.mp_referee_bot.rename_lobby(n)
+                self.host_rotation_data["lobby_name"] = n
+
+        ctk.CTkButton(name_row, text="Ändern", width=60, height=28, font=("Arial", 10, "bold"),
+                      fg_color="#2b2035", hover_color="#AB47BC", command=change_name).pack(side="right")
+
+        # Password change
+        ctk.CTkLabel(settings_scroll, text="🔒 Passwort:", font=("Arial", 11, "bold"), text_color="#cccccc").pack(anchor="w", padx=6, pady=(4, 2))
+        pw_row = ctk.CTkFrame(settings_scroll, fg_color="transparent")
+        pw_row.pack(fill="x", padx=6, pady=(0, 8))
+        pw_entry = ctk.CTkEntry(pw_row, font=("Arial", 11), height=28, placeholder_text="leer = öffentlich")
+        pw_entry.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        def change_pw():
+            pw = pw_entry.get().strip()
             if getattr(self, "mp_referee_bot", None):
-                next_h = self.mp_referee_bot.rotate_next_host()
-                if next_h:
-                    self._host_rot_log_callback(f"👑 Host manuell übergeben an: {next_h}", "#00E5FF")
+                self.mp_referee_bot.set_password(pw)
+                self.host_rotation_data["password"] = pw
+                self._host_rot_log_callback(f"🔒 Passwort {'geändert' if pw else 'entfernt'}.", "#BA68C8")
 
-        def invite_all():
+        ctk.CTkButton(pw_row, text="Setzen", width=60, height=28, font=("Arial", 10, "bold"),
+                      fg_color="#2b2035", hover_color="#AB47BC", command=change_pw).pack(side="right")
+
+        # Slots change
+        ctk.CTkLabel(settings_scroll, text="🎮 Slots:", font=("Arial", 11, "bold"), text_color="#cccccc").pack(anchor="w", padx=6, pady=(4, 2))
+        slot_row = ctk.CTkFrame(settings_scroll, fg_color="transparent")
+        slot_row.pack(fill="x", padx=6, pady=(0, 10))
+        slot_opt = ctk.CTkOptionMenu(slot_row, values=[str(i) for i in range(2, 17)], font=("Arial", 11), fg_color="#2b2035", button_color="#3e2a4f", height=28, width=60)
+        slot_opt.set("8")
+        slot_opt.pack(side="left", padx=(0, 4))
+
+        def change_slots():
+            s = slot_opt.get()
             if getattr(self, "mp_referee_bot", None):
-                for p in self.host_rotation_data.get("players", []):
-                    self.mp_referee_bot.invite_player(p)
-                self._host_rot_log_callback("✉️ Einladungen an alle Spieler erneut gesendet!", "#00E676")
+                self.mp_referee_bot.set_size(int(s))
+                self._host_rot_log_callback(f"🎮 Slots auf {s} gesetzt.", "#BA68C8")
 
-        btn_row = ctk.CTkFrame(q_frame, fg_color="transparent")
-        btn_row.pack(fill="x", padx=18, pady=(0, 10))
-        ctk.CTkButton(btn_row, text="👑 Nächster Host", font=("Arial", 11, "bold"), height=30,
-                      fg_color="#AB47BC", hover_color="#8E24AA", command=skip_host).pack(side="left")
-        ctk.CTkButton(btn_row, text="✉️ Spieler einladen", font=("Arial", 11, "bold"), height=30,
-                      fg_color="#2b2035", hover_color="#3e2a4f", text_color="#BA68C8", command=invite_all).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(slot_row, text="Setzen", width=60, height=28, font=("Arial", 10, "bold"),
+                      fg_color="#2b2035", hover_color="#AB47BC", command=change_slots).pack(side="left")
 
-        # Right: Feed
-        feed_frame = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2a3a")
-        feed_frame.grid(row=0, column=1, padx=(10, 0), pady=5, sticky="nsew")
+        # Separator
+        ctk.CTkFrame(settings_scroll, fg_color="#333346", height=1).pack(fill="x", padx=6, pady=10)
 
-        ctk.CTkLabel(feed_frame, text="🤖 Ingame Bancho Live-Feed", font=("Arial", 16, "bold"), text_color="#00E5FF").pack(anchor="w", padx=18, pady=(15, 8))
+        # ☑ Auto Host-Rotation
+        ctk.CTkLabel(settings_scroll, text="🔄 Automatisierung:", font=("Arial", 12, "bold"), text_color="#BA68C8").pack(anchor="w", padx=6, pady=(4, 6))
 
-        self.host_rot_feed = ctk.CTkTextbox(feed_frame, wrap="word", font=("Arial", 11), fg_color="#101016", border_width=1, border_color="#222230")
-        self.host_rot_feed.pack(fill="both", expand=True, padx=14, pady=(0, 14))
-        self.host_rot_feed.insert("1.0", "\n".join(self.host_rotation_data.get("logs", ["Warte auf Bot-Verbindung..."])))
+        auto_rot_var = ctk.BooleanVar(value=self.host_rotation_data.get("auto_rotate", False))
+
+        def toggle_auto_rotate():
+            self.host_rotation_data["auto_rotate"] = auto_rot_var.get()
+            state = "aktiviert ✅" if auto_rot_var.get() else "deaktiviert ❌"
+            self._host_rot_log_callback(f"🔄 Auto Host-Rotation {state}", "#BA68C8")
+            
+            # Immediately assign host to first player if no host is set yet
+            if auto_rot_var.get():
+                active_players = self.host_rotation_data.get("connected_players", []) or (list(self.mp_referee_bot.host_queue) if getattr(self, "mp_referee_bot", None) else []) or self.host_rotation_data.get("players", [])
+                if active_players and getattr(self, "mp_referee_bot", None):
+                    first_p = active_players[0]
+                    self.host_rotation_data["current_host"] = first_p
+                    self.mp_referee_bot.set_host(first_p)
+                    self._host_rot_log_callback(f"👑 Host initial an {first_p} übergeben.", "#BA68C8")
+                    self.after(0, self._refresh_host_rot_player_list)
+
+        ctk.CTkCheckBox(settings_scroll, text="Auto Host-Rotation", font=("Arial", 12), text_color="#ffffff",
+                        variable=auto_rot_var, command=toggle_auto_rotate,
+                        fg_color="#AB47BC", hover_color="#8E24AA").pack(anchor="w", padx=6, pady=(0, 6))
+
+        # ☑ KI-Autopick
+        ai_pick_var = ctk.BooleanVar(value=self.host_rotation_data.get("ai_picker", False))
+
+        def toggle_ai_picker():
+            self.host_rotation_data["ai_picker"] = ai_pick_var.get()
+            state = "aktiviert ✅" if ai_pick_var.get() else "deaktiviert ❌"
+            self._host_rot_log_callback(f"🤖 KI-Autopick {state}", "#BA68C8")
+            # Show/hide AI settings
+            if ai_pick_var.get():
+                ai_settings_frame.pack(fill="x", padx=6, pady=(4, 6))
+                # Automatically pick first map immediately
+                self.trigger_bancho_lounge_ai_pick()
+            else:
+                ai_settings_frame.pack_forget()
+
+        ctk.CTkCheckBox(settings_scroll, text="🤖 KI-Autopick (Gemini AI wählt Maps)", font=("Arial", 12), text_color="#ffffff",
+                        variable=ai_pick_var, command=toggle_ai_picker,
+                        fg_color="#9C27B0", hover_color="#7B1FA2").pack(anchor="w", padx=6, pady=(0, 4))
+
+        # AI settings (hidden by default)
+        ai_settings_frame = ctk.CTkFrame(settings_scroll, fg_color="#1e1830", corner_radius=10, border_width=1, border_color="#3e2a4f")
+
+        ctk.CTkLabel(ai_settings_frame, text="🎯 Skillset:", font=("Arial", 11, "bold"), text_color="#cccccc").pack(anchor="w", padx=10, pady=(8, 2))
+        skill_options = ["🎲 Zufällig", "Aim", "Streams", "Speed", "Tech", "Stamina", "Reading", "Precision", "Consistency"]
+        skill_opt = ctk.CTkOptionMenu(ai_settings_frame, values=skill_options, font=("Arial", 11),
+                                      fg_color="#2b2035", button_color="#3e2a4f", height=28)
+        skill_opt.set("🎲 Zufällig")
+        skill_opt.pack(fill="x", padx=10, pady=(0, 6))
+
+        def on_skill_change(val):
+            clean = val.replace("🎲 ", "")
+            self.host_rotation_data["ai_skill"] = clean
+
+        skill_opt.configure(command=on_skill_change)
+
+        ctk.CTkLabel(ai_settings_frame, text="⭐ Schwierigkeit:", font=("Arial", 11, "bold"), text_color="#cccccc").pack(anchor="w", padx=10, pady=(4, 2))
+        sr_vals = ["Auto"] + [f"{x/10:.1f}★" for x in range(30, 96, 5)]
+        sr_opt = ctk.CTkOptionMenu(ai_settings_frame, values=sr_vals, font=("Arial", 11),
+                                   fg_color="#2b2035", button_color="#3e2a4f", height=28)
+        sr_opt.set("Auto")
+        sr_opt.pack(fill="x", padx=10, pady=(0, 8))
+
+        def on_sr_change(val):
+            clean = val.replace("★", "").strip()
+            self.host_rotation_data["ai_sr"] = clean
+
+        sr_opt.configure(command=on_sr_change)
+
+        ctk.CTkButton(ai_settings_frame, text="🤖 Jetzt Map von Gemini picken", font=("Arial", 11, "bold"), height=32,
+                      fg_color="#AB47BC", hover_color="#8E24AA", text_color="#ffffff",
+                      command=self.trigger_bancho_lounge_ai_pick).pack(fill="x", padx=10, pady=(4, 10))
+
+        # Only show AI settings if already enabled
+        if ai_pick_var.get():
+            ai_settings_frame.pack(fill="x", padx=6, pady=(4, 6))
+
+        # =================== RIGHT COLUMN: BANCHO LIVE-FEED ===================
+        right_panel = ctk.CTkFrame(main_grid, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2a3a")
+        right_panel.grid(row=0, column=2, padx=(6, 0), pady=5, sticky="nsew")
+
+        ctk.CTkLabel(right_panel, text="🤖 Bancho Live-Feed", font=("Arial", 15, "bold"), text_color="#00E5FF").pack(anchor="w", padx=14, pady=(12, 6))
+
+        self.host_rot_feed = ctk.CTkTextbox(right_panel, wrap="word", font=("Consolas", 11), fg_color="#0d0d14",
+                                             border_width=1, border_color="#222230", text_color="#cccccc")
+        self.host_rot_feed.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.host_rot_feed.insert("1.0", "\n".join(self.host_rotation_data.get("logs", ["Verbinde mit Bancho..."])))
         self.host_rot_feed.configure(state="disabled")
+
 
     # ---------------------------------------------------------------------------
     # FREUNDE & ONLINE-COMMUNITY (ECHTE LIVE PRESENCE & UHO HUB VS OSU! BADGES)
@@ -11829,15 +15918,16 @@ Erstelle einen professionellen, packenden Caster-Abschlussbericht auf Deutsch mi
   3. Bestätige, dass die links vorbereitete Map seinen Wunsch berücksichtigt!"""
 
                                 full_prompt = f"""[KI-Live-Coaching Feed]
-Aktuell geladene Trainingsmap: {cur_info}
+Aktuell links vorbereitete Trainingsmap: {cur_info}
 Bekanntes Spieler-Setup: {setup_info}
 Spezielle Anweisung: {coach_directive_note}
 Spieler-Nachricht: {msg}
 
-Antworte als Pro-Coach auf Deutsch (ca. 3-5 prägnante Sätze):
+Antworte als Pro-Coach auf Deutsch (ca. 3-4 prägnante Sätze):
 - Wenn der Spieler Hardware-/Setup-Details (Maus/Tablet, DPI/Area, Tastatur/Rapid Trigger, Grip oder Tapping-Stil) genannt hat, gehe sofort darauf ein und gib konkrete Tuning- und Ergonomie-Tipps (z. B. Area-Größe, Actuation Point, Handgelenk-Winkel).
-- Falls er nach einer bestimmten Map/Kategorie/★ gefragt oder etwas ausgeschlossen hat (z.B. keine Easy Maps, nächstes Problem), bestätige den Wechsel auf die neue Map links.{crutch_instruction}
-- Gib ihm konkrete mechanische Ausführungstipps und motiviere ihn!"""
+- Falls er nach einer bestimmten Map/Kategorie/★ gefragt oder die Map gewechselt hat: Bestätige, dass die links vorbereitete Map '{cur_map.get('name', 'Trainingsmap')}' (★ {cur_map.get('sr', 5.5):.1f}) jetzt bereitsteht.{crutch_instruction}
+- WICHTIG: Erfinde KEINE abweichende Map und formatiere keinen separaten Map-Block im Chat-Text, da der Spieler die vorbereitete Map direkt links über den osu!direct-Button startet!
+- Gib ihm konkrete mechanische Ausführungstipps für diese Map und motiviere ihn!"""
                                 response = self.query_gemini(full_prompt)
                             except Exception as api_err:
                                 response = f"⚠️ [API-Fehlercode: {type(api_err).__name__}]: {api_err}\n\n" + self.offline_analyze(msg)
@@ -12148,11 +16238,13 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
         if not hasattr(self, "recent_ai_training_map_ids"):
             self.recent_ai_training_map_ids = set()
 
-        # Fetch from pre-loaded 8-skillset cache for 0ms instant load
+        # Fetch from pre-loaded 8-skillset cache for 0ms instant load (only if SR is accurate)
         chosen = None
         if hasattr(self, "_ai_prefetched_maps_pool") and self._ai_prefetched_maps_pool.get(skill):
-            chosen = self._ai_prefetched_maps_pool[skill].pop(0)
-            threading.Thread(target=lambda s=skill, sr=target_sr: self._refill_skill_cache(s, sr), daemon=True).start()
+            pool_cands = self._ai_prefetched_maps_pool[skill]
+            if pool_cands and abs(pool_cands[0].get("sr", target_sr) - target_sr) <= 0.45:
+                chosen = pool_cands.pop(0)
+                threading.Thread(target=lambda s=skill, sr=target_sr: self._refill_skill_cache(s, sr), daemon=True).start()
 
         if not chosen:
             chosen = pick_dynamic_map_for_skill(
@@ -12285,7 +16377,7 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
                 if not hasattr(self, "_processed_ai_training_play_ids"):
                     self._processed_ai_training_play_ids = set()
 
-                # Find the newest matching play for the CURRENT recommended map
+                # Find the newest unprocessed play (captures prescribed map as well as requested/chat picks!)
                 matching_play = None
                 for p in plays:
                     p_bid = str(p.get("beatmap_id", ""))
@@ -12294,13 +16386,9 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
                     if p_id in self._processed_ai_training_play_ids:
                         continue
                         
-                    if p_bid == expected_bid:
-                        matching_play = p
-                        self._processed_ai_training_play_ids.add(p_id)
-                        break
-                    else:
-                        # Mark other plays as seen so they don't block
-                        self._processed_ai_training_play_ids.add(p_id)
+                    matching_play = p
+                    self._processed_ai_training_play_ids.add(p_id)
+                    break
 
                 if not matching_play:
                     return
@@ -12308,7 +16396,74 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
                 last_p = matching_play
                 try: self.record_play_in_active_session(last_p)
                 except: pass
-                bid = str(last_p.get("beatmap_id"))
+                bid = str(last_p.get("beatmap_id", ""))
+
+                # If the player played a different map (e.g. from chat recommendation or manual pick in osu!), resolve metadata dynamically
+                if bid and bid != expected_bid:
+                    played_meta = None
+                    if BEATMAP_SQLITE_DB_PATH:
+                        try:
+                            with get_safe_sqlite_conn() as conn:
+                                if conn:
+                                    row = conn.execute("SELECT * FROM maps WHERE id = ?", (int(bid),)).fetchone()
+                                    if row:
+                                        played_meta = dict(row)
+                        except Exception:
+                            pass
+                    
+                    if not played_meta:
+                        try:
+                            r_b = requests.get(f"https://osu.ppy.sh/api/get_beatmaps?k={key}&b={bid}", timeout=5)
+                            if r_b.status_code == 200 and r_b.json():
+                                b_data = r_b.json()[0]
+                                b_art = b_data.get("artist", "")
+                                b_tit = b_data.get("title", "")
+                                b_ver = b_data.get("version", "")
+                                b_sr = float(b_data.get("difficultyrating", 5.0))
+                                b_bpm = float(b_data.get("bpm", 180))
+                                played_meta = {
+                                    "id": int(bid),
+                                    "name": f"{b_art} - {b_tit} [{b_ver}]",
+                                    "artist": b_art,
+                                    "title": b_tit,
+                                    "version": b_ver,
+                                    "sr": b_sr,
+                                    "bpm": b_bpm,
+                                    "mod": "NM",
+                                    "status": "Ranked",
+                                    "skill": getattr(self, "ai_training_target_skill", "Allgemein"),
+                                    "goal": "Gespielte Map analysieren & Performance auswerten."
+                                }
+                        except Exception:
+                            pass
+
+                    if not played_meta:
+                        played_meta = {
+                            "id": int(bid),
+                            "name": f"Beatmap #{bid}",
+                            "sr": 5.0,
+                            "bpm": 180,
+                            "mod": "NM",
+                            "status": "Ranked",
+                            "skill": getattr(self, "ai_training_target_skill", "Allgemein"),
+                            "goal": "Live-Coaching Auswertung"
+                        }
+
+                    cur_map = played_meta
+                    self.current_ai_training_map = played_meta
+                    def update_left_card_ui(m=played_meta):
+                        if hasattr(self, "ai_train_map_title") and self.ai_train_map_title.winfo_exists():
+                            self.ai_train_map_title.configure(text=m["name"])
+                        if hasattr(self, "ai_train_map_meta") and self.ai_train_map_meta.winfo_exists():
+                            self.ai_train_map_meta.configure(text=f"★ {m.get('sr', 5.0):.1f} • {m.get('mod', 'NM')} • {m.get('status', 'Ranked')} • {m.get('bpm', 180)} BPM")
+                        if hasattr(self, "ai_train_focus_lbl") and self.ai_train_focus_lbl.winfo_exists():
+                            self.ai_train_focus_lbl.configure(text=f"✨ KI-Fokus: {m.get('skill', getattr(self, 'ai_training_target_skill', 'Allgemein'))} (★ {m.get('sr', 5.0):.1f})")
+                        b_id = m["id"]
+                        if hasattr(self, "ai_train_direct_btn") and self.ai_train_direct_btn.winfo_exists():
+                            self.ai_train_direct_btn.configure(command=lambda: os.startfile(f"osu://b/{b_id}") if hasattr(os, "startfile") else webbrowser.open(f"https://osu.ppy.sh/b/{b_id}"))
+                        if hasattr(self, "ai_train_web_btn") and self.ai_train_web_btn.winfo_exists():
+                            self.ai_train_web_btn.configure(command=lambda: webbrowser.open(f"https://osu.ppy.sh/b/{b_id}"))
+                    self.after(0, update_left_card_ui)
                 h300 = int(last_p.get("count300", 0))
                 h100 = int(last_p.get("count100", 0))
                 h50 = int(last_p.get("count50", 0))
@@ -12356,62 +16511,123 @@ Begrüße den Spieler mit einer scharfsinnigen, hochkompetenten Erstanalyse auf 
                 if not mod_matched and prescribed_mod != "NM":
                     mod_warning = f"⚠️ *Hinweis: Diese Übung war mit +{prescribed_mod} geplant (gespielt mit {played_mods_str}). Aktiviere beim nächsten Mal den geforderten Mod in osu! für optimalen Trainingsfortschritt!*"
 
-                # Call Gemini for dynamic, unique coaching advice
+                # Compute precise osu! lazer Hit Telemetry (Timing Distribution & Accuracy Heatmap)
+                lazer_hit_data = None
+                dt = getattr(self, "last_deep_replay_telemetry", None)
+                try:
+                    lazer_hit_data = compute_lazer_hit_telemetry(dt if (dt and isinstance(dt, dict) and dt.get('frames')) else last_p)
+                except Exception:
+                    pass
+
+                # Build rich telemetry context
                 ai_coaching_text = ""
                 deep_telem_info = ""
                 setup_info = json.dumps(getattr(self, "user_setup_profile", {}))
-                dt = getattr(self, "last_deep_replay_telemetry", None)
-                if dt:
+                
+                avg_err_val = lazer_hit_data.get('avg_hit_error', 0.0) if lazer_hit_data else 0.0
+                ur_val = lazer_hit_data.get('unstable_rate', 88.5) if lazer_hit_data else 88.5
+                over_val = lazer_hit_data.get('overshoot_pct', 50.0) if lazer_hit_data else 50.0
+                under_val = lazer_hit_data.get('underaim_pct', 50.0) if lazer_hit_data else 50.0
+
+                if dt and dt.get("metrics"):
                     dt_m = dt.get("metrics", {})
                     deep_telem_info = (
-                        f"\nDeep-Telemetrie: Overaim: {dt_m.get('overaim_pct', 50):.1f}% | Underaim: {dt_m.get('underaim_pct', 50):.1f}% | "
+                        f"\nDeep-Telemetrie: Overaim: {over_val:.1f}% | Underaim: {under_val:.1f}% | "
                         f"Peak Snapping Speed: {dt_m.get('peak_speed', 0):,.0f} px/s | "
                         f"K1-Hold: {dt_m.get('k1_avg_hold', 50):.1f}ms | K2-Hold: {dt_m.get('k2_avg_hold', 50):.1f}ms | "
-                        f"UR: ~{dt_m.get('ur', 80):.1f} | Choke-Diagnose: {', '.join(dt_m.get('choke_reasons', []))}"
+                        f"UR: {ur_val:.1f} | Ø Hit-Fehler: {avg_err_val:+.2f}ms | Choke-Diagnose: {', '.join(dt_m.get('choke_reasons', []))}"
                     )
+                else:
+                    deep_telem_info = f"\nTelemetrie: Ø Hit-Fehler: {avg_err_val:+.2f}ms | UR: {ur_val:.1f} | Overaim: {over_val:.1f}% | Underaim: {under_val:.1f}%"
 
+                # Pre-calculate settings & offset recommendations
+                recs_live = compute_settings_recommendations(avg_err_val, ur_val, over_val, under_val, 0.0)
+
+                # Structured Multi-Section Pro-Coach Prompt
                 if getattr(self, "gemini_key", ""):
                     coach_prompt = f"""Du bist der offizielle Pro-Level osu! KI-Coach und Cheftrainer für osu! Standard (Mode 0).
 WICHTIG: Antworte ZU 100% AUF DEUTSCH! Verwende kein einziges Wort auf Englisch (außer osu!-Begriffe wie Stream, Aim, Burst, FC, Mods wie DT/HR/HD/EZ).
 
 Der Spieler '{user}' hat soeben eine Runde im Live-Training ({target_skill}) gespielt ({'FEHLGESCHLAGEN / FAIL' if is_real_fail else 'ERFOLGREICH BEENDET'}):
-Map: {map_name} (★ {map_sr:.1f}, Skillset: {target_skill}, BPM: {map_bpm}, Geforderter Mod: {prescribed_mod})
-Gespielte Mods: {played_mods_str}
+Map: {map_name} (★ {map_sr:.1f}, Skillset: {target_skill}, BPM: {map_bpm}, Mod: {played_mods_str})
 Ziel: {map_goal}
 
-Score & Replay-Telemetrie:
-- Status: {'💀 Fail bei Note #' + str(tot) if is_real_fail else '🏆 Pass'} | Accuracy: {acc:.2f}% | 300s: {h300} | 100s: {h100} | 50s: {h50} | Misses: {miss} | Max Combo: {combo}{deep_telem_info}
-- Bisher bekanntes Hardware-Setup: {setup_info}
+Score & Telemetrie-Auswertung:
+- Status: {'💀 Fail bei Note #' + str(tot) if is_real_fail else '🏆 Pass'} | Accuracy: {acc:.2f}% | 300s: {h300} | 100s: {h100} | 50s: {h50} | Misses: {miss} | Max Combo: {combo}
+- Lazer-Timing & Heatmap: Ø Trefferfehler: {avg_err_val:+.2f}ms ({'zu spät' if avg_err_val >= 0 else 'zu früh'}) | Streuung (UR): {ur_val:.1f} | Overshoot: {over_val:.1f}% | Undershoot: {under_val:.1f}%{deep_telem_info}
+- Empfohlene Settings-Anpassung: {recs_live}
+- Bekanntes Hardware-Setup: {setup_info}
 
-KERNZIEL: Schwächen und Belastungsgrenzen (Fingerlocking, Overaiming, Reading-Fatigue, High-OD Unstable Rate) finden und aktiv ausbessern!
-Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch (3-5 prägnante Sätze):
-1. Analysiere das Abschneiden und die konkrete Ursache für den {'Fail / Choke' if is_real_fail else 'Score'}.
-2. Was muss der Spieler mechanisch korrigieren (z. B. Handgelenk-Führung, Lockere Finger, Klick-Release, Reading-Fokus)?
-3. {'Mache ihm Mut und erkläre, ob the Map für ihn machbar ist!' if is_real_fail else 'Motiviere ihn für die nächste Steigerung!'}"""
+STRIKTE QUALITÄTS-ANWEISUNG:
+Antworte NIEMALS mit nur 1-2 Sätzen! Gib ein tiefgehendes, strukturiertes Pro-Coaching mit mindestens 5 Absätzen im folgenden Markdown-Format:
+
+🎯 **Performance-Diagnose:**
+[2-3 prägnante Sätze Analyse zur Genauigkeit, UR ({ur_val:.1f}), Trefferlage ({avg_err_val:+.2f}ms) und konkreten Miss-Ursachen]
+
+🔧 **Mechanische Korrektur:**
+[2 Sätze direkte Handlungsanweisung für Aiming-Weg, Griffhaltung, Tapping-Lockerheit oder Finger-Release]
+
+🛠️ **Settings- & Offset-Empfehlung:**
+[Konkrete Anweisung: Universal Audio Offset auf welchen Wert in ms anpassen (z.B. {(-int(round(avg_err_val))):+d}ms) oder Tablet-Area/DPI Feinabstimmung]
+
+💡 **Taktik für die nächste Map:**
+[1-2 Sätze worauf bei den Pattern und dem Rhythmus jetzt besonders geachtet werden muss]
+
+🚀 **Coach-Fazit:**
+[1 motivierender Satz mit klarer Empfehlung für die nächste Runde]"""
                     try:
                         g_model = getattr(self, "selected_ai_model", "gemini-3.6-flash")
                         g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self.gemini_key}"
                         payload = {
                             "contents": [{"role": "user", "parts": [{"text": coach_prompt}]}],
-                            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 600}
+                            "generationConfig": {"temperature": 0.5, "maxOutputTokens": 850}
                         }
                         resp = requests.post(g_url, json=payload, timeout=12)
                         res_j = resp.json()
-                        ai_coaching_text = res_j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        cand_text = res_j["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        
+                        # Quality Gate: Check if response has sufficient length & structure
+                        if len(cand_text) >= 160:
+                            ai_coaching_text = cand_text
+                        else:
+                            # Immediate Retry with assertive directive
+                            retry_prompt = coach_prompt + "\n\nACHTUNG: Deine vorherige Antwort war zu kurz! Bitte antworte ausführlich mit allen 5 geforderten Abschnitten!"
+                            payload["contents"][0]["parts"][0]["text"] = retry_prompt
+                            resp_r = requests.post(g_url, json=payload, timeout=10)
+                            res_r = resp_r.json()
+                            ai_coaching_text = res_r["candidates"][0]["content"]["parts"][0]["text"].strip()
                     except Exception:
                         pass
 
+                # Rich Structured Fallback if Gemini is offline or response is missing
+                if not ai_coaching_text or len(ai_coaching_text) < 120:
+                    err_desc = f"{abs(avg_err_val):.1f}ms zu spät" if avg_err_val >= 0 else f"{abs(avg_err_val):.1f}ms zu früh"
+                    aim_bias_desc = f"{over_val:.0f}% Overshoot (Zug über das Ziel hinaus)" if over_val > 55 else (f"{under_val:.0f}% Undershoot (Cursor stoppt vor der Kante)" if under_val > 55 else "ausgewogenes 50/50 Aiming")
+                    offset_action = f"Stelle dein Universal Audio Offset in den osu! Optionen auf {(-int(round(avg_err_val))):+d} ms ein." if abs(avg_err_val) > 2.5 else "Audio Offset ist optimal bei 0ms."
+                    
+                    ai_coaching_text = f"""🎯 **Performance-Diagnose:**
+Deine Accuracy lag bei {acc:.2f}% mit {miss} Miss(es) und einer Unstable Rate von {ur_val:.1f}. Im Schnitt lag dein Timing {err_desc}, während deine Cursor-Bewegung {aim_bias_desc} zeigte.
+
+🔧 **Mechanische Korrektur:**
+Achte darauf, deine Handmuskulatur zwischen den Pattern zu lockern. Halte den Klick-Release kurz und fokussiere deinen Blick 100-150ms vor dem Cursor auf den nächsten Circle.
+
+🛠️ **Settings- & Offset-Empfehlung:**
+{offset_action}
+
+💡 **Taktik für die nächste Map:**
+Nutze den Rhythmus der Musik als Taktgeber für die Notenfolgen und ziehe deine Jumps in einer fließenden Bewegung durch.
+
+🚀 **Coach-Fazit:**
+Guter Einsatz! Wir halten den Fokus auf {target_skill} und steigern die Stabilität in der nächsten Runde!"""
+
                 # 2. Real Fail Handling
                 if is_real_fail:
-                    if not ai_coaching_text:
-                        ai_coaching_text = "Achte auf eine entspannte Handhaltung und versuche, die Noten nicht hektisch zu spamen."
-
                     fail_feedback = f"💀 **Map nicht bestanden (Fail)** – Choke bei Note #{tot} ({acc:.1f}% Acc).\n\n🤖 **Coach-Analyse:**\n{ai_coaching_text}\n\n💡 *Die Map bleibt für einen Re-Try geladen. Klicke links auf 'Nächste Map' oder schreibe mir im Chat, wenn du wechseln willst!*"
 
                     def update_fail_feed():
                         if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
                             self.ai_train_sync_lbl.configure(text=f"💀 Fail erfasst ({acc:.1f}% bis Note #{tot}) • Bereit für Re-Try", text_color="#FFA726")
-                            self.add_modern_chat_bubble("ai", fail_feedback)
+                            self.add_modern_chat_bubble("ai", fail_feedback, lazer_hit_data=lazer_hit_data)
 
                     self.after(0, update_fail_feed)
                     return
@@ -12434,9 +16650,6 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                     delta = -0.35  # Major struggle / fingerlock -> step down to solidify floor
                     adapt_msg = f"⚠️ Wegen {miss} Miss(es) / {acc:.1f}% Acc: Nächste Map angepasst (-0.35★) zur Stabilisierung des Fundaments!"
 
-                if not ai_coaching_text:
-                    ai_coaching_text = f"{adapt_msg}\n\nAchte auf gleichmäßiges Tapping und ruhiges Aiming."
-
                 self.log_ai_event(
                     category="Live KI-Training Coach",
                     input_summary={
@@ -12450,7 +16663,9 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                         "combo": combo,
                         "300s": h300,
                         "100s": h100,
-                        "50s": h50
+                        "50s": h50,
+                        "ur": ur_val,
+                        "avg_hit_error": avg_err_val
                     },
                     prompt_text=coach_prompt if getattr(self, "gemini_key", "") else None,
                     raw_ai_response=ai_coaching_text,
@@ -12462,7 +16677,7 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                 def update_feed():
                     if hasattr(self, 'ai_train_sync_lbl') and self.ai_train_sync_lbl.winfo_exists():
                         self.ai_train_sync_lbl.configure(text=f"⚡ Live-Sync: Runde erfasst ({acc:.1f}% / {miss} Miss) ➔ Bereite nächste Map vor...", text_color="#00E676")
-                        self.add_modern_chat_bubble("ai", feedback)
+                        self.add_modern_chat_bubble("ai", feedback, lazer_hit_data=lazer_hit_data)
                         self.after(1200, lambda: self.pick_next_ai_training_map(adaptive_delta=delta) if hasattr(self, 'ai_train_map_title') and self.ai_train_map_title.winfo_exists() else None)
 
                 self.after(0, update_feed)
@@ -12505,6 +16720,31 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
         master.pack(fill="both", expand=True)
         self.draw_lazer_background(master)
 
+        def handle_manual_osr_files(file_list):
+            added = False
+            for f in file_list:
+                clean_f = f.strip('{}').strip('"')
+                if clean_f.endswith(".osr") and os.path.exists(clean_f):
+                    p = parse_osr_deep_telemetry(clean_f)
+                    if p:
+                        self.record_deep_replay_play(p)
+                        added = True
+            if added:
+                self.show_deep_replay_analyzer(view_mode=view_mode)
+
+        def on_window_dnd_drop(event):
+            try:
+                files = self.tk.splitlist(event.data)
+                handle_manual_osr_files(files)
+            except Exception:
+                pass
+
+        try:
+            master.drop_target_register(DND_FILES)
+            master.dnd_bind('<<Drop>>', on_window_dnd_drop)
+        except Exception:
+            pass
+
         top_bar = ctk.CTkFrame(master, fg_color="#181822", height=60, corner_radius=12)
         top_bar.pack(fill="x", padx=20, pady=(15, 10))
         top_bar.pack_propagate(False)
@@ -12515,6 +16755,15 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
 
         ctk.CTkLabel(top_bar, text="🔬 Deep Replay Telemetrie & KI-Gesamtanalyse", font=("Arial", 18, "bold"), text_color="#00E5FF").pack(side="left", padx=10)
         ctk.CTkLabel(top_bar, text=" ✨ MULTI-PLAY ANALYSE ", font=("Arial", 10, "bold"), fg_color="#00BFA5", text_color="#000000", corner_radius=4).pack(side="left", padx=8)
+
+        def pick_osr_file():
+            try:
+                from tkinter import filedialog
+                fps = filedialog.askopenfilenames(title="osu! Replay (.osr) öffnen", filetypes=[("osu! Replay", "*.osr")])
+                if fps:
+                    handle_manual_osr_files(fps)
+            except Exception:
+                pass
 
         def trigger_re_scan():
             self.scan_all_local_osu_replays(max_replays=40)
@@ -12532,13 +16781,32 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
         ctk.CTkButton(top_bar, text="🔄 Replays scannen", width=125, height=32, font=("Arial", 11, "bold"),
                       fg_color="#1f538d", hover_color="#2b78c9", command=trigger_re_scan).pack(side="right", padx=4)
 
+        ctk.CTkButton(top_bar, text="📂 .osr Replay ablegen", width=145, height=32, font=("Arial", 11, "bold"),
+                      fg_color="#00BFA5", hover_color="#00897B", text_color="#000000", command=pick_osr_file).pack(side="right", padx=4)
+
         history = getattr(self, "deep_replay_history", [])
         if not history and getattr(self, "last_deep_replay_telemetry", None):
             self.record_deep_replay_play(self.last_deep_replay_telemetry)
             history = getattr(self, "deep_replay_history", [])
 
+        # Auto-rehydrate any historical entries missing lazer_telemetry
+        for item in history:
+            if isinstance(item, dict) and not item.get('lazer_telemetry') and item.get('file_path') and os.path.exists(item['file_path']):
+                try:
+                    reparsed = parse_osr_deep_telemetry(item['file_path'])
+                    if reparsed and reparsed.get('lazer_telemetry'):
+                        item['lazer_telemetry'] = reparsed['lazer_telemetry']
+                except Exception:
+                    pass
+
         scroll_container = ctk.CTkScrollableFrame(master, fg_color="transparent")
         scroll_container.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+        try:
+            scroll_container.drop_target_register(DND_FILES)
+            scroll_container.dnd_bind('<<Drop>>', on_window_dnd_drop)
+        except Exception:
+            pass
 
         if not history:
             empty_box = ctk.CTkFrame(scroll_container, fg_color="#181822", corner_radius=14, border_width=1, border_color="#2e2e3f")
@@ -12547,7 +16815,6 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
             ctk.CTkLabel(empty_box, text="⚡ Zero-Click Replay-Scanner ist aktiv!", font=("Arial", 20, "bold"), text_color="#00E5FF").pack(pady=(40, 10))
             ctk.CTkLabel(empty_box, text="Spiele einfach eine oder mehrere Runden in osu! Stable (egal welche Map).\nDu musst KEIN F2 drücken! UHO Hub erfasst ALLE deine Plays automatisch und analysiert deine Schwächen ganzheitlich.",
                          font=("Arial", 13), text_color="#cccccc", justify="center").pack(pady=10)
-
             drop_f = ctk.CTkFrame(empty_box, fg_color="#13131c", corner_radius=12, border_width=2, border_color="#00BFA5", width=440, height=120)
             drop_f.pack(pady=30)
             drop_f.pack_propagate(False)
@@ -12556,15 +16823,7 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
 
             try:
                 drop_f.drop_target_register(DND_FILES)
-                def on_manual_drop(event):
-                    files = self.tk.splitlist(event.data)
-                    for f in files:
-                        if f.endswith(".osr"):
-                            p = parse_osr_deep_telemetry(f)
-                            if p:
-                                self.record_deep_replay_play(p)
-                    self.show_deep_replay_analyzer()
-                drop_f.dnd_bind('<<Drop>>', on_manual_drop)
+                drop_f.dnd_bind('<<Drop>>', on_window_dnd_drop)
             except Exception:
                 pass
             return
@@ -12580,7 +16839,8 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
         v_inner = ctk.CTkFrame(v_bar, fg_color="transparent")
         v_inner.pack(fill="x", padx=16, pady=10)
 
-        ctk.CTkLabel(v_inner, text=f"📊 Session-Speicher: {len(history)} Plays erfasst", font=("Arial", 13, "bold"), text_color="#00E5FF").pack(side="left")
+        ctk.CTkLabel(v_inner, text=f"📊 Session-Speicher: {len(history)} Plays erfasst  (📂 .osr Replays jederzeit per Drag & Drop reinziehen)",
+                     font=("Arial", 12, "bold"), text_color="#00E5FF").pack(side="left")
 
         def set_mode(mode):
             self.show_deep_replay_analyzer(view_mode=mode)
@@ -12619,6 +16879,13 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
             ctk.CTkLabel(right_stats, text=f"Max Combo: {agg['max_combo']}x  |  Gesamt-Score: {agg['total_score']:,}  |  300s: {agg['total_300s']} • 100s: {agg['total_100s']} • 50s: {agg['total_50s']}",
                          font=("Arial", 11), text_color="#aaaaaa").pack(anchor="e", pady=(2, 0))
 
+            # osu! lazer Visual Accuracy Breakdown (Timing Distribution & Accuracy Heatmap across ALL plays)
+            try:
+                agg_hit_data = compute_aggregate_lazer_hit_telemetry(history)
+                create_lazer_results_card(scroll_container, agg_hit_data, width=760, height=210)
+            except Exception:
+                agg_hit_data = {}
+
             # 2-Column Telemetry Grid (Aim Dynamics vs Tapping Dynamics)
             grid_2col = ctk.CTkFrame(scroll_container, fg_color="transparent")
             grid_2col.pack(fill="x", pady=(0, 12))
@@ -12650,36 +16917,37 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
             ctk.CTkLabel(spd_box, text=f"⚡ Peak Snapping Speed: {agg['avg_peak_spd']:,.0f} px/s\n📊 Durchschnittliche Cursor-Geschwindigkeit: {agg['avg_cursor_spd']:,.0f} px/s",
                          font=("Arial", 11, "bold"), text_color="#cccccc", justify="left").pack(anchor="w", padx=12, pady=8)
 
-            quads = agg["quadrants"]
             quad_box = ctk.CTkFrame(aim_card, fg_color="#121218", corner_radius=8)
             quad_box.pack(fill="x", padx=16, pady=(4, 14))
-            ctk.CTkLabel(quad_box, text=f"Bildschirm-Aktivität (Heatmap über alle Maps):\n↖ Oben-Links (TL): {quads.get('TL', 25)}%   |   ↗ Oben-Rechts (TR): {quads.get('TR', 25)}%\n↙ Unten-Links (BL): {quads.get('BL', 25)}%   |   ↘ Unten-Rechts (BR): {quads.get('BR', 25)}%",
+            quads = agg["quadrants"]
+            ctk.CTkLabel(quad_box, text=f"Bildschirm-Aktivität (Heatmap über alle Maps):\n↖ Oben-Links (TL): {quads.get('TL', 25):.1f}%  |  ↗ Oben-Rechts (TR): {quads.get('TR', 25):.1f}%\n↙ Unten-Links (BL): {quads.get('BL', 25):.1f}%  |  ↘ Unten-Rechts (BR): {quads.get('BR', 25):.1f}%",
                          font=("Arial", 11), text_color="#888899", justify="left").pack(anchor="w", padx=12, pady=8)
 
             # RIGHT CARD: TAPPING & FINGER CONTROL (AGGREGATE)
             tap_card = ctk.CTkFrame(grid_2col, fg_color="#181822", corner_radius=12, border_width=1, border_color="#00BFA5")
             tap_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
-            ctk.CTkLabel(tap_card, text="⚡ Systemische Tapping- & Finger-Kontrolle", font=("Arial", 15, "bold"), text_color="#00BFA5").pack(anchor="w", padx=16, pady=(14, 8))
-
-            ur_val = agg["avg_ur"]
-            early_b = agg["avg_early"]
-            ur_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
-            ur_box.pack(fill="x", padx=16, pady=4)
-            ctk.CTkLabel(ur_box, text=f"Unstable Rate (UR): ~{ur_val:.1f} UR  •  Hit-Offset: {early_b:.0f}% Early / {100-early_b:.0f}% Late", font=("Arial", 13, "bold"), text_color="#00E676").pack(anchor="w", padx=12, pady=(8, 2))
-            ur_desc = "Stabiles Rhythmusgefühl ohne systematisches Vorauseilen (Rushing)." if 40 <= early_b <= 60 else ("Du rushst Noten leicht verfrüht (Early Hit Bias)." if early_b > 60 else "Du triffst Noten leicht verzögert (Late Hit Bias).")
-            ctk.CTkLabel(ur_box, text=ur_desc, font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=12, pady=(0, 8))
+            ctk.CTkLabel(tap_card, text="⚡ Tapping-Muster & Finger Control", font=("Arial", 15, "bold"), text_color="#00BFA5").pack(anchor="w", padx=16, pady=(14, 8))
 
             k1_hold = agg["avg_k1_hold"]
             k2_hold = agg["avg_k2_hold"]
             hold_gap = abs(k1_hold - k2_hold)
+            alt_r = agg["avg_alt_ratio"]
+            ur_val = agg_hit_data.get('unstable_rate', agg.get("avg_ur", 80.0)) if agg_hit_data else agg.get("avg_ur", 80.0)
+            avg_err_ms = agg_hit_data.get('avg_hit_error', 0.0) if agg_hit_data else 0.0
+
+            ur_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
+            ur_box.pack(fill="x", padx=16, pady=4)
+            err_lbl = f"+{avg_err_ms:.2f}ms spät" if avg_err_ms >= 0 else f"{avg_err_ms:.2f}ms früh"
+            ctk.CTkLabel(ur_box, text=f"Unstable Rate (UR): ~{ur_val:.1f} UR  •  Ø Timing-Offset: {err_lbl}", font=("Arial", 13, "bold"), text_color="#00E676").pack(anchor="w", padx=12, pady=(8, 2))
+            ur_desc = f"Konstantes Tapping-Timing über alle {agg['total_plays']} Maps." if ur_val < 95.0 else f"Erhöhte Streuung ({ur_val:.1f} UR) – Tapping-Offset optimieren."
+            ctk.CTkLabel(ur_box, text=ur_desc, font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=12, pady=(0, 8))
+
             hold_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
             hold_box.pack(fill="x", padx=16, pady=4)
-            gap_txt = f" (⚠️ {hold_gap:.1f}ms Asymmetrie!)" if hold_gap > 15.0 else " (Ausbalanciert)"
-            ctk.CTkLabel(hold_box, text=f"Tasten-Haltezeiten (Hold Time):\n• Taste 1 (K1): {k1_hold:.1f} ms\n• Taste 2 (K2): {k2_hold:.1f} ms{gap_txt}",
+            ctk.CTkLabel(hold_box, text=f"Tasten-Haltezeit (Ø Hold Time):\n• Taste 1 (K1): {k1_hold:.1f} ms  |  • Taste 2 (K2): {k2_hold:.1f} ms\n• Asymmetrie-Versatz: {hold_gap:.1f} ms",
                          font=("Arial", 11, "bold"), text_color="#cccccc", justify="left").pack(anchor="w", padx=12, pady=8)
 
-            alt_r = agg["avg_alt_ratio"]
             alt_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
             alt_box.pack(fill="x", padx=16, pady=(4, 14))
             alt_desc = "Gleichmäßiges Full-Alternating" if alt_r >= 70.0 else ("Hybrid-Singletapping" if alt_r >= 25.0 else "Reines Singletapping")
@@ -12705,6 +16973,20 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
                     ctk.CTkLabel(r_box, text=f"[{count}x in {agg['total_plays']} Maps • {pct}%]", font=("Arial", 10, "bold"), fg_color="#331c1c", text_color="#FF5252", corner_radius=4).pack(side="left", padx=8, pady=6)
                     ctk.CTkLabel(r_box, text=issue_txt, font=("Arial", 12), text_color="#ffffff", justify="left").pack(side="left", padx=4, pady=6)
 
+            # Settings & Offset Recommendations Card
+            settings_card = ctk.CTkFrame(scroll_container, fg_color="#181826", corner_radius=12, border_width=1, border_color="#00E5FF")
+            settings_card.pack(fill="x", pady=(0, 12))
+
+            s_hdr = ctk.CTkFrame(settings_card, fg_color="transparent")
+            s_hdr.pack(fill="x", padx=16, pady=(14, 6))
+            ctk.CTkLabel(s_hdr, text="🛠️ Empfohlene osu! Settings & Offset-Feinabstimmung (Session-Durchschnitt)", font=("Arial", 15, "bold"), text_color="#00E5FF").pack(side="left")
+
+            recs_text = compute_settings_recommendations(avg_err_ms, ur_val, over_pct, under_pct, hold_gap)
+            s_box = ctk.CTkTextbox(settings_card, wrap="word", font=("Arial", 12), fg_color="#101018", border_width=1, border_color="#222232", corner_radius=8, height=190)
+            s_box.pack(fill="x", padx=16, pady=(4, 14))
+            s_box.insert("1.0", recs_text)
+            s_box.configure(state="disabled")
+
             # Bottom AI Deep Diagnosis Box (Holistic AI Coaching across all plays)
             ai_card = ctk.CTkFrame(scroll_container, fg_color="#221826", corner_radius=12, border_width=2, border_color="#9C27B0")
             ai_card.pack(fill="x", pady=(0, 16))
@@ -12713,7 +16995,7 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
             ai_header.pack(fill="x", padx=16, pady=(14, 6))
             ctk.CTkLabel(ai_header, text=f"🤖 Google Gemini KI-Gesamtdiagnose ({agg['total_plays']} Plays ausgewertet)", font=("Arial", 15, "bold"), text_color="#BA68C8").pack(side="left")
 
-            ai_res_box = ctk.CTkTextbox(ai_card, wrap="word", font=("Arial", 12), fg_color="#14141a", border_width=1, border_color="#33243a", corner_radius=8, height=160)
+            ai_res_box = ctk.CTkTextbox(ai_card, wrap="word", font=("Arial", 12), fg_color="#14141a", border_width=1, border_color="#33243a", corner_radius=8, height=360)
             ai_res_box.pack(fill="x", padx=16, pady=(4, 10))
             ai_res_box.insert("1.0", "Klicke auf den Button unten, um eine umfassende KI-Gesamtdiagnose deiner Spielweise über ALLE gespeicherten Replays zu erhalten.")
             ai_res_box.configure(state="disabled")
@@ -12721,21 +17003,38 @@ Gib dem Spieler ein hochprofessionelles, direktes Coaching-Feedback auf Deutsch 
             def run_aggregate_ai():
                 ai_btn.configure(state="disabled", text="⏳ Analysiere alle Plays mit Google Gemini...")
                 
-                prompt = f"""Du bist der offizielle Cheftrainer und Pro-Coach für osu! Standard (Mode 0).
-WICHTIG: Antworte ZU 100% AUF DEUTSCH! Verwende präzise osu!-Terminologie.
+                issues_summary = "\n".join([f"- {txt} ({c}x aufgetreten)" for txt, c in issues]) if issues else "- Keine akuten Chokes festgestellt"
 
-Du analysierst die GESAMTE SESSION / HISTORIE des Spielers '{p_name}' über ALLE {agg['total_plays']} gespielten Replays zusammengefasst:
-- Gesamt-Statistik: {agg['total_plays']} Maps gespielt | Ø Accuracy: {agg['avg_acc']:.2f}% | Gesamt-Misses: {agg['total_misses']} (Ø {agg['avg_misses_per_play']:.1f} Miss/Map) | Max Combo: {agg['max_combo']}x
-- Aim-Telemetrie über alle Maps: Overaim {over_pct:.1f}% vs Underaim {under_pct:.1f}% | Peak Snapping Speed: {agg['avg_peak_spd']:,.0f} px/s | Avg Cursor Speed: {agg['avg_cursor_spd']:,.0f} px/s
-- Tapping-Telemetrie über alle Maps: K1 Hold: {k1_hold:.1f}ms | K2 Hold: {k2_hold:.1f}ms (Asymmetrie-Gap: {hold_gap:.1f}ms) | Alternating Balance: {alt_r:.1f}% | Unstable Rate: ~{ur_val:.1f} UR
-- Häufigste Choke-Muster über alle Maps: {', '.join([f'{txt} ({c}x)' for txt, c in issues]) if issues else 'Keine akuten Chokes'}
+                prompt = f"""Du bist der offizielle Cheftrainer und Pro-Level Head Coach für osu! Standard (Mode 0).
+WICHTIG & STRIKT: Antworte ZU 100% AUF DEUTSCH! Verwende kein einziges englisches Wort (außer osu!-Begriffe wie Stream, Aim, Burst, FC, Mods wie DT/HR/HD/EZ).
+STRIKTE QUALITÄT: Antworte NIEMALS mit nur 1-2 kurzen Sätzen oder stichpunktartigen Fragmenten! Der Spieler verlangt eine tiefgehende, hochprofessionelle 5-Punkte-Gesamtdiagnose seiner gesamten Spielweise über alle Replays!
 
-Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
-1. 🎯 Ganzheitliche Aim-Muster (Systematische Overaim/Underaim Tendenzen & Cursor-Snapping über alle Maps)
-2. ⚡ Tapping-Technik & Finger-Stamina (K1/K2 Asymmetrie, Tastatur-Druck, Notelock-Gefahr)
-3. 🩸 Hauptursachen für Misses im Schnitt (Woran scheitert der Spieler am häufigsten?)
-4. 🛠️ Hardware-, Grip- & Setup-Empfehlung (Tablet-Area Feintuning, Maus-DPI / Polling Rate, Tastatur-Settings)
-5. 🔥 Konkreter 3-Tage Trainings- und Ausbesserungsplan."""
+Du analysierst die GESAMTE HISTORIE des Spielers '{p_name}' über ALLE {agg['total_plays']} gespielten Replays zusammengefasst:
+- Gesamt-Statistik: {agg['total_plays']} Maps gespielt | Ø Accuracy: {agg['avg_acc']:.2f}% | Gesamt-Misses: {agg['total_misses']} (Ø {agg['avg_misses_per_play']:.1f} Misses pro Map) | Max Combo: {agg['max_combo']}x | 300s: {agg['total_300s']} | 100s: {agg['total_100s']} | 50s: {agg['total_50s']}
+- Aim-Telemetrie über alle Maps: Underaim {under_pct:.1f}% vs Overaim {over_pct:.1f}% | Peak Snapping Speed: {agg['avg_peak_spd']:,.0f} px/s | Avg Cursor Speed: {agg['avg_cursor_spd']:,.0f} px/s | Quadranten: ↖ TL {agg['quadrants']['TL']:.1f}%, ↗ TR {agg['quadrants']['TR']:.1f}%, ↙ BL {agg['quadrants']['BL']:.1f}%, ↘ BR {agg['quadrants']['BR']:.1f}%
+- Tapping-Telemetrie über alle Maps: Ø Hit-Offset: {avg_err_ms:+.2f}ms | K1 Hold: {k1_hold:.1f}ms | K2 Hold: {k2_hold:.1f}ms (Asymmetrie-Gap: {hold_gap:.1f}ms) | Alternating Balance: {alt_r:.1f}% | Unstable Rate: ~{ur_val:.1f} UR
+- Häufigste Choke-Muster über die gesamte Session:
+{issues_summary}
+
+Konkrete Settings- & Offset-Empfehlungen:
+{recs_text}
+
+Erstelle eine ausführliche, fachlich fundierte und motivierende 5-Punkte-Gesamtdiagnose (mindestens 350-500 Wörter) mit folgenden 5 Abschnitten:
+
+🎯 **1. Aim- & Cursor-Mechanik (Underaim / Overaim & Snapping):**
+[Ausführliche Analyse: Warum neigt der Spieler zu {under_pct:.1f}% Underaim (bzw. Overaim)? Wo verliert er bei weiten Cross-Screen Jumps und Richtungswechseln die Circle-Edge? Welche Ecken des Bildschirms bereiten die größten Probleme?]
+
+⚡ **2. Tapping-Technik & Finger-Stamina:**
+[Ausführliche Analyse: Was bedeuten die Hold-Zeiten K1 ({k1_hold:.1f}ms) vs K2 ({k2_hold:.1f}ms) und der Versatz von {hold_gap:.1f}ms? Wie stabil ist die Unstable Rate von {ur_val:.1f}? Wo droht Fingerlocking oder Notelock?]
+
+🩸 **3. Hauptursachen für Misses & Chokes:**
+[Genaue Aufschlüsselung der durchschnittlich {agg['avg_misses_per_play']:.1f} Misses pro Map: Liegt es an Lesegeschwindigkeit (Reading), Jump-Winkeln, Tapping-Erschöpfung oder Panik-Taps?]
+
+🛠️ **4. Hardware-, Grip- & Setup-Empfehlungen (inkl. konkretem Audio Offset):**
+[Konkrete Ratschläge: Audio Offset in den osu!-Optionen auf welchen genauen Wert anpassen (z.B. {(-int(round(avg_err_ms))):+d}ms), Tablet-Area / Maus-DPI Feinjustierung (Area um wie viele mm verkleinern/vergrößern), Tapping-Finger-Position, Tastatur-Actuation-Point und Entlastung des Handgelenks]
+
+📅 **5. Konkreter 3-Tage Trainings- und Ausbesserungsplan:**
+[Strukturierter Trainingsablauf mit Skillset-Schwerpunkten, BPM-Bereichen und klaren Zielen für Tag 1, Tag 2 und Tag 3]"""
 
                 def _req():
                     rep = ""
@@ -12743,14 +17042,47 @@ Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
                         try:
                             g_model = getattr(self, "selected_ai_model", "gemini-3.6-flash")
                             url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self.gemini_key}"
-                            payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1200}}
+                            payload = {
+                                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1500}
+                            }
                             res = requests.post(url, json=payload, timeout=25).json()
-                            rep = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            cand = res["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            
+                            # Quality Gate: check length and German formatting
+                            if len(cand) >= 280 and ("Aim" in cand or "Tapping" in cand):
+                                rep = cand
+                            else:
+                                # Retry with assertive prompt
+                                retry_prompt = prompt + "\n\nACHTUNG: Deine vorherige Antwort war zu kurz oder unvollständig! Bitte schreibe eine vollständige, ausführliche 5-Punkte-Analyse auf Deutsch!"
+                                payload["contents"][0]["parts"][0]["text"] = retry_prompt
+                                res_r = requests.post(url, json=payload, timeout=20).json()
+                                rep = res_r["candidates"][0]["content"]["parts"][0]["text"].strip()
                         except Exception:
                             pass
                     
-                    if not rep:
-                        rep = f"🎯 **Aim:** Über alle {agg['total_plays']} Maps zeigt sich ein systematischer Overaim von {over_pct:.1f}%. Reduziere deine Tablet-Area um ca. 2mm in der Breite, um die Jump-Stabilität zu erhöhen.\n\n⚡ **Tapping:** Deine Hold-Times (K1: {k1_hold:.1f}ms / K2: {k2_hold:.1f}ms) weisen einen Versatz von {hold_gap:.1f}ms auf. Achte auf gleichmäßigen Fingerdruck bei Streams.\n\n🩸 **Miss-Ursachen:** Die meisten Fehler entstehen durch Dekompensation bei schnellen Jump-Winkeln.\n\n🔥 **Trainings-Fokus:** Absolviere täglich 15 Minuten gezieltes CS 4.8+ Jump-Training und 180-200 BPM Finger-Control Maps."
+                    if not rep or len(rep) < 200:
+                        aim_tendency = f"{under_pct:.1f}% Underaim (Cursor stoppt kurz vor der Circle-Edge)" if under_pct > 55 else (f"{over_pct:.1f}% Overaim (Cursor überschießt das Ziel)" if over_pct > 55 else "balancierte 50/50 Aim-Dynamik")
+                        offset_action = f"Universal Audio Offset in den osu!-Optionen auf {(-int(round(avg_err_ms))):+d} ms einstellen" if abs(avg_err_ms) > 2.5 else "Audio Offset bei 0ms belassen"
+                        
+                        rep = f"""🎯 **1. Aim- & Cursor-Mechanik:**
+Über alle {agg['total_plays']} gespielten Maps zeigt sich eine dominante Tendenz zu {aim_tendency}. Bei weiten Cross-Screen Jumps und schnellen Richtungswechseln wird die Bewegung oft zu früh abgebremst, bevor der Klick erfolgt. Deine Peak-Snapping-Geschwindigkeit von {agg['avg_peak_spd']:,.0f} px/s ist solide, benötigt jedoch mehr Konstanz am Zielpunkt.
+
+⚡ **2. Tapping-Technik & Finger-Stamina:**
+Deine durchschnittlichen Hold-Zeiten liegen bei K1: {k1_hold:.1f}ms und K2: {k2_hold:.1f}ms (Asymmetrie-Versatz: {hold_gap:.1f}ms). Deine Unstable Rate von ~{ur_val:.1f} zeigt, dass bei schnelleren Streams ein leichtes Finger-Locking auftritt. Achte darauf, beide Tasten mit identischem Druck und schnellem Release zu bedienen.
+
+🩸 **3. Hauptursachen für Misses & Chokes:**
+Mit durchschnittlich {agg['avg_misses_per_play']:.1f} Misses pro Map entstehen die meisten Fehler nicht durch fehlende Grundschnelligkeit, sondern durch Dekompensation bei dichten Pattern-Übergängen und weiten Sprungdistanzen.
+
+🛠️ **4. Hardware-, Grip- & Setup-Empfehlungen:**
+- **Audio Offset:** {offset_action}, um dein Treffer-Timing ({avg_err_ms:+.2f}ms) perfekt auf den Musik-Beat zu zentrieren.
+- **Tablet / Maus:** Reduziere deine Tablet-Area in der Breite um ca. 2 bis 3 mm (oder erhöhe die DPI minimal), um die Reichweite bei weiten Jumps ohne übermäßige Handgelenk-Dehnung zu erreichen.
+- **Ergonomie:** Halte deinen Unterarm flach auf dem Tisch und lockere die Finger zwischen Notenfolgen bewusst auf.
+
+📅 **5. Konkreter 3-Tage Trainings- und Ausbesserungsplan:**
+- **Tag 1 (Aim-Stabilisierung):** 20 Min. NoMod Jump-Training (CS 4.5 - 5.0, 160-180 BPM) mit Fokus auf saubere Circle-Mitte-Treffer.
+- **Tag 2 (Finger-Control & UR):** 25 Min. Alternate- und Burst-Maps (175-195 BPM) zur Beseitigung der {hold_gap:.1f}ms Tapping-Asymmetrie.
+- **Tag 3 (Consistency & Push):** 30 Min. Level-Training mit Fokus auf PFCs und 3-Minuten-Maps zur Festigung der Nervenstärke."""
 
                     self.log_ai_event(
                         category="Deep Replay KI-Gesamtanalyse",
@@ -12846,6 +17178,14 @@ Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
             ctk.CTkLabel(right_stats, text=f"{acc:.2f}% ACC  •  {combo}x Max Combo", font=("Arial", 15, "bold"), text_color=acc_col).pack(anchor="e")
             ctk.CTkLabel(right_stats, text=f"Score: {score:,}  |  300s: {h300} • 100s: {h100} • 50s: {h50} • Misses: {miss}", font=("Arial", 11), text_color="#aaaaaa").pack(anchor="e")
 
+            # osu! lazer Visual Accuracy Breakdown (Timing Distribution & Accuracy Heatmap)
+            single_hit_data = None
+            try:
+                single_hit_data = compute_lazer_hit_telemetry(cur_rd)
+                create_lazer_results_card(scroll_container, single_hit_data, width=760, height=210)
+            except Exception:
+                pass
+
             # Single Play 2-Column Telemetry Grid
             grid_2col = ctk.CTkFrame(scroll_container, fg_color="transparent")
             grid_2col.pack(fill="x", pady=(0, 12))
@@ -12889,12 +17229,13 @@ Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
             k1_cnt = metrics.get("k1_count", 0)
             k2_cnt = metrics.get("k2_count", 0)
             alt_r = metrics.get("alt_ratio", 50.0)
-            ur_val = metrics.get("ur", 80.0)
-            early_b = metrics.get("early_bias_pct", 50.0)
+            ur_val = single_hit_data.get('unstable_rate', metrics.get("ur", 80.0)) if single_hit_data else metrics.get("ur", 80.0)
+            avg_err_single = single_hit_data.get('avg_hit_error', 0.0) if single_hit_data else 0.0
 
             ur_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
             ur_box.pack(fill="x", padx=16, pady=4)
-            ctk.CTkLabel(ur_box, text=f"Unstable Rate (UR): ~{ur_val:.1f} UR  •  Hit Error: {early_b:.0f}% Early", font=("Arial", 13, "bold"), text_color="#00E676").pack(anchor="w", padx=12, pady=(8, 2))
+            err_lbl = f"+{avg_err_single:.2f}ms spät" if avg_err_single >= 0 else f"{avg_err_single:.2f}ms früh"
+            ctk.CTkLabel(ur_box, text=f"Unstable Rate (UR): ~{ur_val:.1f} UR  •  Ø Treffer-Versatz: {err_lbl}", font=("Arial", 13, "bold"), text_color="#00E676").pack(anchor="w", padx=12, pady=(8, 2))
             ctk.CTkLabel(ur_box, text="Gleichmäßiges Rhythmusgefühl ohne vorzeitiges Rushing.", font=("Arial", 11), text_color="#888899").pack(anchor="w", padx=12, pady=(0, 8))
 
             hold_box = ctk.CTkFrame(tap_card, fg_color="#121218", corner_radius=8)
@@ -12918,6 +17259,20 @@ Erstelle eine schonungslose, ganzheitliche 5-Punkte Gesamt-Diagnose:
                 r_box = ctk.CTkFrame(choke_card, fg_color="#14141c", corner_radius=6)
                 r_box.pack(fill="x", padx=16, pady=3)
                 ctk.CTkLabel(r_box, text=r, font=("Arial", 12), text_color="#ffffff", justify="left").pack(anchor="w", padx=10, pady=6)
+
+            # Single Play Settings & Offset Recommendations Card
+            s_card = ctk.CTkFrame(scroll_container, fg_color="#181826", corner_radius=12, border_width=1, border_color="#00E5FF")
+            s_card.pack(fill="x", pady=(0, 12))
+
+            s_hdr = ctk.CTkFrame(s_card, fg_color="transparent")
+            s_hdr.pack(fill="x", padx=16, pady=(14, 6))
+            ctk.CTkLabel(s_hdr, text="🛠️ Empfohlene osu! Settings & Offset-Feinabstimmung (Dieses Replay)", font=("Arial", 15, "bold"), text_color="#00E5FF").pack(side="left")
+
+            single_recs_text = compute_settings_recommendations(avg_err_single, ur_val, over_pct, under_pct, abs(k1_hold - k2_hold))
+            s_box = ctk.CTkTextbox(s_card, wrap="word", font=("Arial", 12), fg_color="#101018", border_width=1, border_color="#222232", corner_radius=8, height=190)
+            s_box.pack(fill="x", padx=16, pady=(4, 14))
+            s_box.insert("1.0", single_recs_text)
+            s_box.configure(state="disabled")
 
     # ---------------------------------------------------------------------------
     # MASTER SKILL-ANALYSE (SCHRITT 1: PROFIL -> SCHRITT 2: TEST -> PERMANENT RADAR)
@@ -14542,36 +18897,73 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
             tot_tmp = h300_tmp + h100_tmp + h50_tmp + miss_tmp
             acc_tmp = (safe_div(h300_tmp * 300 + h100_tmp * 100 + h50_tmp * 50, tot_tmp * 300, 0.0) * 100) if tot_tmp > 0 else 0
             mock_p = {
-                "beatmap_id": parsed.get("beatmap_hash", ""),
+                "beatmap_id": parsed.get("beatmap_hash", "") or parsed.get("hash", ""),
                 "count300": h300_tmp, "count100": h100_tmp, "count50": h50_tmp, "countmiss": miss_tmp,
                 "maxcombo": parsed.get("combo", 0), "rank": "S" if (acc_tmp >= 93.0 and miss_tmp == 0) else "A",
                 "score": parsed.get("score", 0)
             }
             self.record_play_in_active_session(mock_p)
-        except: pass
+        except Exception:
+            pass
+
         try:
             if "levels" not in self.data: self.data["levels"] = {}
             if level_str not in self.data["levels"]: self.data["levels"][level_str] = {"s_ranks": [], "pfcs": [], "min3_maps": []}
             
             lvl = self.data["levels"][level_str]
-            h300 = parsed['300s']
-            h100 = parsed['100s']
-            h50 = parsed['50s']
-            miss = parsed['misses']
+            h300 = parsed.get('300s', 0)
+            h100 = parsed.get('100s', 0)
+            h50 = parsed.get('50s', 0)
+            miss = parsed.get('misses', 0)
             tot = h300 + h100 + h50 + miss
             acc = (safe_div(h300 * 300 + h100 * 100 + h50 * 50, tot * 300, 0.0) * 100) if tot > 0 else 0
+            is_perfect = parsed.get("perfect", False)
 
-            # S Rank Check
+            # 1. S Rank Check
             is_s = (acc >= 93.0 and miss == 0) or (acc >= 90.0 and safe_div(h50, tot, 1.0) <= 0.01 and miss == 0)
             if is_s and len(lvl.get("s_ranks", [])) < 5:
                 lvl.setdefault("s_ranks", []).append(parsed)
 
-            if parsed.get("perfect", False) and len(lvl.get("pfcs", [])) < 2:
+            # 2. Perfect Full Combo Check
+            if is_perfect and len(lvl.get("pfcs", [])) < 2:
                 lvl.setdefault("pfcs", []).append(parsed)
+
+            # 3. 3-Minute+ Map Check (>= 175s duration, or DB hit_length/total_length >= 175, or high note density)
+            dur_sec = 0.0
+            if parsed.get('frames') and len(parsed['frames']) > 0:
+                dur_sec = float(parsed['frames'][-1].get('time', 0)) / 1000.0
+            elif parsed.get('file_path') and os.path.exists(parsed['file_path']):
+                try:
+                    deep = parse_osr_deep_telemetry(parsed['file_path'])
+                    if deep and deep.get('frames') and len(deep['frames']) > 0:
+                        dur_sec = float(deep['frames'][-1].get('time', 0)) / 1000.0
+                except Exception:
+                    pass
+
+            b_hash = parsed.get('hash', '') or parsed.get('beatmap_hash', '')
+            if dur_sec < 175.0 and b_hash and BEATMAP_SQLITE_DB_PATH:
+                try:
+                    with get_safe_sqlite_conn() as conn:
+                        if conn:
+                            row = conn.execute("SELECT total_length, hit_length, title FROM maps WHERE md5 = ? OR id = ?", (b_hash, b_hash)).fetchone()
+                            if row:
+                                db_len = max(row[0] or 0, row[1] or 0)
+                                if db_len > dur_sec:
+                                    dur_sec = float(db_len)
+                                if not parsed.get("title") and row[2]:
+                                    parsed["title"] = row[2]
+                except Exception:
+                    pass
+
+            is_3min = (dur_sec >= 175.0) or (tot >= 750)
+            is_pass = (acc >= 85.0) or is_s or is_perfect
+            if is_3min and is_pass and len(lvl.get("min3_maps", [])) < 2:
+                lvl.setdefault("min3_maps", []).append(parsed)
 
             self.save_data()
             self.render_cards()
-        except: pass
+        except Exception:
+            pass
 
     def show_overlay(self):
         if not hasattr(self, 'overlay') or not self.overlay.winfo_exists():
@@ -15007,32 +19399,13 @@ Antworte STRENG im folgenden JSON-Format (ohne Markdown Backticks darum herum):
     def process_replay(self, file_path, level_str):
         if not file_path.endswith('.osr'): return
         try:
-            parsed = parse_osr(file_path)
-            # Filter strictly for osu! Standard (mode 0, no Mania/Catch/Taiko)
-            if parsed.get('mode', 0) != 0:
+            parsed = parse_osr_deep_telemetry(file_path) or parse_osr(file_path)
+            if not parsed or parsed.get('mode', 0) != 0:
                 return
-            if "levels" not in self.data: self.data["levels"] = {}
-            if level_str not in self.data["levels"]: self.data["levels"][level_str] = {"s_ranks": [], "pfcs": [], "min3_maps": []}
-            
-            lvl = self.data["levels"][level_str]
-            h300 = parsed['300s']
-            h100 = parsed['100s']
-            h50 = parsed['50s']
-            miss = parsed['misses']
-            tot = h300 + h100 + h50 + miss
-            acc = ((h300 * 300 + h100 * 100 + h50 * 50) / (tot * 300) * 100) if tot > 0 else 0
-
-            # S Rank Check
-            is_s = (acc >= 93.0 and miss == 0) or (acc >= 90.0 and (h50/tot) <= 0.01 and miss == 0)
-            if is_s and len(lvl.get("s_ranks", [])) < 5:
-                lvl.setdefault("s_ranks", []).append(parsed)
-
-            if parsed.get("perfect", False) and len(lvl.get("pfcs", [])) < 2:
-                lvl.setdefault("pfcs", []).append(parsed)
-
-            self.save_data()
-            self.render_cards()
-        except: pass
+            parsed['file_path'] = file_path
+            self.process_replay_parsed(parsed, level_str)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

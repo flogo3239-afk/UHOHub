@@ -25,3 +25,16 @@ trigger: always_on
    - **STRIKTE REGEL:** Wenn der Nutzer in seinem Prompt das Wort **"Theoretisch"**, **"theoretisch"** oder Ausdrücke wie **"nur theoretisch"**, **"reine Theorie"** bzw. **"nichts machen"** verwendet, darf der Agent **KEINERLEI Code-, Datei- oder Systemänderungen** vornehmen.
    - Es dürfen **keine Tools zum Bearbeiten oder Ausführen** (`replace_file_content`, `write_to_file`, `run_command` etc.) genutzt werden, um das Projekt zu modifizieren.
    - Der Agent soll in diesem Fall **ausschließlich die Frage präzise, verständlich und theoretisch beantworten**, die Machbarkeit erklären und das Konzept aufzeigen, ohne etwas umzusetzen.
+
+5. **100% Echte Daten & Zero-Fake Policy:**
+   - **STRIKTE REGEL:** Jede Funktion, die implementiert oder erweitert wird, muss **vollkommen echte, gemessene Werte** beinhalten (aus echten `.osr`-Frames, Live-Prozessspeicher oder offizieller Bancho API).
+   - **VERBOT VON FAKE-DATEN:** Es dürfen niemals Zufallswerte (`random.gauss`, `random.uniform`, `rng.betavariate`), hardcodierte Schein-Messwerte oder synthetische Fallbacks generiert werden, um fehlende Daten zu kaschieren.
+
+6. **Explizite Fehlercodes & Transparenz bei Fehlern:**
+   - Wenn eine Berechnung fehlschlägt oder nicht genügend Daten vorhanden sind (z. B. zu wenige Taps für UR oder keine Replay-Frames), darf kein erfundener Wert (wie `0.0 UR` oder ausgedachte Hold-Zeiten) angezeigt werden.
+   - Es müssen **immer klare, verständliche Fehlercodes / Status-Meldungen** auf Deutsch ausgegeben werden (z. B. *„ERR_NO_FRAMES: Keine Replay-Frame-Daten verfügbar“* oder *„ERR_INSUFFICIENT_TAPS: Nicht genügend Taps für UR-Berechnung vorhanden“*).
+
+7. **Radikale Ehrlichkeit & schonungslose Problem-Nennung bei Planungen:**
+   - Bei jeder Planung, Architekturentscheidung und technischen Einschätzung müssen **alle realen Hürden, Performance-Flaschenhälse, Limitierungen und Risiken schonungslos offen angesprochen werden**.
+   - Niemals Dinge als „einfach möglich“ darstellen, ohne die echten technischen Probleme und Konsequenzen detailliert zu erklären.
+
